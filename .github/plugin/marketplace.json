@@ -4,13 +4,13 @@
     "name": "Sergey Teplyakov"
   },
   "metadata": {
-    "description": "A code-review canvas for the GitHub Copilot app. Inspect local diffs, leave inline comments, and iterate with your coding agent before opening a PR.",
+    "description": "A human-led diff and review canvas for the GitHub Copilot app. Inspect local changes in a rich diff view, then steer your agent with inline feedback to fine-tune the implementation.",
     "version": "0.1.0"
   },
   "plugins": [
     {
       "name": "self-review-canvas",
-      "description": "A code-review canvas for the GitHub Copilot app. Inspect local diffs, leave inline comments, and iterate with your coding agent before opening a PR.",
+      "description": "A human-led diff and review canvas for the GitHub Copilot app. Inspect local changes in a rich diff view, then steer your agent with inline feedback to fine-tune the implementation.",
       "version": "0.1.0",
       "source": "./"
     }
