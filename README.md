@@ -1,15 +1,15 @@
-# Self Review Canvas
+# Self-Review
 
 A human-led diff and review canvas for the GitHub Copilot app. Inspect local changes in a rich diff view, then steer your agent with inline feedback to fine-tune the implementation.
 
 ```bash
-copilot plugin marketplace add SergeyTeplyakov/self-review-canvas
+copilot plugin marketplace add SergeyTeplyakov/Self-Review
 copilot plugin install self-review-canvas@self-review-canvas
 ```
 
-In the Copilot app, [install Self Review Canvas](https://github.com/copilot/app/launch?open=ghapp%3A%2F%2Fplugins%2Finstall%3Fsource%3Dself-review-canvas%2540self-review-canvas%26marketplace%3DSergeyTeplyakov%252Fself-review-canvas). It asks you to confirm adding the `SergeyTeplyakov/self-review-canvas` marketplace and installing `self-review-canvas@self-review-canvas`, then opens the install form pre-filled. Click Install to finish.
+In the Copilot app, [install Self-Review](https://github.com/copilot/app/launch?open=ghapp%3A%2F%2Fplugins%2Finstall%3Fsource%3Dself-review-canvas%2540self-review-canvas%26marketplace%3DSergeyTeplyakov%252FSelf-Review). It asks you to confirm adding the `SergeyTeplyakov/Self-Review` marketplace and installing `self-review-canvas@self-review-canvas`, then opens the install form pre-filled. Click Install to finish.
 
-Or do it by hand: **Customize → + Add → Marketplace** with `SergeyTeplyakov/self-review-canvas`, then **+ Add → Plugin** with `self-review-canvas@self-review-canvas`.
+Or do it by hand: **Customize → + Add → Marketplace** with `SergeyTeplyakov/Self-Review`, then **+ Add → Plugin** with `self-review-canvas@self-review-canvas`.
 
 Start a new session in a repository with some changes and try a read-only review:
 
@@ -25,7 +25,7 @@ To review only what you haven't committed yet, ask for your pending changes inst
 
 Agents write code faster than you can read it. Reviewing in chat is awkward: you paste file names and line numbers, describe which `if` you mean, and lose track of what was already addressed. PR tools have the right shape for this, but they only kick in after you push, and their comments go to people, not to the agent that wrote the code.
 
-Self Review Canvas brings a rich diff view and the PR review loop to your working tree. Read whole files with changes inline, use syntax highlighting to follow the code, and review Markdown without losing its source markers. Compare a whole branch or focus on pending edits. You read the changes and decide what matters.
+Self-Review brings a rich diff view and the PR review loop to your working tree. Read whole files with changes inline, use syntax highlighting to follow the code, and review Markdown without losing its source markers. Compare a whole branch or focus on pending edits. You read the changes and decide what matters.
 
 Use it while the implementation is taking shape, not just for a final check. Select a line or block and ask your agent to use an existing helper, preserve a behavior, simplify an approach, or adjust the design. Each comment carries the exact file, side, line range, and surrounding hunk. The agent makes the edits or answers, replies in the thread, and the diff refreshes so you can keep steering. Send feedback immediately or collect it into a batch. Nothing is pushed, published, or committed unless you ask for it.
 
@@ -154,7 +154,7 @@ This project was renamed from Manual Review Canvas, and its plugin, marketplace,
 ```bash
 copilot plugin uninstall manual-review-canvas@manual-review-canvas
 copilot plugin marketplace remove manual-review-canvas
-copilot plugin marketplace add SergeyTeplyakov/self-review-canvas
+copilot plugin marketplace add SergeyTeplyakov/Self-Review
 copilot plugin install self-review-canvas@self-review-canvas
 ```
 

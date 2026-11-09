@@ -18,7 +18,7 @@ discuss; they never authorize automatic fixes.
   `extensions/self-review/`. If it is missing from the canvas catalog, the plugin
   is not installed or the session started before it was installed. Tell the user
   how to install it and run nothing without their confirmation:
-  `copilot plugin marketplace add SergeyTeplyakov/self-review-canvas`, then
+  `copilot plugin marketplace add SergeyTeplyakov/Self-Review`, then
   `copilot plugin install self-review-canvas@self-review-canvas`, then start a
   new session.
 - Inspect the live canvas catalog for the self-review extension. Discover its
