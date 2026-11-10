@@ -9,8 +9,10 @@ import { Store, migrateLegacyDataRoot } from "./lib/store.mjs";
 import { ReviewService, ReviewError, THREAD_KINDS, THREAD_STATUSES, OUTCOMES, LESSON_STATUSES, SCOPES } from "./lib/review-service.mjs";
 import { SettingsService } from "./lib/settings.mjs";
 import { Delivery } from "./lib/delivery.mjs";
-import { AgentReview, REVIEW_FOCUSES, FINDING_ASSESSMENTS, FINDING_SEVERITIES, EVIDENCE_FIELDS, FUSION_REVIEWER, SUGGESTED_REVIEWERS } from "./lib/agent-review.mjs";
+import { AgentReview, REVIEW_FOCUSES, FINDING_ASSESSMENTS, FINDING_SEVERITIES, EVIDENCE_FIELDS, FUSION_REVIEWER } from "./lib/agent-review.mjs";
 import { startReviewServer } from "./lib/server.mjs";
+import { settingsActions } from "./lib/settings-actions.mjs";
+import { completionHooks } from "./lib/completion-guidance.mjs";
 
 const CANVAS_ID = "self-review";
 const WEB_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "web");
@@ -159,39 +161,14 @@ function requireString(input, name) {
 }
 
 const reviewIdProp = { type: "string", description: "Review id. Defaults to the review shown in this canvas instance." };
-const agentReviewSettingsSchema = {
-    type: "object",
-    properties: {
-        models: { type: "array", minItems: 1, maxItems: 4, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 120 } },
-        focus: { type: "string", enum: REVIEW_FOCUSES },
-        intent: { type: "string", maxLength: 4000 },
-        skipDialog: { type: "boolean", description: "An explicit Run agentic review click uses these defaults without reopening configuration. Does not auto-start reviews or authorize fixes." },
-    },
-    required: ["models", "focus", "skipDialog"],
-    additionalProperties: false,
-};
-
 const actions = [
-    {
-        name: "get_agent_review_settings",
-        description: `Read this user's agent review defaults across repositories. Null means not configured; the canvas then prefills the built-in suggestions ${SUGGESTED_REVIEWERS.join(", ")}, which are not saved choices or consent. Reading settings does not start a review.`,
-        handler: guarded(() => settings.getAgentReview()),
-    },
-    {
-        name: "set_agent_review_settings",
-        description: "Save user-selected review defaults across repositories, or clear them with defaults:null. Only on the user's explicit configuration request. Never select paid models on the user's behalf.",
-        inputSchema: {
-            type: "object",
-            properties: { defaults: { anyOf: [agentReviewSettingsSchema, { type: "null" }] } },
-            required: ["defaults"],
-            additionalProperties: false,
-        },
-        handler: guarded(async (ctx) => {
-            const saved = await settings.updateAgentReview(inputOf(ctx).defaults);
+    ...settingsActions({
+        settings,
+        guard: guarded,
+        changed: () => {
             for (const reviewId of openReviewIds()) service.changed(reviewId, "agent-review-settings");
-            return saved;
-        }),
-    },
+        },
+    }),
     {
         name: "run_agent_review",
         description: `Only on an explicit user request, queue a read-only review by selected models or saved user defaults (useDefaults:true). Reuse saved choices without asking again. Models are exact model IDs or ${FUSION_REVIEWER}, which runs Copilot Fusion in a coordinated child session. May consume credits. Read get_review for revisionId first; results are suggestions, never automatic edits.`,
@@ -431,6 +408,7 @@ const actions = [
 const migration = await migrateLegacyDataRoot().then((copied) => ({ copied }), (error) => ({ error }));
 
 session = await joinSession({
+    hooks: completionHooks,
     canvases: [
         createCanvas({
             id: CANVAS_ID,

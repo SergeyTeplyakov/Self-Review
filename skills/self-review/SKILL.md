@@ -33,6 +33,16 @@ discuss; they never authorize automatic fixes.
 
 ## Start the review
 
+The extension injects completion guidance through documented session-start and
+user-prompt hooks. After a completed code-changing task, open or refresh the
+matching human-led review unless the user opts out. This is advisory context,
+not a deterministic completion callback. Verify the actual checkout and
+comparison, discover live schemas, and reuse a matching panel; never reopen
+reviews for read-only work or create a loop while processing review comments.
+If tools or the provider are unavailable, propose the review and state the
+limitation instead. Opening the diff does not authorize an agent review or
+publication.
+
 1. Establish the intended comparison from the user's request and existing
    context. Ask only if the base or scope is ambiguous. Distinguish the published
    PR, committed branch changes, and local working-tree changes. Open the canvas

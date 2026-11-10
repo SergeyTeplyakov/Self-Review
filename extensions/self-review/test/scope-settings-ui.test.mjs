@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
 import { parseUnifiedDiff } from "../lib/diff.mjs";
+import { loadApp as runApp } from "./load-app.mjs";
 
 // Loads the page script into a bare vm context. Elements are created on demand and remembered per selector,
 // so a test can render one piece of the page and read its markup back.
@@ -23,7 +24,7 @@ async function loadApp(globals = {}) {
         URLSearchParams, location: { search: "" }, document, localStorage: storage(), sessionStorage,
         setInterval() {}, setTimeout: () => 0, clearTimeout() {}, ...globals,
     });
-    vm.runInContext(await readFile(new URL("../web/app.js", import.meta.url), "utf8"), context);
+    await runApp(context);
     return {
         document, sessionStorage, focused, node,
         state: vm.runInContext("state", context),

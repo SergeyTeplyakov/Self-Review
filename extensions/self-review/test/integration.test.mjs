@@ -295,6 +295,11 @@ test("HTTP server enforces token/host/origin and delivers posted comments", asyn
         assert.equal(page.status, 200);
         assert.match(page.text, /app\.js/);
         assert.equal((await request(port, { pathName: "/app.js" })).status, 200);
+        for (const asset of ["/contracts.mjs", "/settings-api.mjs"]) {
+            const response = await request(port, { pathName: asset });
+            assert.equal(response.status, 200);
+            assert.match(response.text, /export /);
+        }
         assert.equal((await request(port, { pathName: "/../extension.mjs" })).status, 404);
 
         assert.equal((await request(port, { pathName: "/api/state" })).status, 403);
