@@ -7,6 +7,7 @@ import { watch } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { SCOPES } from "./review-service.mjs";
+import { SUGGESTED_REVIEWERS } from "./agent-review.mjs";
 import { resolveDelivery } from "./settings.mjs";
 
 const MAX_JSON = 1024 * 1024;
@@ -148,6 +149,16 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         }
     }
 
+    async function readAgentReviewSettings() {
+        if (!settings?.getAgentReview) return { agentReviewSettings: null, agentReviewSettingsAvailable: false };
+        try {
+            return { agentReviewSettings: await settings.getAgentReview(), agentReviewSettingsAvailable: true };
+        } catch (err) {
+            log(`self-review: could not read agent review defaults: ${err.message}`, "warning");
+            return { agentReviewSettings: null, agentReviewSettingsAvailable: true, agentReviewSettingsError: `Could not read agent review defaults: ${err.message}` };
+        }
+    }
+
     // An explicit draft flag wins; otherwise the repository's delivery mode decides, and an undecided ask-mode review holds.
     async function shouldHold(reviewId, draft) {
         if (draft !== undefined) {
@@ -172,7 +183,7 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         if (req.method === "GET") {
             if (parts[0] === "state" && parts.length === 1) {
                 const review = await service.getReview(reviewId);
-                return send(res, 200, { instanceId, review, session: { busy: delivery.busy }, settings: await readSettings(review.repoRoot), agentReviewAvailable: Boolean(agentReview) });
+                return send(res, 200, { instanceId, review, session: { busy: delivery.busy }, settings: await readSettings(review.repoRoot), agentReviewAvailable: Boolean(agentReview), agentReviewSuggestedModels: SUGGESTED_REVIEWERS, ...await readAgentReviewSettings() });
             }
             if (parts[0] === "snapshot" && parts.length === 2) {
                 return send(res, 200, await service.getSnapshot(reviewId, parts[1]));
@@ -203,6 +214,13 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
             throw new HttpError(409, "conflict", "This canvas now shows a different review. Your comment was not saved; reload and try again.");
         }
         const body = await readJsonBody(req);
+
+        if (parts[0] === "agent-review-settings" && parts.length === 1) {
+            if (!settings?.updateAgentReview) throw new HttpError(501, "unsupported", "Agent review defaults are not available.");
+            const saved = await settings.updateAgentReview(body.defaults);
+            service.changed(reviewId, "agent-review-settings");
+            return send(res, 200, saved);
+        }
 
         if (parts[0] === "agent-reviews") {
             if (!agentReview) throw new HttpError(501, "unsupported", "Agent review is not available. Reload the extension.");

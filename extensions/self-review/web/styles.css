@@ -138,19 +138,30 @@ select {
 .finding-evidence dt { margin-top: 8px; font-weight: 600; }
 .finding-evidence dd { margin: 4px 0; overflow-wrap: anywhere; }
 .agent-review-run { padding: 12px; margin-bottom: 8px; }
+.change-context { display: flex; flex-direction: column; gap: 8px; }
+.change-context-heading, .change-context-details { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; }
+.change-context-heading .title { overflow-wrap: anywhere; }
+.change-context-details { padding-top: 8px; border-top: 1px solid var(--mr-border); }
+.change-context-details .spacer { flex: 1; }
+.review-workflows { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; padding-top: 12px; border-top: 1px solid var(--mr-border); }
+.review-lane { display: flex; min-width: 0; flex-direction: column; gap: 12px; padding: 12px; border: 1px solid var(--mr-border); border-radius: var(--mr-radius); }
+.review-lane-heading h2 { margin: 0 0 4px; font-size: 1.05em; }
+.review-lane-heading p { margin: 0; }
+.review-lane-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.feedback-draft-count { color: var(--mr-muted); }
+button.agent-review-launch { padding: 7px 14px; font-weight: 600; }
+button:focus-visible { outline: 2px solid var(--color-focus-outline, var(--mr-accent)); outline-offset: 2px; }
 .review-summary { white-space: pre-wrap; overflow-wrap: anywhere; }
 .mono { font-family: var(--mr-mono); }
 
 #top {
     display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 6px 14px;
-    padding: 8px 12px;
+    flex-direction: column;
+    gap: 12px;
+    padding: 12px;
     border-bottom: 1px solid var(--mr-border);
 }
 #top .title { font-weight: 600; font-size: 1.1em; }
-#top .spacer { flex: 1; }
 .pill {
     display: inline-flex;
     align-items: center;
@@ -168,6 +179,10 @@ select {
 
 .add { color: var(--mr-green); }
 .del { color: var(--mr-red); }
+
+@media (max-width: 720px) {
+    .review-workflows { grid-template-columns: 1fr; }
+}
 
 #layout { display: flex; flex: 1; min-height: 0; position: relative; }
 

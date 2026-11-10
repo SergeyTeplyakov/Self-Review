@@ -85,6 +85,165 @@ test("agent review is opt-in and its dialog collects models, focus, and guidance
     assert.equal(app.focused.at(-1), '[data-action="agent-review"]');
 });
 
+test("built-in reviewer suggestions prefill only without saved or previous choices and never skip the dialog", async () => {
+    const posts = [];
+    const app = await loadApp({ fetch: async (url) => { posts.push(url); return jsonResponse({}); } });
+    app.state.review = reviewFixture();
+    app.state.agentReviewAvailable = true;
+    app.state.agentReviewSuggestedModels = ["gpt-6-astra", "gpt-6.1-sol", "copilot-fusion"];
+    const click = clicker(app);
+    await click("agent-review");
+    assert.equal(app.state.dialog.models, "gpt-6-astra, gpt-6.1-sol, copilot-fusion");
+    assert.equal(app.state.dialog.saveDefaults, false, "suggestions are not saved choices");
+    assert.equal(app.state.dialog.skipDialog, false);
+    assert.match(app.node("#dialog").innerHTML, /copilot-fusion to run Copilot Fusion in a child session/);
+    assert.equal(posts.length, 0, "suggestions never start a review");
+    await click("dialog-cancel");
+    app.state.review = reviewFixture({ agentReviews: [{ runId: "ar-last", state: "completed", focus: "simplify", models: ["model-last"], results: [] }] });
+    await click("agent-review");
+    assert.equal(app.state.dialog.models, "model-last", "the previous run wins over suggestions");
+    await click("dialog-cancel");
+    app.state.agentReviewSettings = { models: ["model-saved"], focus: "both", intent: "", skipDialog: false };
+    await click("agent-review");
+    assert.equal(app.state.dialog.models, "model-saved", "saved defaults win over the previous run");
+    await click("dialog-cancel");
+    app.state.review = reviewFixture({ agentReviews: [{ runId: "ar-fusion", state: "running", focus: "both", revisionId: "r1", models: ["model-a", "copilot-fusion"], results: [] }] });
+    const html = app.run("agentReviewsHtml()");
+    assert.match(html, /copilot-fusion<\/span>: Awaiting result from the Copilot Fusion child session/);
+    assert.match(html, /model-a<\/span>: Awaiting result</);
+    assert.equal(posts.length, 0);
+});
+
+test("the prominent review action and agent-comment counts include findings, not human threads or replies", async () => {
+    const app = await loadApp();
+    const thread = (id, status, revisionId) => ({
+        threadId: id, kind: "overview", status,
+        agentReview: { runId: "ar-one", model: "model-a", revisionId, assessment: "unverified" },
+        messages: [{ messageId: id, author: "agent", body: "Finding", createdAt: "2026-01-01" },
+            { messageId: `${id}-reply`, author: "user", body: "Discuss", createdAt: "2026-01-01" }],
+    });
+    app.state.review = reviewFixture({ threads: [thread("one", "active", "r1"), thread("two", "resolved", "r0"),
+        { threadId: "manual", kind: "overview", status: "active", messages: [{ author: "agent", body: "Reply to human feedback" }] }] });
+    app.state.agentReviewAvailable = true;
+    app.state.busy = false;
+    app.state.settings = settingsFixture();
+    app.run("renderTop(); renderSide()");
+    const html = app.node("#top").innerHTML;
+    assert.deepEqual([...html.matchAll(/<section class="review-lane [^"]*" aria-labelledby="([^"]+)"/g)].map((match) => match[1]),
+        ["agentic-review-title", "manual-review-title"]);
+    assert.ok(html.indexOf('aria-label="Change context"') < html.indexOf("Agentic review"));
+    assert.match(html, /aria-label="Change context".*Copilot idle.*Refresh/);
+    assert.match(html, /class="primary agent-review-launch"[^>]*>Run agentic review/);
+    assert.match(html, /Agent comments \(<span aria-live="polite">2<\/span>\)/);
+    assert.match(html, /aria-labelledby="manual-review-title".*Delivery: Immediate.*Learning: Off.*Manual review settings/);
+    assert.match(app.node("#side").innerHTML, /Agent comments<\/span><span class="count">2/);
+    assert.match(app.run("agentCommentsView()"), /1 active, 1 closed or resolved; 1 from older revisions/);
+    assert.doesNotMatch(app.run("agentCommentsView()"), /Reply to human feedback/);
+    await clicker(app)("nav", { view: "agent-comments" });
+    assert.equal(app.state.view.type, "agent-comments");
+    assert.match(app.node("#main").innerHTML, /Agent comments \(2\)/);
+    app.state.review = reviewFixture({ agentReviews: [{ state: "running" }] });
+    app.run("renderTop()");
+    assert.match(app.node("#top").innerHTML, /data-action="agent-review"[^>]*disabled>Agentic review running/);
+    assert.equal(app.run("agentComments().length"), 0, "scope switches never carry another scope's counts");
+});
+
+test("saved user choices prefill configuration and save-only never starts a review", async () => {
+    const posts = [];
+    const defaults = { models: ["model-a"], focus: "both", intent: "Check contracts.", skipDialog: true };
+    const app = await loadApp({
+        fetch: async (url, opts) => {
+            posts.push([url, JSON.parse(opts.body)]);
+            return jsonResponse(JSON.parse(opts.body).defaults);
+        },
+    });
+    app.run("loadState = async () => {}");
+    app.state.review = reviewFixture();
+    app.state.agentReviewAvailable = true;
+    app.state.agentReviewSettingsAvailable = true;
+    app.state.agentReviewSettings = defaults;
+    await clicker(app)("agent-review-configure");
+    assert.equal(app.state.dialog.models, "model-a");
+    assert.equal(app.state.dialog.intent, "Check contracts.");
+    assert.equal(app.state.dialog.skipDialog, true);
+    assert.match(app.node("#dialog").innerHTML, /User defaults for all repositories/);
+    await app.run("onChange")({ target: { name: "review-skip-dialog", checked: false } });
+    await clicker(app)("agent-review-save-defaults");
+    assert.deepEqual(posts, [["/api/agent-review-settings", { defaults: { ...defaults, skipDialog: false } }]]);
+    assert.equal(app.state.dialog, null);
+    assert.equal(app.state.agentReviewSettings.skipDialog, false);
+    await clicker(app)("agent-review");
+    assert.equal(app.state.dialog.type, "agent-review", "disabling one-click brings back the dialog");
+    assert.equal(posts.length, 1, "opening configuration never launches work");
+});
+
+test("one-click run skips the dialog, uses the current revision, and guards repeated clicks", async () => {
+    let finish;
+    const posts = [];
+    const app = await loadApp({ fetch: async (url, opts) => {
+        posts.push([url, JSON.parse(opts.body)]);
+        return new Promise((resolve) => { finish = () => resolve(jsonResponse({ state: "queued" })); });
+    } });
+    app.run("loadState = async () => {}");
+    app.state.review = reviewFixture();
+    app.state.agentReviewAvailable = true;
+    app.state.agentReviewSettings = { models: ["model-a"], focus: "both", intent: "", skipDialog: true };
+    const first = clicker(app)("agent-review");
+    await clicker(app)("agent-review");
+    assert.equal(app.state.dialog, null);
+    assert.equal(app.state.startingReview, true);
+    assert.deepEqual(posts, [["/api/agent-reviews", { useDefaults: true, revisionId: "r1" }]]);
+    finish();
+    await first;
+    assert.equal(app.state.startingReview, false);
+});
+
+test("one-click failures surface errors and release the button even if reloading state fails", async () => {
+    for (const reloadFails of [false, true]) {
+        const app = await loadApp({ fetch: async () => jsonResponse({ error: { message: "Review could not be queued" } }, 500) });
+        app.run(reloadFails ? 'loadState = async () => { throw new Error("State reload failed"); }' : "loadState = async () => {}");
+        app.state.review = reviewFixture();
+        app.state.agentReviewAvailable = true;
+        app.state.agentReviewSettings = { models: ["model-a"], focus: "both", skipDialog: true };
+        await clicker(app)("agent-review");
+        assert.equal(app.state.startingReview, false);
+        assert.equal(app.state.dialog, null);
+        assert.match(app.node("#top").innerHTML, /data-action="agent-review"[^>]*>Run agentic review/);
+        assert.doesNotMatch(app.node("#top").innerHTML, /data-action="agent-review"[^>]*disabled/);
+        assert.equal(app.node("#toast").textContent, reloadFails ? "State reload failed" : "Review could not be queued");
+        assert.match(app.node("#toast").className, /error/);
+    }
+});
+
+test("failed settings saves stay visible and never start a review", async () => {
+    const posts = [];
+    const app = await loadApp({ fetch: async (url) => {
+        posts.push(url);
+        return jsonResponse({ error: { message: "Disk is read-only" } }, 500);
+    } });
+    app.run("loadState = async () => {}");
+    app.state.review = reviewFixture();
+    app.state.agentReviewAvailable = true;
+    app.state.agentReviewSettingsAvailable = true;
+    app.run("openAgentReview()");
+    app.state.dialog.models = "model-a";
+    app.state.dialog.saveDefaults = true;
+    await app.run("startAgentReview()");
+    assert.deepEqual(posts, ["/api/agent-review-settings"]);
+    assert.match(app.node("#dialog").innerHTML, /role="alert">Disk is read-only/);
+    assert.equal(app.state.dialog.saving, false);
+});
+
+test("an unreadable profile exposes its error instead of silently running different choices", async () => {
+    const app = await loadApp();
+    app.state.review = reviewFixture();
+    app.state.agentReviewAvailable = true;
+    app.state.agentReviewSettingsError = "Could not read agent review defaults: invalid JSON";
+    await clicker(app)("agent-review");
+    assert.match(app.node("#dialog").innerHTML, /role="alert">Could not read agent review defaults/);
+    assert.equal(app.state.dialog.models, "");
+});
+
 test("agent review traps keyboard focus including guidance and the optional skill link while queuing", async () => {
     const app = await loadApp();
     app.state.dialog = { type: "agent-review", saving: false };
@@ -297,11 +456,12 @@ test("the top bar shows the review scope, and the learning controls only when th
 
     for (const [learning, pill] of [["off", "Off"], ["suggest", "Suggest"], ["auto", "Auto-save"], ["unexpected", "Off"]]) {
         app.state.settings = settingsFixture({ learning, configured: true });
-        assert.match(top(), new RegExp(`Learning: ${pill}</span><button data-action="configure"`), learning);
+        assert.match(top(), new RegExp(`Learning: ${pill}</span><button data-action="configure"[^>]*>Manual review settings`), learning);
     }
     app.state.settings = null;
     html = top();
-    assert.doesNotMatch(html, /Learning:|data-action="configure"/);
+    assert.doesNotMatch(html, /Learning:|Manual review settings|data-action="configure"/);
+    assert.match(html, /aria-labelledby="manual-review-title"/);
     assert.match(html, /data-action="refresh"/);
 });
 

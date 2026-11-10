@@ -6,12 +6,13 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { Store } from "../lib/store.mjs";
 import { ReviewService } from "../lib/review-service.mjs";
-import { AgentReview } from "../lib/agent-review.mjs";
+import { AgentReview, FUSION_REVIEWER, SUGGESTED_REVIEWERS } from "../lib/agent-review.mjs";
 import { Delivery } from "../lib/delivery.mjs";
 import { parseUnifiedDiff } from "../lib/diff.mjs";
 import * as git from "../lib/git.mjs";
 import { startReviewServer } from "../lib/server.mjs";
 import { buildCommentPrompt } from "../lib/prompt.mjs";
+import { SettingsService } from "../lib/settings.mjs";
 
 const models = ["gpt-review-test", "mai-review-test"];
 const input = { models, focus: "both", revisionId: "r1" };
@@ -46,12 +47,63 @@ async function fixture(t, options = {}) {
     const sent = [];
     const log = [];
     const agent = new AgentReview({
-        service, sessionId: () => options.owner ?? "session-a",
+        service, settings: new SettingsService({ store }), sessionId: () => options.owner ?? "session-a",
         send: async (o) => { sent.push(o); return options.send ? options.send(o) : "transport-1"; },
         log: (...args) => log.push(args),
     });
     return { root, store, service, snapshot, agent, sent, log };
 }
+
+test("user review defaults persist across providers without changing repository preferences or starting work", async (t) => {
+    const f = await fixture(t);
+    const settings = new SettingsService({ store: f.store });
+    const defaults = { models, focus: "both", intent: "Preserve behavior.", skipDialog: true };
+    assert.equal(await settings.getAgentReview(), null);
+    await f.store.updateSettings((data) => { data.repos.first = { learning: "suggest", delivery: "batch" }; });
+    await settings.updateAgentReview(defaults);
+    const reopened = new SettingsService({ store: new Store(f.root) });
+    assert.deepEqual(await reopened.getAgentReview(), defaults);
+    assert.deepEqual((await f.store.readSettings()).repos.first, { learning: "suggest", delivery: "batch" });
+    assert.equal(f.sent.length, 0, "configuration never dispatches a paid review");
+    const before = await readFile(f.store.settingsFile(), "utf8");
+    for (const patch of [{ models: [] }, { models: [...models, models[0]] }, { focus: "fix" }, { skipDialog: "yes" }, { intent: "x".repeat(4001) }]) {
+        await assert.rejects(settings.updateAgentReview({ ...defaults, ...patch }));
+        assert.equal(await readFile(f.store.settingsFile(), "utf8"), before, "invalid preferences do not overwrite saved choices");
+    }
+    await settings.updateAgentReview(null);
+    assert.equal(await reopened.getAgentReview(), null);
+    assert.deepEqual((await f.store.readSettings()).repos.first, { learning: "suggest", delivery: "batch" });
+});
+
+test("saved-default runs use the same validated, revision-pinned pipeline and never ask for models again", async (t) => {
+    const f = await fixture(t);
+    const settings = new SettingsService({ store: f.store });
+    const request = { useDefaults: true, revisionId: "r1" };
+    await assert.rejects(f.agent.start("review", request, "c"), /No agent review defaults/);
+    await settings.updateAgentReview({ models, focus: "simplify", intent: "Keep API behavior.", skipDialog: true });
+    for (const patch of [{ models }, { focus: "review" }, { intent: "" }, { useDefaults: false }, { revisionId: "r0" }]) {
+        await assert.rejects(f.agent.start("review", { ...request, ...patch }, "c"));
+    }
+    assert.equal(f.sent.length, 0);
+    const run = await f.agent.start("review", request, "c");
+    assert.deepEqual(run.models, models);
+    assert.equal(run.focus, "simplify");
+    assert.equal(run.intent, "Keep API behavior.");
+    assert.match(f.sent[0].prompt, /Do not ask for those choices again/);
+    assert.match(f.sent[0].prompt, /Honor host permission prompts/);
+    await settings.updateAgentReview({ models: ["another-model"], focus: "review", skipDialog: false });
+    assert.deepEqual((await f.service.getReview("review")).agentReviews[0].models, models, "changing preferences cannot alter a queued run");
+    await assert.rejects(f.agent.start("review", request, "c"), /already has an active/);
+    assert.equal(f.sent.length, 1);
+});
+
+test("unreadable saved defaults fail explicitly without dispatch or fallback", async (t) => {
+    const f = await fixture(t);
+    await writeFile(f.store.settingsFile(), "{broken");
+    await assert.rejects(f.agent.start("review", { useDefaults: true, revisionId: "r1" }, "c"), SyntaxError);
+    assert.equal(f.sent.length, 0);
+    assert.equal((await f.service.getReview("review")).agentReviews, undefined);
+});
 
 test("multi-model review queues only after an explicit start and excludes manual drafts", async (t) => {
     const f = await fixture(t);
@@ -79,6 +131,8 @@ test("multi-model review queues only after an explicit start and excludes manual
     assert.match(prompt.prompt, /Zero confirmed findings/);
     assert.match(prompt.prompt, /Do not launch an extra validator model/);
     assert.match(prompt.prompt, /Preserve outputs, errors, side effects, ordering, and prose meaning/);
+    assert.match(prompt.prompt, /Wait for all reviewers and report every result before ending your turn/);
+    assert.doesNotMatch(prompt.prompt, /copilot-fusion|create_session/, "Fusion dispatch is only added when selected");
     const inventory = await f.agent.input("review", { runId: run.runId });
     assert.equal(inventory.run.state, "running");
     assert.equal(inventory.scope, "pending");
@@ -92,6 +146,34 @@ test("multi-model review queues only after an explicit start and excludes manual
     assert.deepEqual((await f.agent.input("review", { runId: run.runId, path: "notes.md", side: "new" })).content.lines, ["new"]);
     await assert.rejects(f.agent.input("review", { runId: run.runId, path: "absent.txt" }), /not in/);
     await assert.rejects(f.agent.input("review", { runId: run.runId, path: "notes.md", hunkIndex: 1 }), /outside/);
+});
+
+test("copilot-fusion runs in one coordinated child session and its result may arrive after the subagents report", async (t) => {
+    assert.deepEqual(SUGGESTED_REVIEWERS, ["gpt-6-astra", "gpt-6.1-sol", FUSION_REVIEWER]);
+    const f = await fixture(t);
+    const run = await f.agent.start("review", { ...input, models: [models[0], FUSION_REVIEWER] }, "c");
+    const prompt = f.sent[0].prompt;
+    assert.match(prompt, /per selected model except copilot-fusion \(\["gpt-review-test"\]\)/);
+    assert.match(prompt, /exactly one coordinated child session; never emulate it with a subagent, switch this conversation's model/);
+    assert.match(prompt, /create_session: session_kind "chat", coordinate_with_creator true, notify_on_idle "once"/);
+    assert.match(prompt, /kickoff \{mode: "interactive", model: "auto", auto_tier: the Copilot Fusion tier/);
+    assert.match(prompt, /immediately report an error for copilot-fusion/);
+    assert.match(prompt, /must not edit, format, commit, build, create PRs or sessions, or dispatch other reviewers/);
+    assert.match(prompt, /Treat child messages as provisional until its idle notification or a confirmed terminal state/);
+    assert.match(prompt, /Do not finalize on the first message/);
+    assert.match(prompt, /reconcile all received candidates and summaries/);
+    assert.match(prompt, /validate its candidates exactly like other reviewers/);
+    assert.match(prompt, /call report_agent_review once with model copilot-fusion; reports are immutable/);
+    assert.match(prompt, /If the child finishes without a usable result, report an error for copilot-fusion/);
+    assert.match(prompt, /Only the copilot-fusion result may arrive in a later turn/);
+    assert.doesNotMatch(prompt, /report every result before ending your turn/);
+    assert.equal((await f.agent.report("review", { runId: run.runId, model: models[0], findings: [], summary })).state, "running", "the run waits for Fusion");
+    assert.equal((await f.agent.report("review", { runId: run.runId, model: FUSION_REVIEWER, findings: [finding], summary })).state, "completed");
+    assert.deepEqual((await f.service.getReview("review")).threads.map((x) => x.agentReview.model), [FUSION_REVIEWER]);
+    const solo = await fixture(t);
+    await solo.agent.start("review", { ...input, models: [FUSION_REVIEWER] }, "c");
+    assert.doesNotMatch(solo.sent[0].prompt, /subagent per selected model/, "a Fusion-only run launches no subagents");
+    assert.match(solo.sent[0].prompt, /exactly one coordinated child session/);
 });
 
 test("invalid models, focus, stale revisions, empty changes, and concurrent runs are rejected", async (t) => {
@@ -363,6 +445,39 @@ test("review context exposes the baseline and caller guard; known outcomes persi
     const clean = await agent.report(reviewId, { runId: run.runId, model: models[0], findings: [], summary: "Simulated clean-diff result: no new defects; the old charge issue remains. Source inspection only; tests not run." });
     assert.equal(clean.state, "completed");
     assert.deepEqual(clean.results[0].threadIds, [], "a clean diff must not fabricate a new finding");
+});
+
+test("HTTP settings persist user-wide defaults, expose read failures, and separate save from run", async (t) => {
+    const f = await fixture(t);
+    const logs = [];
+    const settings = new SettingsService({ store: f.store });
+    const delivery = new Delivery({ service: f.service, sessionId: () => "session-a", send: async () => "unused" });
+    const server = await startReviewServer({
+        instanceId: "c", getReviewId: () => "review", service: f.service, settings, delivery, agentReview: f.agent,
+        webRoot: fileURLToPath(new URL("../web", import.meta.url)), log: (message) => logs.push(message),
+    });
+    t.after(() => server.close());
+    const url = new URL(server.url);
+    const headers = { "Content-Type": "application/json", "X-MR-Token": url.searchParams.get("t"), "X-MR-Review": "review" };
+    const post = (route, body) => fetch(new URL(`api/${route}`, url), { method: "POST", headers, body: JSON.stringify(body) });
+    const state = async () => (await fetch(new URL("api/state", url), { headers })).json();
+    assert.equal((await state()).agentReviewSettings, null);
+    assert.deepEqual((await state()).agentReviewSuggestedModels, SUGGESTED_REVIEWERS, "suggestions are offered without being saved");
+    const defaults = { models, focus: "both", intent: "", skipDialog: true };
+    assert.equal((await post("agent-review-settings", { defaults })).status, 200);
+    assert.equal(f.sent.length, 0);
+    assert.deepEqual((await state()).agentReviewSettings, defaults);
+    assert.equal((await state()).agentReviewSettingsAvailable, true);
+    assert.equal((await post("agent-review-settings", { defaults: { ...defaults, models: [] } })).status, 400);
+    assert.deepEqual((await state()).agentReviewSettings, defaults);
+    assert.equal((await post("agent-reviews", { useDefaults: true, revisionId: "r1" })).status, 200);
+    assert.equal(f.sent.length, 1);
+    await writeFile(f.store.settingsFile(), '{"agentReview":{"skipDialog":true}}');
+    const failed = await state();
+    assert.equal(failed.agentReviewSettings, null);
+    assert.match(failed.agentReviewSettingsError, /Could not read agent review defaults/);
+    assert.ok(logs.some((message) => message.includes("could not read agent review defaults")));
+    assert.equal(f.sent.length, 1);
 });
 
 test("HTTP start, model reporting, approval, and discussion use the real delivery pipeline", async (t) => {
