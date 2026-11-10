@@ -51,7 +51,7 @@ export class ReviewService extends EventEmitter {
     setDelivery(reviewId: string, messageId: string, update: { state: string; error?: string }): Promise<unknown>;
     findMessage(reviewId: string, messageId: string): Promise<{ thread: ReviewThread; message: ReviewMessage }>;
     discardDraft(reviewId: string, messageId: string): Promise<unknown>;
-    setDeliveryChoice(reviewId: string, mode: unknown): Promise<"immediate" | "batch">;
+    setDeliveryChoice(reviewId: string, mode: unknown): Promise<"immediate" | "batch" | null>;
     openSibling(reviewId: string, scope: unknown): Promise<string>;
 }
 

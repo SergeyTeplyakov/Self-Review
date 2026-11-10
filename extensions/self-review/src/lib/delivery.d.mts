@@ -15,7 +15,7 @@ export class Delivery extends EventEmitter {
         learning: (repoRoot: string) => Promise<string>;
         sessionId: () => string | undefined;
     });
-    readonly busy: boolean;
+    readonly busy: boolean | null;
     setBusy(busy: boolean): void;
     onUserMessage(event: unknown): Promise<void>;
     onIdle(): Promise<void>;

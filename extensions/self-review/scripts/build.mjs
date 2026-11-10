@@ -8,7 +8,21 @@ const repositoryRoot = path.resolve(extensionRoot, "..", "..");
 const distributionRoot = path.join(extensionRoot, "dist");
 const compiler = path.join(repositoryRoot, "node_modules", "typescript", "bin", "tsc");
 
-rmSync(distributionRoot, { recursive: true, force: true });
+function clearDirectory(directory) {
+    mkdirSync(directory, { recursive: true });
+    for (const entry of readdirSync(directory)) {
+        rmSync(path.join(directory, entry), { recursive: true, force: true });
+    }
+}
+
+mkdirSync(distributionRoot, { recursive: true });
+const webOutput = path.join(distributionRoot, "web");
+mkdirSync(webOutput, { recursive: true });
+for (const entry of readdirSync(distributionRoot)) {
+    const entryPath = path.join(distributionRoot, entry);
+    if (entry === "web") clearDirectory(webOutput);
+    else rmSync(entryPath, { recursive: true, force: true });
+}
 
 for (const project of ["tsconfig.node.build.json", "tsconfig.web.build.json"]) {
     execFileSync(process.execPath, [
@@ -18,7 +32,6 @@ for (const project of ["tsconfig.node.build.json", "tsconfig.web.build.json"]) {
     ], { cwd: repositoryRoot, stdio: "inherit" });
 }
 
-const webOutput = path.join(distributionRoot, "web");
 mkdirSync(webOutput, { recursive: true });
 const legacyLibrary = path.join(extensionRoot, "src", "lib");
 for (const file of readdirSync(legacyLibrary)) {

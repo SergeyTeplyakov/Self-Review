@@ -45,6 +45,14 @@ function fresh() {
     return { store, service: new ReviewService({ store }) };
 }
 
+test("Delivery busy starts unknown until session activity is observed", () => {
+    const { service } = fresh();
+    const { delivery } = recorder(service);
+    assert.equal(delivery.busy, null);
+    delivery.setBusy(false);
+    assert.equal(delivery.busy, false);
+});
+
 // A Delivery whose session records every prompt; set control.fail to make sending throw.
 function recorder(service, control = {}) {
     const sent = [];

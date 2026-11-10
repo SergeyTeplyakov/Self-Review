@@ -22,6 +22,6 @@ export interface DiffRow {
 
 export function parseUnifiedDiff(text: string): DiffFile[];
 export function synthesizeAddedFile(path: string, content: string): DiffFile;
-export function hunkAnchorRange(hunk: DiffHunk): { side: "old" | "new"; startLine: number; endLine: number };
+export function hunkAnchorRange(hunk: DiffHunk): { side: "old" | "new"; startLine: number; endLine: number } | null;
 export function selectedLines(file: DiffFile, side: "old" | "new", startLine: number, endLine: number): string[];
 export function hunkExcerpt(file: DiffFile, side: "old" | "new", startLine: number, endLine: number): { text: string } | null;

@@ -12,6 +12,7 @@
     "extensions/self-review/types/**/*.d.ts",
     "extensions/self-review/src/extension.mts",
     "extensions/self-review/src/lib/**/*.mts",
-    "extensions/self-review/src/web/contracts.mts"
+    "extensions/self-review/src/web/contracts.mts",
+    "extensions/self-review/type-tests/runtime-apis.mts"
   ]
 }

@@ -79,6 +79,7 @@ test("parseUnifiedDiff handles dash/plus content, renames, no-newline, deletes, 
 test("hunk helpers select lines per side", () => {
     const [a] = parseUnifiedDiff(DIFF);
     assert.deepEqual(hunkAnchorRange(a.hunks[0]), { side: "new", startLine: 1, endLine: 4 });
+    assert.equal(hunkAnchorRange({ rows: [] }), null, "an empty hunk has no anchor range");
     assert.deepEqual(selectedLines(a, "new", 2, 3), ["++ not a header, an added line starting with pluses", "line3"]);
     assert.deepEqual(selectedLines(a, "old", 2, 2), ["-- not a header, a deleted line starting with dashes"]);
     const ex = hunkExcerpt(a, "new", 2, 2);
