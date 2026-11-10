@@ -1,9 +1,9 @@
-import { createSettingsApi } from "../web/settings-api.mjs";
-import { reviewOptions } from "../web/contracts.mjs";
+import { createSettingsApi } from "../src/web/settings-api.mjs";
+import { reviewOptions } from "../src/web/contracts.mjs";
+import type { RepoSettings, SettingsTransport } from "../types/contracts.js";
 
 // Compile-only regression checks: each expected error must remain an error.
-/** @param {import("../types/contracts.js").SettingsTransport} request @param {unknown} raw */
-function contracts(request, raw) {
+function contracts(request: SettingsTransport, raw: unknown) {
     const api = createSettingsApi(request);
     api.update({ learning: "suggest", delivery: "ask", dismissed: false });
     api.updateAgentReview({ models: ["model-a"], focus: "both", intent: "", skipDialog: false });
@@ -16,9 +16,8 @@ function contracts(request, raw) {
     request("POST", "agent-review-settings", { learning: "off" });
     // @ts-expect-error Delivery selection is not a learning mode.
     request("POST", "settings", { learning: "batch" });
-    /** @type {import("../types/contracts.js").RepoSettings} */
     // @ts-expect-error Raw network JSON must be decoded before reading settings.
-    const response = raw;
+    const response: RepoSettings = raw;
     return response;
 }
 

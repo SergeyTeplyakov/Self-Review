@@ -3,12 +3,12 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { agentReviewDefaults, reviewOptions, settingsDocument, settingsPatch } from "../web/contracts.mjs";
-import { createSettingsApi } from "../web/settings-api.mjs";
-import { Store } from "../lib/store.mjs";
-import { SettingsService, resolveDelivery } from "../lib/settings.mjs";
-import { SettingsHttp } from "../lib/settings-http.mjs";
-import { settingsActions } from "../lib/settings-actions.mjs";
+import { agentReviewDefaults, reviewOptions, settingsDocument, settingsPatch } from "../dist/web/contracts.mjs";
+import { createSettingsApi } from "../dist/web/settings-api.mjs";
+import { Store } from "../dist/lib/store.mjs";
+import { SettingsService, resolveDelivery } from "../dist/lib/settings.mjs";
+import { SettingsHttp } from "../dist/lib/settings-http.mjs";
+import { settingsActions } from "../dist/lib/settings-actions.mjs";
 
 const defaults = { models: ["model-a", "copilot-fusion"], focus: "both", intent: "Check contracts.", skipDialog: false };
 const effective = { repoName: "repo", learning: "suggest", delivery: "ask", configured: true, dismissed: false };

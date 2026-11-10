@@ -1,6 +1,4 @@
-import { REVIEW_FOCUSES, SUGGESTED_REVIEWERS } from "../web/contracts.mjs";
-
-/** @type {import("@github/copilot-sdk/extension").CanvasJsonSchema} */
+import { isRecord, REVIEW_FOCUSES, SUGGESTED_REVIEWERS } from "../web/contracts.mjs";
 export const agentReviewSettingsSchema = {
     type: "object",
     properties: {
@@ -12,15 +10,7 @@ export const agentReviewSettingsSchema = {
     required: ["models", "focus", "skipDialog"],
     additionalProperties: false,
 };
-
-/**
- * @param {object} options
- * @param {import("./settings.mjs").SettingsService} options.settings
- * @param {() => void} options.changed
- * @param {(handler: import("@github/copilot-sdk/extension").CanvasAction["handler"]) => import("@github/copilot-sdk/extension").CanvasAction["handler"]} options.guard
- * @returns {import("@github/copilot-sdk/extension").CanvasAction[]}
- */
-export function settingsActions({ settings, changed, guard }) {
+export function settingsActions({ settings, changed, guard, }) {
     return [
         {
             name: "get_agent_review_settings",
@@ -37,8 +27,7 @@ export function settingsActions({ settings, changed, guard }) {
                 additionalProperties: false,
             },
             handler: guard(async (ctx) => {
-                const input = ctx.input;
-                const defaults = input && typeof input === "object" && !Array.isArray(input) ? input.defaults : undefined;
+                const defaults = isRecord(ctx.input) ? ctx.input.defaults : undefined;
                 const saved = await settings.updateAgentReview(defaults);
                 changed();
                 return saved;

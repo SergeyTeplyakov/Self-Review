@@ -5,13 +5,13 @@ import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { Store } from "../lib/store.mjs";
-import { ReviewService } from "../lib/review-service.mjs";
-import { Delivery } from "../lib/delivery.mjs";
-import { hunkExcerpt, parseUnifiedDiff } from "../lib/diff.mjs";
-import { normalizeRemoteUrl, SettingsService } from "../lib/settings.mjs";
-import { relocate } from "../lib/anchors.mjs";
-import { captureSnapshot, readWorkingFile, runGit, safeJoin } from "../lib/git.mjs";
+import { Store } from "../dist/lib/store.mjs";
+import { ReviewService } from "../dist/lib/review-service.mjs";
+import { Delivery } from "../dist/lib/delivery.mjs";
+import { hunkExcerpt, parseUnifiedDiff } from "../dist/lib/diff.mjs";
+import { normalizeRemoteUrl, SettingsService } from "../dist/lib/settings.mjs";
+import { relocate } from "../dist/lib/anchors.mjs";
+import { captureSnapshot, readWorkingFile, runGit, safeJoin } from "../dist/lib/git.mjs";
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const git = (cwd, ...args) => runGit(cwd, ["-c", "user.name=test", "-c", "user.email=test@example.com", "-c", "core.autocrlf=false", ...args]);
@@ -65,7 +65,7 @@ test("separate provider processes preserve review, settings, lesson and instance
     const store = new Store(dir);
     await store.updateReview("shared", () => ({ review: { values: [] } }));
     const source = `
-        import { Store } from ${JSON.stringify(new URL("../lib/store.mjs", import.meta.url).href)};
+        import { Store } from ${JSON.stringify(new URL("../dist/lib/store.mjs", import.meta.url).href)};
         const store = new Store(process.argv[1]);
         const worker = process.argv[2];
         const delay = () => new Promise(r => setTimeout(r, 10));

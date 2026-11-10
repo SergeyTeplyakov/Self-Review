@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { completionHooks, COMPLETION_REVIEW_GUIDANCE } from "../lib/completion-guidance.mjs";
+import { completionHooks, COMPLETION_REVIEW_GUIDANCE } from "../dist/lib/completion-guidance.mjs";
 
 test("startup and prompt hooks inject advisory context without changing prompts or scheduling work", async () => {
     assert.deepEqual(Object.keys(completionHooks).sort(), ["onSessionStart", "onUserPromptSubmitted"]);
@@ -51,7 +51,7 @@ test("fallback guidance reports limitations and never authorizes paid reviews or
 });
 
 test("the runtime entry registers the documented hooks without replacing the system prompt", async () => {
-    const source = await readFile(new URL("../extension.mjs", import.meta.url), "utf8");
+    const source = await readFile(new URL("../dist/extension.mjs", import.meta.url), "utf8");
     assert.match(source, /import \{ completionHooks \} from "\.\/lib\/completion-guidance\.mjs"/);
     assert.match(source, /joinSession\(\{\s+hooks: completionHooks,/);
     assert.doesNotMatch(source, /systemMessage\s*:/);

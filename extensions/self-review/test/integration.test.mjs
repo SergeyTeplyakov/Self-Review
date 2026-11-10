@@ -5,13 +5,13 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { runGit } from "../lib/git.mjs";
-import { Store } from "../lib/store.mjs";
-import { ReviewService } from "../lib/review-service.mjs";
-import { Delivery } from "../lib/delivery.mjs";
-import { startReviewServer } from "../lib/server.mjs";
+import { runGit } from "../dist/lib/git.mjs";
+import { Store } from "../dist/lib/store.mjs";
+import { ReviewService } from "../dist/lib/review-service.mjs";
+import { Delivery } from "../dist/lib/delivery.mjs";
+import { startReviewServer } from "../dist/lib/server.mjs";
 
-const WEB_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "web");
+const WEB_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "dist", "web");
 const lines = (n, f = (i) => `line ${i}`) => Array.from({ length: n }, (_, i) => f(i + 1)).join("\n") + "\n";
 const git = (cwd, ...args) => runGit(cwd, ["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "core.autocrlf=false", ...args]);
 

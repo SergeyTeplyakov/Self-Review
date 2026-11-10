@@ -3,8 +3,9 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "build": "node extensions/self-review/scripts/build.mjs",
     "typecheck": "tsc -p tsconfig.node.json && tsc -p tsconfig.web.json",
-    "test": "node --test extensions/self-review/test/*.test.mjs"
+    "test": "npm run build && node --test extensions/self-review/test/*.test.mjs"
   },
   "devDependencies": {
     "@github/copilot-sdk": "1.0.30",

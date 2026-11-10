@@ -4,10 +4,10 @@ import { mkdir, mkdtemp, rm, readFile, readdir, writeFile } from "node:fs/promis
 import vm from "node:vm";
 import os from "node:os";
 import path from "node:path";
-import { parseUnifiedDiff, synthesizeAddedFile, hunkAnchorRange, selectedLines, hunkExcerpt } from "../lib/diff.mjs";
-import { relocate } from "../lib/anchors.mjs";
-import { buildCommentPrompt, marker } from "../lib/prompt.mjs";
-import { Store, migrateLegacyDataRoot } from "../lib/store.mjs";
+import { parseUnifiedDiff, synthesizeAddedFile, hunkAnchorRange, selectedLines, hunkExcerpt } from "../dist/lib/diff.mjs";
+import { relocate } from "../dist/lib/anchors.mjs";
+import { buildCommentPrompt, marker } from "../dist/lib/prompt.mjs";
+import { Store, migrateLegacyDataRoot } from "../dist/lib/store.mjs";
 import { loadApp } from "./load-app.mjs";
 
 const DIFF = [
@@ -594,7 +594,7 @@ test("markdown fenced blocks highlight known languages, tint their rows, and res
 });
 
 test("syntax and line-number colors retain WCAG AA contrast on light and dark diff backgrounds", async () => {
-    const css = await readFile(new URL("../web/styles.css", import.meta.url), "utf8");
+    const css = await readFile(new URL("../dist/web/styles.css", import.meta.url), "utf8");
     assert.match(css, /td\.code\s*\{[^}]*color:\s*var\(--mr-code-fg\)/, "plain source must not inherit green/red statistics colors");
     assert.match(css, /body\[data-theme-tone="light"\]\s*\{/);
     assert.match(css, /:root:not\(\[data-theme-tone="light"\]\)\s*\{/);

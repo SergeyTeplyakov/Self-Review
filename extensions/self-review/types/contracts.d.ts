@@ -36,6 +36,7 @@ export interface StoredRepoSettings {
     promptDismissed?: unknown;
     name?: string;
     updatedAt?: string;
+    [key: string]: unknown;
 }
 
 export interface SettingsDocument {
