@@ -480,6 +480,56 @@ test("HTTP settings persist user-wide defaults, expose read failures, and separa
     assert.equal(f.sent.length, 1);
 });
 
+test("user-wide settings changes reach every open canvas and one-click runs require current opt-in", async (t) => {
+    const f = await fixture(t);
+    const settings = new SettingsService({ store: f.store });
+    const delivery = new Delivery({ service: f.service, sessionId: () => "session-a", send: async () => "unused" });
+    const server = await startReviewServer({
+        instanceId: "first", getReviewId: () => "review", service: f.service, settings, delivery, agentReview: f.agent,
+        webRoot: fileURLToPath(new URL("../web", import.meta.url)),
+    });
+    const otherCanvas = await startReviewServer({
+        instanceId: "second", getReviewId: () => "other-review", service: f.service, settings, delivery, agentReview: f.agent,
+        webRoot: fileURLToPath(new URL("../web", import.meta.url)),
+    });
+    t.after(async () => { await Promise.all([server.close(), otherCanvas.close()]); });
+
+    const otherUrl = new URL(otherCanvas.url);
+    const events = await fetch(new URL(`api/events?t=${otherUrl.searchParams.get("t")}`, otherUrl));
+    const reader = events.body.getReader();
+    t.after(() => reader.cancel());
+    const changedEvent = (async () => {
+        let text = "";
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) throw new Error("Event stream closed before settings changed.");
+            text += Buffer.from(value).toString("utf8");
+            const start = text.indexOf("event: changed\n");
+            if (start >= 0) return text.slice(start);
+        }
+    })();
+
+    const firstUrl = new URL(server.url);
+    const headers = {
+        "Content-Type": "application/json",
+        "X-MR-Token": firstUrl.searchParams.get("t"),
+        "X-MR-Review": "review",
+    };
+    const save = await fetch(new URL("api/agent-review-settings", firstUrl), {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ defaults: { models, focus: "both", intent: "", skipDialog: false } }),
+    });
+    assert.equal(save.status, 200);
+    assert.match(await changedEvent, /"reason":"agent-review-settings"/);
+
+    const post = (body) => fetch(new URL("api/agent-reviews", firstUrl), { method: "POST", headers, body: JSON.stringify(body) });
+    assert.equal((await post({ useDefaults: true, oneClick: true, revisionId: "r1" })).status, 409);
+    assert.equal(f.sent.length, 0, "stale one-click state cannot dispatch after confirmation is turned off");
+    assert.equal((await post({ useDefaults: true, revisionId: "r1" })).status, 200, "an explicit review action still uses the saved choices");
+    assert.equal(f.sent.length, 1);
+});
+
 test("HTTP start, model reporting, approval, and discussion use the real delivery pipeline", async (t) => {
     const f = await fixture(t);
     const fixes = [];

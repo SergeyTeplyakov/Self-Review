@@ -97,7 +97,7 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         for (const res of clients) res.write(frame);
     };
     const onChanged = (e) => {
-        if (e.reviewId === getReviewId()) broadcast("changed", e);
+        if (e.reason === "agent-review-settings" || e.reviewId === getReviewId()) broadcast("changed", e);
     };
     const onSession = (e) => broadcast("session", e);
     service.on("changed", onChanged);
@@ -225,7 +225,13 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         if (parts[0] === "agent-reviews") {
             if (!agentReview) throw new HttpError(501, "unsupported", "Agent review is not available. Reload the extension.");
             if (pageReview !== reviewId) throw new HttpError(409, "conflict", "Refresh the canvas before starting or closing an agent review.");
-            if (parts.length === 1) return send(res, 200, await agentReview.start(reviewId, body, instanceId));
+            if (parts.length === 1) {
+                if (body.oneClick === true && !(await settings?.getAgentReview?.())?.skipDialog) {
+                    throw new HttpError(409, "conflict", "Saved defaults no longer allow one-click reviews. Confirm the current settings before starting.");
+                }
+                const { oneClick: _oneClick, ...input } = body;
+                return send(res, 200, await agentReview.start(reviewId, input, instanceId));
+            }
             if (parts.length === 3 && parts[2] === "close") return send(res, 200, await agentReview.close(reviewId, parts[1]));
         }
         if (parts[0] === "threads" && parts.length === 3 && parts[2] === "approve") {

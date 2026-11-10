@@ -192,10 +192,64 @@ test("one-click run skips the dialog, uses the current revision, and guards repe
     await clicker(app)("agent-review");
     assert.equal(app.state.dialog, null);
     assert.equal(app.state.startingReview, true);
-    assert.deepEqual(posts, [["/api/agent-reviews", { useDefaults: true, revisionId: "r1" }]]);
+    assert.deepEqual(posts, [["/api/agent-reviews", { useDefaults: true, oneClick: true, revisionId: "r1" }]]);
     finish();
     await first;
     assert.equal(app.state.startingReview, false);
+});
+
+test("one-click run reloads defaults and requires the same scope and revision", async () => {
+    const app = await loadApp();
+    app.run('loadState = async () => { state.agentReviewSettings = { models: ["updated-model"], focus: "review", skipDialog: false }; }');
+    app.state.review = reviewFixture();
+    app.state.agentReviewAvailable = true;
+    app.state.agentReviewSettings = { models: ["stale-model"], focus: "both", skipDialog: true };
+    await clicker(app)("agent-review");
+    assert.equal(app.state.dialog?.type, "agent-review");
+    assert.equal(app.state.dialog.models, "updated-model");
+    assert.equal(app.state.startingReview, false);
+
+    app.state.dialog = null;
+    app.state.agentReviewSettings = { models: ["model-a"], focus: "both", skipDialog: true };
+    app.run('loadState = async () => { state.review = { ...state.review, reviewId: "other-scope" }; }');
+    await clicker(app)("agent-review");
+    assert.equal(app.state.dialog, null);
+    assert.equal(app.state.startingReview, false);
+    assert.match(app.node("#toast").textContent, /scope or revision changed/);
+
+    app.state.review = reviewFixture();
+    app.state.agentReviewSettings = { models: ["model-a"], focus: "both", skipDialog: true };
+    app.run('loadState = async () => { state.review = { ...state.review, currentRevisionId: "r2" }; }');
+    await clicker(app)("agent-review");
+    assert.equal(app.state.dialog, null);
+    assert.equal(app.state.startingReview, false);
+    assert.match(app.node("#toast").textContent, /scope or revision changed/);
+});
+
+test("saving defaults during a scope or revision change does not start an unconfirmed review", async () => {
+    for (const change of [
+        { reviewId: "other-scope", currentRevisionId: "other-r1" },
+        { reviewId: "r", currentRevisionId: "r2" },
+    ]) {
+        let app;
+        const posts = [];
+        app = await loadApp({ fetch: async (url, opts) => {
+            posts.push([url, JSON.parse(opts.body)]);
+            app.state.review = reviewFixture(change);
+            return jsonResponse({ models: ["model-a"], focus: "both", intent: "", skipDialog: true });
+        } });
+        app.run("loadState = async () => {}");
+        app.state.review = reviewFixture();
+        app.state.agentReviewAvailable = true;
+        app.state.agentReviewSettingsAvailable = true;
+        app.run("openAgentReview()");
+        app.state.dialog.models = "model-a";
+        app.state.dialog.saveDefaults = true;
+        await app.run("startAgentReview()");
+        assert.deepEqual(posts.map(([url]) => url), ["/api/agent-review-settings"]);
+        assert.match(app.state.dialog.error, /scope changed or revision is stale/);
+        assert.equal(app.state.dialog.saving, false);
+    }
 });
 
 test("one-click failures surface errors and release the button even if reloading state fails", async () => {

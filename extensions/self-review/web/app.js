@@ -877,10 +877,17 @@ async function startAgentReview(saveOnly = false) {
     d.error = "";
     renderDialog();
     try {
-        if (d.reviewId !== state.review?.reviewId) throw new Error("The review scope changed. Close this dialog and try again.");
+        if (d.reviewId !== state.review?.reviewId || d.revisionId !== state.review?.currentRevisionId) {
+            throw new Error("The review scope changed or revision is stale. Close this dialog and try again.");
+        }
         if (saveOnly && !d.saveDefaults) throw new Error("Select Save these models, focus, and guidance first.");
         if (d.saveDefaults) await saveAgentReviewDefaults(d);
-        if (!saveOnly) await api("POST", "agent-reviews", { ...agentReviewOptions(d), revisionId: d.revisionId });
+        if (!saveOnly) {
+            if (d.reviewId !== state.review?.reviewId || d.revisionId !== state.review?.currentRevisionId) {
+                throw new Error("The review scope changed or revision is stale. Close this dialog and try again.");
+            }
+            await api("POST", "agent-reviews", { ...agentReviewOptions(d), revisionId: d.revisionId });
+        }
         state.dialog = null;
         renderDialog();
         focusIn('[data-action="agent-review"]');
@@ -901,10 +908,21 @@ async function runAgentReview() {
         openAgentReview();
         return;
     }
+    const reviewId = state.review.reviewId;
+    const revisionId = state.review.currentRevisionId;
     state.startingReview = true;
     renderTop();
     try {
-        await api("POST", "agent-reviews", { useDefaults: true, revisionId: state.review.currentRevisionId });
+        await loadState();
+        if (state.review?.reviewId !== reviewId || state.review.currentRevisionId !== revisionId) {
+            toast("The review scope or revision changed. Confirm the current review before starting.");
+            return;
+        }
+        if (!state.agentReviewSettings?.skipDialog || state.agentReviewSettingsError) {
+            openAgentReview();
+            return;
+        }
+        await api("POST", "agent-reviews", { useDefaults: true, oneClick: true, revisionId });
         toast("Review requested with your saved defaults.");
     } finally {
         state.startingReview = false;
