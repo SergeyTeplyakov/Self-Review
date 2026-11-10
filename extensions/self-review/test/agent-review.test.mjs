@@ -450,18 +450,25 @@ test("review context exposes the baseline and caller guard; known outcomes persi
 test("HTTP settings persist user-wide defaults, expose read failures, and separate save from run", async (t) => {
     const f = await fixture(t);
     const logs = [];
+    const pullRequest = { number: 7, url: "https://github.com/SergeyTeplyakov/Self-Review/pull/7" };
+    const lookups = [];
     const settings = new SettingsService({ store: f.store });
     const delivery = new Delivery({ service: f.service, sessionId: () => "session-a", send: async () => "unused" });
     const server = await startReviewServer({
         instanceId: "c", getReviewId: () => "review", service: f.service, settings, delivery, agentReview: f.agent,
         webRoot: fileURLToPath(new URL("../web", import.meta.url)), log: (message) => logs.push(message),
+        findPullRequest: async (repoRoot, branch) => { lookups.push({ repoRoot, branch }); return pullRequest; },
     });
     t.after(() => server.close());
     const url = new URL(server.url);
     const headers = { "Content-Type": "application/json", "X-MR-Token": url.searchParams.get("t"), "X-MR-Review": "review" };
     const post = (route, body) => fetch(new URL(`api/${route}`, url), { method: "POST", headers, body: JSON.stringify(body) });
     const state = async () => (await fetch(new URL("api/state", url), { headers })).json();
-    assert.equal((await state()).agentReviewSettings, null);
+    const initial = await state();
+    assert.equal(initial.agentReviewSettings, null);
+    assert.deepEqual(initial.pullRequest, pullRequest);
+    assert.deepEqual(lookups, [{ repoRoot: f.root, branch: "feature" }]);
+    assert.equal((await state()).pullRequest.number, 7, "the verified PR metadata is reused during the short cache window");
     assert.deepEqual((await state()).agentReviewSuggestedModels, SUGGESTED_REVIEWERS, "suggestions are offered without being saved");
     const defaults = { models, focus: "both", intent: "", skipDialog: true };
     assert.equal((await post("agent-review-settings", { defaults })).status, 200);

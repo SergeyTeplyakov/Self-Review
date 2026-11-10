@@ -173,6 +173,8 @@ button:focus-visible { outline: 2px solid var(--color-focus-outline, var(--mr-ac
 }
 .pill.busy { border-color: var(--mr-accent); color: var(--mr-accent); }
 .pill.warn { border-color: var(--mr-yellow); color: var(--mr-yellow); }
+a.pill { color: var(--mr-accent); text-decoration: none; }
+a.pill:hover { text-decoration: underline; }
 .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; display: inline-block; }
 .pill.busy .dot { animation: pulse 1.2s infinite; }
 @keyframes pulse { 50% { opacity: 0.25; } }

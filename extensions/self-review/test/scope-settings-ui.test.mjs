@@ -252,6 +252,33 @@ test("saving defaults during a scope or revision change does not start an unconf
     }
 });
 
+test("saving user defaults remains available after the review scope or revision changes", async () => {
+    for (const change of [
+        { reviewId: "other-scope", currentRevisionId: "other-r1" },
+        { reviewId: "r", currentRevisionId: "r2" },
+    ]) {
+        const posts = [];
+        const app = await loadApp({ fetch: async (url, opts) => {
+            posts.push([url, JSON.parse(opts.body)]);
+            return jsonResponse({ models: ["model-a"], focus: "both", intent: "", skipDialog: false });
+        } });
+        app.run("loadState = async () => {}");
+        app.state.review = reviewFixture();
+        app.state.agentReviewAvailable = true;
+        app.state.agentReviewSettingsAvailable = true;
+        app.run("openAgentReview()");
+        app.state.dialog.models = "model-a";
+        app.state.dialog.saveDefaults = true;
+        app.state.review = reviewFixture(change);
+        await app.run("startAgentReview(true)");
+        assert.deepEqual(posts, [["/api/agent-review-settings", {
+            defaults: { models: ["model-a"], focus: "review", intent: "", skipDialog: false },
+        }]]);
+        assert.equal(app.state.dialog, null);
+        assert.match(app.node("#toast").textContent, /User defaults saved\. No review was started/);
+    }
+});
+
 test("one-click failures surface errors and release the button even if reloading state fails", async () => {
     for (const reloadFails of [false, true]) {
         const app = await loadApp({ fetch: async () => jsonResponse({ error: { message: "Review could not be queued" } }, 500) });
@@ -491,6 +518,12 @@ test("the top bar shows the review scope, and the learning controls only when th
     assert.match(html, /↑1 ↓2/);
     assert.match(html, />3 uncommitted</);
     assert.doesNotMatch(toggle(html), /disabled/);
+
+    app.state.pullRequest = { number: 7, url: "https://github.com/SergeyTeplyakov/Self-Review/pull/7" };
+    html = top();
+    assert.match(html, /<a class="pill pr-link" href="https:\/\/github\.com\/SergeyTeplyakov\/Self-Review\/pull\/7" target="_blank" rel="noopener noreferrer" title="Open pull request #7 in browser">Open PR #7<\/a>/);
+    app.state.pullRequest = null;
+    assert.doesNotMatch(top(), /Open PR #7/);
 
     app.state.review = reviewFixture({ git: { branch: "feature", uncommittedFiles: 0 } });
     html = top();

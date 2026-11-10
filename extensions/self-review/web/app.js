@@ -9,6 +9,7 @@ const FINDING_SEVERITIES = { critical: "Critical", required: "Required", optiona
 const state = {
     review: null,
     snapshot: null,
+    pullRequest: null,
     busy: null,
     connection: "connecting",
     view: { type: "overview" },
@@ -407,6 +408,7 @@ async function loadState() {
             const data = await api("GET", "state");
             if (state.review && state.review.reviewId !== data.review.reviewId) resetForReview();
             state.review = data.review;
+            state.pullRequest = data.pullRequest ?? null;
             state.settings = data.settings ?? null;
             state.agentReviewAvailable = data.agentReviewAvailable === true;
             state.agentReviewSettings = data.agentReviewSettings ?? null;
@@ -692,6 +694,7 @@ function renderTop() {
         `<div class="change-context-heading"><span class="title">${esc(r.title)}</span>${branch}`,
         scope === "all" ? `<span class="muted">vs</span><span class="pill mono" title="merge-base ${esc(git.baseCommit ?? "")}">${esc(r.base)}</span>`
             : `<span class="muted">uncommitted changes only</span>`,
+        state.pullRequest ? `<a class="pill pr-link" href="${esc(state.pullRequest.url)}" target="_blank" rel="noopener noreferrer" title="Open pull request #${esc(state.pullRequest.number)} in browser">Open PR #${esc(state.pullRequest.number)}</a>` : "",
         `</div><div class="change-context-details">${scopeToggleHtml(scope)}`,
     ];
     if (rev) parts.push(`<span class="pill" title="Revision captured ${esc(rev.createdAt)}">${esc(rev.revisionId)} · ${rev.files} files · <span class="add">+${rev.additions}</span> <span class="del">−${rev.deletions}</span></span>`);
@@ -877,7 +880,7 @@ async function startAgentReview(saveOnly = false) {
     d.error = "";
     renderDialog();
     try {
-        if (d.reviewId !== state.review?.reviewId || d.revisionId !== state.review?.currentRevisionId) {
+        if (!saveOnly && (d.reviewId !== state.review?.reviewId || d.revisionId !== state.review?.currentRevisionId)) {
             throw new Error("The review scope changed or revision is stale. Close this dialog and try again.");
         }
         if (saveOnly && !d.saveDefaults) throw new Error("Select Save these models, focus, and guidance first.");
