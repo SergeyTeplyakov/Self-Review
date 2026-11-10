@@ -2,15 +2,14 @@
 import { createHash, randomUUID } from "node:crypto";
 import { ReviewError } from "./review-service.mjs";
 import { selectedLines } from "./diff.mjs";
+import { reviewOptions, REVIEW_FOCUSES, FUSION_REVIEWER, SUGGESTED_REVIEWERS } from "../web/contracts.mjs";
+export { reviewOptions, REVIEW_FOCUSES, FUSION_REVIEWER, SUGGESTED_REVIEWERS } from "../web/contracts.mjs";
 
-export const REVIEW_FOCUSES = ["review", "simplify", "both"];
 export const ACTIVE_RUN_STATES = ["sending", "queued", "running"];
 export const FINDING_ASSESSMENTS = ["confirmed", "pre-existing", "rejected", "unverified"];
 export const FINDING_SEVERITIES = ["critical", "required", "optional", "nit", "fyi"];
 export const EVIDENCE_FIELDS = ["source", "baseline", "validation"];
 // Fusion is an Auto routing tier, not a subagent model ID, so it is dispatched through a child session.
-export const FUSION_REVIEWER = "copilot-fusion";
-export const SUGGESTED_REVIEWERS = ["gpt-6-astra", "gpt-6.1-sol", FUSION_REVIEWER];
 const now = () => new Date().toISOString();
 const invalid = (message) => new ReviewError("invalid_input", message);
 const conflict = (message) => new ReviewError("conflict", message);
@@ -30,19 +29,6 @@ function requiredText(value, name, maxLength) {
 function evidenceOf(value) {
     if (!value || typeof value !== "object" || Array.isArray(value)) throw invalid("Finding evidence is required.");
     return Object.fromEntries(EVIDENCE_FIELDS.map((key) => [key, requiredText(value[key], `evidence.${key}`, 2000)]));
-}
-
-export function reviewOptions(input) {
-    if (!Array.isArray(input.models) || input.models.length < 1 || input.models.length > 4
-        || input.models.some((m) => typeof m !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,119}$/.test(m))
-        || new Set(input.models).size !== input.models.length) {
-        throw invalid(`Choose one to four distinct reviewers: exact model IDs or ${FUSION_REVIEWER}.`);
-    }
-    if (!REVIEW_FOCUSES.includes(input.focus)) throw invalid("focus must be review, simplify, or both.");
-    if (input.intent !== undefined && (typeof input.intent !== "string" || input.intent.length > 4000)) {
-        throw invalid("intent must be text (up to 4000 characters).");
-    }
-    return { models: [...input.models], focus: input.focus, intent: input.intent?.trim() ?? "" };
 }
 
 export function buildAgentReviewPrompt(review, run, instanceId) {

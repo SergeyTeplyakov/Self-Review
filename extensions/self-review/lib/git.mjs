@@ -1,37 +1,14 @@
 // Read-only git access for capturing review snapshots. Never mutates the repository:
 // GIT_OPTIONAL_LOCKS=0 keeps diff/status from rewriting the index.
-import { execFile } from "node:child_process";
+import { runGit } from "./git-process.mjs";
+export { runGit } from "./git-process.mjs";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, open, readlink, realpath } from "node:fs/promises";
 import path from "node:path";
 import { parseUnifiedDiff, synthesizeAddedFile } from "./diff.mjs";
 
-const MAX_BUFFER = 256 * 1024 * 1024;
 const MAX_UNTRACKED_BYTES = 2 * 1024 * 1024;
-
-export function runGit(cwd, args, { allowFail = false } = {}) {
-    return new Promise((resolve, reject) => {
-        execFile(
-            "git",
-            ["--no-pager", "-c", "core.quotepath=false", ...args],
-            {
-                cwd,
-                maxBuffer: MAX_BUFFER,
-                windowsHide: true,
-                encoding: "utf8",
-                env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" },
-            },
-            (err, stdout, stderr) => {
-                if (err && !allowFail) {
-                    reject(new Error(`git ${args[0]} failed: ${(stderr || err.message).trim().split("\n").slice(0, 3).join(" ")}`));
-                    return;
-                }
-                resolve({ ok: !err, stdout: stdout ?? "", stderr: stderr ?? "" });
-            },
-        );
-    });
-}
 
 export async function resolveRepoRoot(repoPath) {
     const { stdout } = await runGit(repoPath, ["rev-parse", "--show-toplevel"]);

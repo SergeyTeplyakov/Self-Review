@@ -6,6 +6,8 @@ import path from "node:path";
 import * as gitDefault from "./git.mjs";
 import { relocate } from "./anchors.mjs";
 import { hunkExcerpt, selectedLines } from "./diff.mjs";
+import { ReviewError } from "../web/contracts.mjs";
+export { ReviewError } from "../web/contracts.mjs";
 
 export const THREAD_KINDS = ["overview", "file", "change", "line"];
 export const THREAD_STATUSES = ["active", "resolved", "wontfix", "closed"];
@@ -17,13 +19,6 @@ const MAX_BODY = 20000;
 const MAX_RANGE = 2000;
 const MAX_ANCHOR_LINES = 400;
 const MAX_FULL_FILE_LINES = 20000;
-
-export class ReviewError extends Error {
-    constructor(code, message) {
-        super(message);
-        this.code = code;
-    }
-}
 
 const invalid = (msg) => new ReviewError("invalid_input", msg);
 const notFound = (msg) => new ReviewError("not_found", msg);

@@ -167,13 +167,71 @@ Then start a new session. On first start, existing reviews and settings are copi
 
 ## Hacking on it
 
+### Completion-time review
+
+The extension carries its own completion guidance using the SDK's documented
+`onSessionStart` and `onUserPromptSubmitted` hooks and `additionalContext`.
+After finishing a code-changing task, the agent is instructed to open or refresh
+the matching human-led review, or propose it with an explanation when canvas
+tools or the provider are unavailable. It discovers live schemas, verifies the
+actual worktree and comparison, preserves scope/filters, and reuses a matching
+panel. Read-only work, explicit opt-outs, and comment-processing review loops
+are excluded. Opening a diff never starts a paid agent review or authorizes
+commits or publication.
+
+This is **advisory agent guidance**, not a guaranteed automatic-open feature:
+these hooks run at session start and prompt submission, not at verified task
+completion, and cannot force a tool call. The extension does not send itself a
+completion prompt or infer completion from an idle event. Existing sessions
+need the updated extension loaded before the hooks can supply this context.
+
+### Development checks
+
 Clone the repo, then run `copilot plugin marketplace add <path-to-clone>` and `copilot plugin install self-review-canvas@self-review-canvas`. It loads straight from your checkout, so edits show up in your next session.
 
-Run the tests from `extensions/self-review`:
+Runtime files stay plain JavaScript: `extension.mjs` remains the entry point, with no
+transpilation, bundler, or production build. Development checks require Node 22.12+
+and npm. From the repository root:
 
 ```bash
-node --test test
+npm ci --ignore-scripts --omit=optional
+npm run typecheck
+npm test
 ```
+
+The SDK package is a **development-only** source of its public canvas types, pinned
+for reproducible checking; the installed Copilot runtime still supplies the SDK at
+run time. No extension-local SDK installation is needed. If `tsc` or SDK declarations
+are missing, run the install command above rather than substituting ambient stubs.
+CI runs the same type checks and regression suite.
+
+This is an incremental `checkJs` rollout with `strict: true` and `noEmit: true`.
+The Node and browser projects have separate libraries and ambient types; shared
+contracts are checked in both environments. Currently checked implementation:
+
+- `web/contracts.mjs`: settings/options codecs, saved-settings validation, and the settings portion of review state.
+- `lib/settings.mjs` and `lib/git-process.mjs`: repository identity, effective learning/delivery modes, reviewer defaults, and their producers.
+- `lib/settings-http.mjs` and `lib/settings-actions.mjs`: HTTP settings state/updates and the two SDK settings actions, using public SDK types.
+- `lib/completion-guidance.mjs`: advisory completion hooks, typed against the public SDK hook contract.
+- `web/settings-api.mjs`: browser settings requests and decoded responses, including the settings slice of `/api/state`.
+
+Shared declarations live in `extensions/self-review/types/contracts.d.ts`.
+Compile-only negative fixtures ensure invalid modes, request envelopes, and checkbox
+values are rejected. Raw inputs remain `unknown` until validated: static types do
+not replace HTTP, SDK, or disk validation. Invalid stored settings fail explicitly;
+the existing read-only fallback keeps reviews usable and logs settings read errors.
+Old settings without delivery modes and unknown stored mode strings retain the
+existing defaults.
+
+**Not yet checked:** the rest of `extension.mjs`, HTTP routing, review/thread/snapshot
+persistence and lifecycle, agent-review coordination/delivery, diff/anchor algorithms,
+and the main renderer `web/app.js`. Their integration with the checked settings code
+is covered by runtime tests, not claimed as static coverage. To expand coverage, add
+implementation files to the appropriate project and type their actual dependencies;
+do not disable strict errors or replace boundaries with `any`.
+
+The dependency-free runtime tests can also be run from `extensions/self-review`
+with `node --test test/*.test.mjs`.
 
 The screenshots in this README come from a script that builds a demo repository, seeds a review, and captures the canvas in light and dark themes with Playwright, using your installed Edge or Chrome:
 

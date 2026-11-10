@@ -1,5 +1,7 @@
 // Self review canvas client: renders the diff, inline threads, and composers; talks to the
 // per-instance loopback server with the token from the URL.
+import { createSettingsApi } from "./settings-api.mjs";
+
 const TOKEN = new URLSearchParams(location.search).get("t") ?? "";
 const STATUSES = ["active", "resolved", "wontfix", "closed"];
 const STALE_QUEUE_MS = 120000;
@@ -36,6 +38,7 @@ const state = {
 };
 
 const FOLDER_VIEW_ROW_BUDGET = 3000;
+const settingsApi = createSettingsApi((method, path, body) => api(method, path, body));
 
 const LEARNING_MODES = ["off", "suggest", "auto"];
 const LEARNING = {
@@ -409,11 +412,12 @@ async function loadState() {
             if (state.review && state.review.reviewId !== data.review.reviewId) resetForReview();
             state.review = data.review;
             state.pullRequest = data.pullRequest ?? null;
-            state.settings = data.settings ?? null;
+            const settingsState = settingsApi.readState(data);
+            state.settings = settingsState.settings;
             state.agentReviewAvailable = data.agentReviewAvailable === true;
-            state.agentReviewSettings = data.agentReviewSettings ?? null;
-            state.agentReviewSettingsAvailable = data.agentReviewSettingsAvailable === true;
-            state.agentReviewSettingsError = data.agentReviewSettingsError ?? "";
+            state.agentReviewSettings = settingsState.agentReviewSettings;
+            state.agentReviewSettingsAvailable = settingsState.agentReviewSettingsAvailable;
+            state.agentReviewSettingsError = settingsState.agentReviewSettingsError ?? "";
             state.agentReviewSuggestedModels = Array.isArray(data.agentReviewSuggestedModels) ? data.agentReviewSuggestedModels : [];
             if (data.session) state.busy = data.session.busy;
             const rev = state.review.currentRevisionId;
@@ -869,7 +873,7 @@ function agentReviewOptions(d) {
 }
 
 async function saveAgentReviewDefaults(d) {
-    state.agentReviewSettings = await api("POST", "agent-review-settings", { defaults: { ...agentReviewOptions(d), skipDialog: d.skipDialog } });
+    state.agentReviewSettings = await settingsApi.updateAgentReview({ ...agentReviewOptions(d), skipDialog: d.skipDialog });
     state.agentReviewSettingsError = "";
 }
 
@@ -982,7 +986,7 @@ function agentReviewsHtml() {
 // A delivery change alters every composer's buttons, so it needs a full render once a diff is shown.
 async function updateSettings(patch) {
     const before = deliveryMode();
-    state.settings = await api("POST", "settings", patch);
+    state.settings = await settingsApi.update(patch);
     if (deliveryMode() !== before && state.snapshot) {
         render();
     } else {

@@ -1,0 +1,14 @@
+{
+  "name": "self-review-development",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.node.json && tsc -p tsconfig.web.json",
+    "test": "node --test extensions/self-review/test/*.test.mjs"
+  },
+  "devDependencies": {
+    "@github/copilot-sdk": "1.0.30",
+    "@types/node": "^22.19.0",
+    "typescript": "^5.9.3"
+  }
+}

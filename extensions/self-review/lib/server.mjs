@@ -10,6 +10,7 @@ import { SCOPES } from "./review-service.mjs";
 import { SUGGESTED_REVIEWERS } from "./agent-review.mjs";
 import { resolveDelivery } from "./settings.mjs";
 import { findOpenPullRequest } from "./pull-request.mjs";
+import { SettingsHttp, HttpError } from "./settings-http.mjs";
 
 const MAX_JSON = 1024 * 1024;
 const PULL_REQUEST_CACHE_MS = 30_000;
@@ -18,17 +19,11 @@ const STATIC = {
     "/index.html": ["index.html", "text/html; charset=utf-8"],
     "/app.js": ["app.js", "text/javascript; charset=utf-8"],
     "/styles.css": ["styles.css", "text/css; charset=utf-8"],
+    "/contracts.mjs": ["contracts.mjs", "text/javascript; charset=utf-8"],
+    "/settings-api.mjs": ["settings-api.mjs", "text/javascript; charset=utf-8"],
 };
 const ASSET_FILES = [...new Set(Object.values(STATIC).map(([file]) => file))];
 const ASSET_DEBOUNCE_MS = 250;
-
-class HttpError extends Error {
-    constructor(status, code, message) {
-        super(message);
-        this.status = status;
-        this.code = code;
-    }
-}
 
 function send(res, status, body, type = "application/json; charset=utf-8") {
     const payload = typeof body === "string" || Buffer.isBuffer(body) ? body : JSON.stringify(body);
@@ -91,6 +86,7 @@ const STATUS_FOR_CODE = { invalid_input: 400, not_found: 404, conflict: 409, git
  * @param {(repoRoot: string, branch: string) => Promise<{number: number, url: string} | null>} [p.findPullRequest]
  */
 export async function startReviewServer({ instanceId, getReviewId, service, delivery, webRoot, log = () => {}, settings, onReviewChange, agentReview, findPullRequest = findOpenPullRequest }) {
+    const settingsHttp = new SettingsHttp(settings, log);
     const token = randomBytes(24).toString("base64url");
     const clients = new Set();
     const pullRequestCache = new Map();
@@ -143,26 +139,6 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         });
     };
 
-    async function readSettings(repoRoot) {
-        if (!settings) return null;
-        try {
-            return await settings.get(repoRoot);
-        } catch (err) {
-            log(`self-review: could not read settings: ${err?.message ?? err}`, "warning");
-            return null;
-        }
-    }
-
-    async function readAgentReviewSettings() {
-        if (!settings?.getAgentReview) return { agentReviewSettings: null, agentReviewSettingsAvailable: false };
-        try {
-            return { agentReviewSettings: await settings.getAgentReview(), agentReviewSettingsAvailable: true };
-        } catch (err) {
-            log(`self-review: could not read agent review defaults: ${err.message}`, "warning");
-            return { agentReviewSettings: null, agentReviewSettingsAvailable: true, agentReviewSettingsError: `Could not read agent review defaults: ${err.message}` };
-        }
-    }
-
     async function readPullRequest(review) {
         if (!review.branch) return null;
         const key = `${review.repoRoot}\0${review.branch}`;
@@ -190,7 +166,7 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         }
         if (!settings) return false;
         const review = await service.getReview(reviewId);
-        return resolveDelivery((await readSettings(review.repoRoot))?.delivery, review) !== "immediate";
+        return resolveDelivery((await settingsHttp.repo(review.repoRoot))?.delivery, review) !== "immediate";
     }
 
     async function api(req, res, url) {
@@ -206,7 +182,7 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         if (req.method === "GET") {
             if (parts[0] === "state" && parts.length === 1) {
                 const review = await service.getReview(reviewId);
-                return send(res, 200, { instanceId, review, session: { busy: delivery.busy }, settings: await readSettings(review.repoRoot), pullRequest: await readPullRequest(review), agentReviewAvailable: Boolean(agentReview), agentReviewSuggestedModels: SUGGESTED_REVIEWERS, ...await readAgentReviewSettings() });
+                return send(res, 200, { instanceId, review, session: { busy: delivery.busy }, pullRequest: await readPullRequest(review), agentReviewAvailable: Boolean(agentReview), agentReviewSuggestedModels: SUGGESTED_REVIEWERS, ...await settingsHttp.read(review.repoRoot) });
             }
             if (parts[0] === "snapshot" && parts.length === 2) {
                 return send(res, 200, await service.getSnapshot(reviewId, parts[1]));
@@ -239,8 +215,7 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         const body = await readJsonBody(req);
 
         if (parts[0] === "agent-review-settings" && parts.length === 1) {
-            if (!settings?.updateAgentReview) throw new HttpError(501, "unsupported", "Agent review defaults are not available.");
-            const saved = await settings.updateAgentReview(body.defaults);
+            const saved = await settingsHttp.updateAgentReview(body);
             service.changed(reviewId, "agent-review-settings");
             return send(res, 200, saved);
         }
@@ -314,7 +289,7 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         if (parts[0] === "settings" && parts.length === 1) {
             if (!settings) throw new HttpError(501, "unsupported", "Settings are not available.");
             const review = await service.getReview(reviewId);
-            return send(res, 200, await settings.update(review.repoRoot, { learning: body.learning, delivery: body.delivery, dismissed: body.dismissed }));
+            return send(res, 200, await settingsHttp.update(review.repoRoot, body));
         }
         if (parts[0] === "scope" && parts.length === 1) {
             if (!SCOPES.includes(body.scope)) throw new HttpError(400, "invalid_input", `scope must be one of ${SCOPES.join(", ")}.`);

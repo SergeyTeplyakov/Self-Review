@@ -5,6 +5,7 @@ import { cp, mkdir, open, readFile, rename, rm, stat, writeFile, appendFile, unl
 import { createHash, randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
+import { settingsDocument } from "../web/contracts.mjs";
 
 const REVIEW_ID = /^[a-z0-9][a-z0-9._-]{0,100}$/;
 const REVISION_ID = /^r[0-9]{1,6}$/;
@@ -219,10 +220,15 @@ export class Store {
     }
 
     async readSettings() {
-        return (await readJson(this.settingsFile())) ?? { version: 1, repos: {} };
+        return settingsDocument(await readJson(this.settingsFile()));
     }
 
     // Read-modify-write of the per-user settings file. mutate(settings) edits it in place and may return a value.
+    /**
+     * @template T
+     * @param {(settings: import("../types/contracts.js").SettingsDocument) => T | Promise<T>} mutate
+     * @returns {Promise<T>}
+     */
     async updateSettings(mutate) {
         return this.lock("settings", async () => {
             const settings = await this.readSettings();

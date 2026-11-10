@@ -8,6 +8,7 @@ import { parseUnifiedDiff, synthesizeAddedFile, hunkAnchorRange, selectedLines, 
 import { relocate } from "../lib/anchors.mjs";
 import { buildCommentPrompt, marker } from "../lib/prompt.mjs";
 import { Store, migrateLegacyDataRoot } from "../lib/store.mjs";
+import { loadApp } from "./load-app.mjs";
 
 const DIFF = [
     "diff --git a/src/a.cs b/src/a.cs",
@@ -239,7 +240,7 @@ test("UI shows a description instead of a duplicate tree, and folds outdated thr
         document: { addEventListener() {}, querySelector: () => ({}) },
         localStorage: { getItem: () => null }, setInterval() {},
     });
-    vm.runInContext(await readFile(new URL("../web/app.js", import.meta.url), "utf8"), context);
+    await loadApp(context);
     vm.runInContext(`
         state.review = {
             reviewId: "r", currentRevisionId: "r1", repoRoot: "repo", revisions: [], lessons: [], threads: [],
@@ -281,7 +282,7 @@ test("file selection shows the whole file with changes inline; folder selection 
         document: { addEventListener() {}, querySelector: () => ({}) },
         localStorage: { getItem: () => null }, setInterval() {},
     });
-    vm.runInContext(await readFile(new URL("../web/app.js", import.meta.url), "utf8"), context);
+    await loadApp(context);
     vm.runInContext(`
         state.review = { reviewId: "r", currentRevisionId: "r1", repoRoot: "repo", revisions: [], lessons: [], threads: [
             { threadId: "gap", kind: "line", status: "active", location: { path: "src/a.cs", side: "new", startLine: 1, endLine: 1, state: "current" }, messages: [] },
@@ -316,7 +317,7 @@ test("full-file view maps line numbers around zero-context insertions and deleti
         document: { addEventListener() {}, querySelector: () => ({}) },
         localStorage: { getItem: () => null }, setInterval() {},
     });
-    vm.runInContext(await readFile(new URL("../web/app.js", import.meta.url), "utf8"), context);
+    await loadApp(context);
     const rows = JSON.parse(vm.runInContext(`JSON.stringify(buildFullFile({ path: "a.cs", hunks: [
         { oldStart: 0, oldLines: 0, newStart: 1, newLines: 1, rows: [{ t: "add", o: null, n: 1, s: "X" }] },
         { oldStart: 3, oldLines: 1, newStart: 3, newLines: 0, rows: [{ t: "del", o: 3, n: null, s: "c" }] },
@@ -335,7 +336,7 @@ test("navigating to a nested file reveals its ancestors in the sidebar", async (
         document: { addEventListener() {}, querySelector: (selector) => selector === "#main" ? main : {} },
         localStorage: { getItem: () => null, setItem() {} }, sessionStorage: { setItem() {} }, setInterval() {},
     });
-    vm.runInContext(await readFile(new URL("../web/app.js", import.meta.url), "utf8"), context);
+    await loadApp(context);
     vm.runInContext(`
         state.review = { reviewId: "r" };
         state.collapsedDirs = new Set(["", "src", "src/folder", "unrelated"]);
@@ -352,7 +353,7 @@ test("a full-file response does not move an active diff selection", async () => 
         document: { addEventListener() {}, querySelector: () => ({}), querySelectorAll: () => [] },
         localStorage: { getItem: () => null }, setInterval() {},
     });
-    vm.runInContext(await readFile(new URL("../web/app.js", import.meta.url), "utf8"), context);
+    await loadApp(context);
     vm.runInContext(`
         state.view = { type: "file", path: "src/a.cs" };
         var file = { path: "src/a.cs", status: "modified", hunks: [{
@@ -385,7 +386,7 @@ test("overview ruler merges adjacent changed rows and scales to scroll height", 
         document: { addEventListener() {}, querySelector: () => ({}) },
         localStorage: { getItem: () => null }, setInterval() {},
     });
-    vm.runInContext(await readFile(new URL("../web/app.js", import.meta.url), "utf8"), context);
+    await loadApp(context);
     const marks = JSON.parse(vm.runInContext(`JSON.stringify(rulerMarks([
         { kind: "add", top: 100, height: 20 }, { kind: "add", top: 120, height: 20 },
         { kind: "del", top: 140, height: 20 }, { kind: "add", top: 500, height: 20 },
@@ -447,7 +448,7 @@ test("syntax highlighting escapes source, preserves text, and recognizes code an
         document: { addEventListener() {}, querySelector: () => ({}) },
         localStorage: { getItem: () => null }, setInterval() {},
     });
-    vm.runInContext(await readFile(new URL("../web/app.js", import.meta.url), "utf8"), context);
+    await loadApp(context);
     const highlight = (text, language) => vm.runInContext(`highlightLine(${JSON.stringify(text)}, ${JSON.stringify(language)})`, context);
     const code = highlight('public required string Name { get; init; } = "<script>&"; // note', "code");
     assert.match(code, /syn-keyword">public/);
@@ -486,7 +487,7 @@ test("multiline syntax state stays separate for old and new sides and resets ove
         document: { addEventListener() {}, querySelector: () => ({}) },
         localStorage: { getItem: () => null }, setInterval() {},
     });
-    vm.runInContext(await readFile(new URL("../web/app.js", import.meta.url), "utf8"), context);
+    await loadApp(context);
     vm.runInContext(`
         var syntaxFile = { path: "a.cs", hunks: [
             { rows: [
@@ -518,7 +519,7 @@ test("markdown highlighting keeps every marker visible and styles inline content
         document: { addEventListener() {}, querySelector: () => ({}) },
         localStorage: { getItem: () => null }, setInterval() {},
     });
-    vm.runInContext(await readFile(new URL("../web/app.js", import.meta.url), "utf8"), context);
+    await loadApp(context);
     vm.runInContext("var mdState = {}", context);
     const highlight = (text) => vm.runInContext(`highlightLine(${JSON.stringify(text)}, "markdown", mdState)`, context);
     const escape = (text) => text.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
@@ -566,7 +567,7 @@ test("markdown fenced blocks highlight known languages, tint their rows, and res
         document: { addEventListener() {}, querySelector: () => ({}) },
         localStorage: { getItem: () => null }, setInterval() {},
     });
-    vm.runInContext(await readFile(new URL("../web/app.js", import.meta.url), "utf8"), context);
+    await loadApp(context);
     vm.runInContext(`
         var mdFile = { path: "docs/README.md", hunks: [
             { rows: [
