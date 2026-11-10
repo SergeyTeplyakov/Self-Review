@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as gitDefault from "./git.mjs";
 import { ReviewError } from "./review-service.mjs";
+import { reviewOptions } from "./agent-review.mjs";
 
 // How the agent treats review feedback as reusable guidelines:
 //   off     - address the comment only; never touch instruction files
@@ -101,6 +102,28 @@ export class SettingsService {
         this.store = store;
         this.git = git;
         this.log = log;
+    }
+
+    // Agent review defaults belong to the user, not a repository or canvas panel.
+    async getAgentReview() {
+        const defaults = (await this.store.readSettings()).agentReview;
+        return defaults == null ? null : this.validateAgentReview(defaults);
+    }
+
+    validateAgentReview(defaults) {
+        if (!defaults || typeof defaults !== "object" || typeof defaults.skipDialog !== "boolean") {
+            throw new ReviewError("invalid_input", "Agent review defaults require models, focus, and a boolean skipDialog.");
+        }
+        return { ...reviewOptions(defaults), skipDialog: defaults.skipDialog };
+    }
+
+    async updateAgentReview(defaults) {
+        const value = defaults === null ? null : this.validateAgentReview(defaults);
+        await this.store.updateSettings((settings) => {
+            if (value === null) delete settings.agentReview;
+            else settings.agentReview = value;
+        });
+        return value;
     }
 
     // Effective settings for a repository. Learning stays off until the reviewer chooses a mode,

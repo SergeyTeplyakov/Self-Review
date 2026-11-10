@@ -7,9 +7,12 @@ import { watch } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { SCOPES } from "./review-service.mjs";
+import { SUGGESTED_REVIEWERS } from "./agent-review.mjs";
 import { resolveDelivery } from "./settings.mjs";
+import { findOpenPullRequest } from "./pull-request.mjs";
 
 const MAX_JSON = 1024 * 1024;
+const PULL_REQUEST_CACHE_MS = 30_000;
 const STATIC = {
     "/": ["index.html", "text/html; charset=utf-8"],
     "/index.html": ["index.html", "text/html; charset=utf-8"],
@@ -85,10 +88,12 @@ const STATUS_FOR_CODE = { invalid_input: 400, not_found: 404, conflict: 409, git
  * @param {import("./settings.mjs").SettingsService} [p.settings] per-repository settings; the UI hides them when absent
  * @param {import("./agent-review.mjs").AgentReview} [p.agentReview] optional multi-model review coordinator
  * @param {(reviewId: string) => Promise<void> | void} [p.onReviewChange] makes getReviewId return the new review; required to switch scope
+ * @param {(repoRoot: string, branch: string) => Promise<{number: number, url: string} | null>} [p.findPullRequest]
  */
-export async function startReviewServer({ instanceId, getReviewId, service, delivery, webRoot, log = () => {}, settings, onReviewChange, agentReview }) {
+export async function startReviewServer({ instanceId, getReviewId, service, delivery, webRoot, log = () => {}, settings, onReviewChange, agentReview, findPullRequest = findOpenPullRequest }) {
     const token = randomBytes(24).toString("base64url");
     const clients = new Set();
+    const pullRequestCache = new Map();
     let port = 0;
 
     const broadcast = (event, data) => {
@@ -96,7 +101,7 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         for (const res of clients) res.write(frame);
     };
     const onChanged = (e) => {
-        if (e.reviewId === getReviewId()) broadcast("changed", e);
+        if (e.reason === "agent-review-settings" || e.reviewId === getReviewId()) broadcast("changed", e);
     };
     const onSession = (e) => broadcast("session", e);
     service.on("changed", onChanged);
@@ -148,6 +153,35 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         }
     }
 
+    async function readAgentReviewSettings() {
+        if (!settings?.getAgentReview) return { agentReviewSettings: null, agentReviewSettingsAvailable: false };
+        try {
+            return { agentReviewSettings: await settings.getAgentReview(), agentReviewSettingsAvailable: true };
+        } catch (err) {
+            log(`self-review: could not read agent review defaults: ${err.message}`, "warning");
+            return { agentReviewSettings: null, agentReviewSettingsAvailable: true, agentReviewSettingsError: `Could not read agent review defaults: ${err.message}` };
+        }
+    }
+
+    async function readPullRequest(review) {
+        if (!review.branch) return null;
+        const key = `${review.repoRoot}\0${review.branch}`;
+        const cached = pullRequestCache.get(key);
+        if (cached && cached.expiresAt > Date.now()) return cached.promise ?? cached.value;
+        const promise = Promise.resolve()
+            .then(() => findPullRequest(review.repoRoot, review.branch))
+            .catch((err) => {
+                log(`self-review: could not discover an open pull request: ${err.message}`, "warning");
+                return null;
+            })
+            .then((value) => {
+                pullRequestCache.set(key, { value, expiresAt: Date.now() + PULL_REQUEST_CACHE_MS });
+                return value;
+            });
+        pullRequestCache.set(key, { promise, expiresAt: Infinity });
+        return promise;
+    }
+
     // An explicit draft flag wins; otherwise the repository's delivery mode decides, and an undecided ask-mode review holds.
     async function shouldHold(reviewId, draft) {
         if (draft !== undefined) {
@@ -172,7 +206,7 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         if (req.method === "GET") {
             if (parts[0] === "state" && parts.length === 1) {
                 const review = await service.getReview(reviewId);
-                return send(res, 200, { instanceId, review, session: { busy: delivery.busy }, settings: await readSettings(review.repoRoot), agentReviewAvailable: Boolean(agentReview) });
+                return send(res, 200, { instanceId, review, session: { busy: delivery.busy }, settings: await readSettings(review.repoRoot), pullRequest: await readPullRequest(review), agentReviewAvailable: Boolean(agentReview), agentReviewSuggestedModels: SUGGESTED_REVIEWERS, ...await readAgentReviewSettings() });
             }
             if (parts[0] === "snapshot" && parts.length === 2) {
                 return send(res, 200, await service.getSnapshot(reviewId, parts[1]));
@@ -204,10 +238,23 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         }
         const body = await readJsonBody(req);
 
+        if (parts[0] === "agent-review-settings" && parts.length === 1) {
+            if (!settings?.updateAgentReview) throw new HttpError(501, "unsupported", "Agent review defaults are not available.");
+            const saved = await settings.updateAgentReview(body.defaults);
+            service.changed(reviewId, "agent-review-settings");
+            return send(res, 200, saved);
+        }
+
         if (parts[0] === "agent-reviews") {
             if (!agentReview) throw new HttpError(501, "unsupported", "Agent review is not available. Reload the extension.");
             if (pageReview !== reviewId) throw new HttpError(409, "conflict", "Refresh the canvas before starting or closing an agent review.");
-            if (parts.length === 1) return send(res, 200, await agentReview.start(reviewId, body, instanceId));
+            if (parts.length === 1) {
+                if (body.oneClick === true && !(await settings?.getAgentReview?.())?.skipDialog) {
+                    throw new HttpError(409, "conflict", "Saved defaults no longer allow one-click reviews. Confirm the current settings before starting.");
+                }
+                const { oneClick: _oneClick, ...input } = body;
+                return send(res, 200, await agentReview.start(reviewId, input, instanceId));
+            }
             if (parts.length === 3 && parts[2] === "close") return send(res, 200, await agentReview.close(reviewId, parts[1]));
         }
         if (parts[0] === "threads" && parts.length === 3 && parts[2] === "approve") {

@@ -9,6 +9,7 @@ const FINDING_SEVERITIES = { critical: "Critical", required: "Required", optiona
 const state = {
     review: null,
     snapshot: null,
+    pullRequest: null,
     busy: null,
     connection: "connecting",
     view: { type: "overview" },
@@ -26,6 +27,11 @@ const state = {
     switching: false, // a scope switch is in flight
     submitting: false, // a review submission is in flight
     agentReviewAvailable: false,
+    agentReviewSettings: null,
+    agentReviewSettingsAvailable: false,
+    agentReviewSettingsError: "",
+    agentReviewSuggestedModels: [],
+    startingReview: false,
     approving: new Set(),
 };
 
@@ -402,8 +408,13 @@ async function loadState() {
             const data = await api("GET", "state");
             if (state.review && state.review.reviewId !== data.review.reviewId) resetForReview();
             state.review = data.review;
+            state.pullRequest = data.pullRequest ?? null;
             state.settings = data.settings ?? null;
             state.agentReviewAvailable = data.agentReviewAvailable === true;
+            state.agentReviewSettings = data.agentReviewSettings ?? null;
+            state.agentReviewSettingsAvailable = data.agentReviewSettingsAvailable === true;
+            state.agentReviewSettingsError = data.agentReviewSettingsError ?? "";
+            state.agentReviewSuggestedModels = Array.isArray(data.agentReviewSuggestedModels) ? data.agentReviewSuggestedModels : [];
             if (data.session) state.busy = data.session.busy;
             const rev = state.review.currentRevisionId;
             if (rev && state.snapshot?.revisionId !== rev) state.snapshot = await api("GET", `snapshot/${rev}`);
@@ -679,11 +690,12 @@ function renderTop() {
     const awaiting = r.threads.flatMap((t) => t.messages).filter((m) => ["queued", "processing"].includes(m.delivery?.state)).length;
     const branch = `<span class="pill mono" title="HEAD ${esc(git.headCommit ?? "")}">${esc(r.branch ?? "?")}</span>`;
     const parts = [
-        `<span class="title">${esc(r.title)}</span>`,
-        scope === "pending"
-            ? `${branch}<span class="muted">uncommitted changes only</span>`
-            : `${branch}<span class="muted">vs</span><span class="pill mono" title="merge-base ${esc(git.baseCommit ?? "")}">${esc(r.base)}</span>`,
-        scopeToggleHtml(scope),
+        `<section class="change-context" role="group" aria-label="Change context">`,
+        `<div class="change-context-heading"><span class="title">${esc(r.title)}</span>${branch}`,
+        scope === "all" ? `<span class="muted">vs</span><span class="pill mono" title="merge-base ${esc(git.baseCommit ?? "")}">${esc(r.base)}</span>`
+            : `<span class="muted">uncommitted changes only</span>`,
+        state.pullRequest ? `<a class="pill pr-link" href="${esc(state.pullRequest.url)}" target="_blank" rel="noopener noreferrer" title="Open pull request #${esc(state.pullRequest.number)} in browser">Open PR #${esc(state.pullRequest.number)}</a>` : "",
+        `</div><div class="change-context-details">${scopeToggleHtml(scope)}`,
     ];
     if (rev) parts.push(`<span class="pill" title="Revision captured ${esc(rev.createdAt)}">${esc(rev.revisionId)} · ${rev.files} files · <span class="add">+${rev.additions}</span> <span class="del">−${rev.deletions}</span></span>`);
     if (scope === "all") {
@@ -696,22 +708,43 @@ function renderTop() {
     if (state.connection === "lost") parts.push(`<span class="pill warn" title="If this persists, reopen the canvas">disconnected</span>`);
     else if (state.busy === true) parts.push(`<span class="pill busy"><span class="dot"></span>Copilot working${awaiting ? ` · ${awaiting} pending` : ""}</span>`);
     else if (state.busy === false) parts.push(`<span class="pill"><span class="dot muted"></span>Copilot idle${awaiting ? ` · ${awaiting} pending` : ""}</span>`);
-    parts.push(`<span class="spacer"></span>`);
+    parts.push(`<span class="spacer"></span><button data-action="refresh" title="Re-read the working tree">Refresh</button></div></section>`);
+
+    const findings = agentComments().length;
     const drafts = draftMessages().length;
-    if (drafts) {
-        parts.push(`<button class="primary" data-action="submit-review" title="Send every draft comment to Copilot together, as one review"${state.submitting ? " disabled>Submitting…" : `>Submit review (${drafts})`}</button>`);
+    const workflows = [];
+    if (state.agentReviewAvailable || findings) {
+        workflows.push(`<section class="review-lane agent-review-lane" aria-labelledby="agentic-review-title">`
+            + `<div class="review-lane-heading"><h2 id="agentic-review-title">Agentic review</h2><p class="muted">Independent, read-only model review. May consume credits.</p></div>`
+            + `<div class="review-lane-actions">`);
+        if (state.agentReviewAvailable) {
+            const running = r.agentReviews?.some((run) => ["sending", "queued", "running"].includes(run.state));
+            const defaults = state.agentReviewSettings;
+            const hint = defaults?.skipDialog
+                ? `Run with saved defaults: ${defaults.models.join(", ")} (${defaults.focus}). May consume credits.`
+                : "Configure and run a read-only agentic review. May consume credits.";
+            workflows.push(`<button class="primary agent-review-launch" data-action="agent-review" title="${esc(hint)}"${running || state.startingReview ? " disabled" : ""}>${running ? "Agentic review running" : state.startingReview ? "Queuing review..." : "Run agentic review"}</button>`);
+        }
+        workflows.push(`<button class="agent-comment-count" data-action="nav" data-view="agent-comments" title="Agent findings in this scope, across all revisions; excludes replies and manual threads">Agent comments (<span aria-live="polite">${findings}</span>)</button>`);
+        if (state.agentReviewAvailable) workflows.push(`<button data-action="agent-review-configure" title="Configure agentic review and user-wide defaults">Review settings</button>`);
+        workflows.push(`</div></section>`);
     }
+    workflows.push(`<section class="review-lane feedback-lane" aria-labelledby="manual-review-title">`
+        + `<div class="review-lane-heading"><h2 id="manual-review-title">Manual Review</h2><p class="muted">Your comments guide the coding agent; these settings control how they are sent and learned from.</p></div>`
+        + `<div class="review-lane-actions">`);
+    workflows.push(`<span class="feedback-draft-count">${drafts} draft ${drafts === 1 ? "comment" : "comments"}</span>`);
+    if (drafts) workflows.push(`<button class="primary" data-action="submit-review" title="Send every draft comment to Copilot together, as one review"${state.submitting ? " disabled>Submitting…" : `>Submit review (${drafts})`}</button>`);
     if (state.settings) {
         const repoMode = deliveryRepoMode();
         const chosen = repoMode === "ask" ? deliveryMode() : null;
-        parts.push(chosen
+        workflows.push(chosen
             ? `<span class="pill" title="${esc(DELIVERY[chosen].hint)} Chosen for this review.">Delivery: ${esc(DELIVERY[chosen].pill)}</span><button class="link" data-action="delivery-reask" title="Choose again how this review sends comments">Change</button>`
             : `<span class="pill" title="${esc(DELIVERY[repoMode].hint)}">Delivery: ${esc(DELIVERY[repoMode].pill)}</span>`);
         const mode = LEARNING[learningMode()];
-        parts.push(`<span class="pill" title="${esc(mode.hint)}">Learning: ${esc(mode.pill)}</span><button data-action="configure" title="Choose how Copilot receives and learns from your review feedback in this repository">Configure</button>`);
+        workflows.push(`<span class="pill" title="${esc(mode.hint)}">Learning: ${esc(mode.pill)}</span><button data-action="configure" title="Change how manual review comments are delivered and used for learning in this repository">Manual review settings</button>`);
     }
-    parts.push(`<button data-action="refresh" title="Re-read the working tree">Refresh</button>`);
-    if (state.agentReviewAvailable) parts.push(`<button data-action="agent-review" title="Request independent, read-only reviews from selected models">Agent review</button>`);
+    workflows.push(`</div></section>`);
+    if (workflows.length) parts.push(`<div class="review-workflows">${workflows.join("")}</div>`);
     $("#top").innerHTML = parts.join("");
 }
 
@@ -789,7 +822,7 @@ function openConfigure() {
 
 function closeConfigure() {
     if (!state.dialog || state.dialog.saving) return;
-    const opener = state.dialog.type === "agent-review" ? "agent-review" : "configure";
+    const opener = state.dialog.type === "agent-review" ? state.dialog.opener ?? "agent-review" : "configure";
     state.dialog = null;
     renderDialog();
     focusIn(`[data-action="${opener}"]`);
@@ -798,43 +831,71 @@ function closeConfigure() {
 function agentReviewDialogHtml(d) {
     const options = [["review", "Review issues"], ["simplify", "Simplification"], ["both", "Review and simplification"]];
     return `<div class="modal-backdrop" data-action="dialog-backdrop"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby="dialog-desc">`
-        + `<h2 id="dialog-title">Agent review</h2>`
+        + `<h2 id="dialog-title">Agentic review</h2>`
         + `<p id="dialog-desc">Review ${esc(d.revisionId)} (${esc(d.scope)}). Each selected model reviews independently and may consume credits. No files are changed until you approve a suggestion or explicitly request a fix.</p>`
-        + `<label class="review-field">Model IDs (one to four, comma-separated)<input name="review-models" value="${esc(d.models)}" maxlength="483" autocomplete="off"${d.saving ? " disabled" : ""}></label>`
-        + `<p class="muted">Use exact model IDs available in your Copilot session. An unavailable model is reported as a failure, never silently replaced.</p>`
+        + `<label class="review-field">Reviewers (one to four model IDs, comma-separated)<input name="review-models" value="${esc(d.models)}" maxlength="483" autocomplete="off"${d.saving ? " disabled" : ""}></label>`
+        + `<p class="muted">Use exact model IDs available in your Copilot session, or copilot-fusion to run Copilot Fusion in a child session that reports back later. An unavailable reviewer is reported as a failure, never silently replaced.</p>`
         + `<label class="review-field"><span id="review-focus-label">Focus</span><select name="review-focus" aria-labelledby="review-focus-label"${d.saving ? " disabled" : ""}>${options.map(([value, label]) => `<option value="${value}"${d.focus === value ? " selected" : ""}>${label}</option>`).join("")}</select></label>`
         + `<label class="review-field">Goal, spec, or review guidance (optional)<textarea name="review-intent" maxlength="4000" rows="3" placeholder="Acceptance criteria, a spec reference, or focused review guidance"${d.saving ? " disabled" : ""}>${esc(d.intent)}</textarea></label>`
         + `<p class="muted">The coordinating agent checks findings against the code, baseline, and relevant callers or tests before reporting them. Missing evidence is reported, not treated as a pass.</p>`
         + `<p class="muted">You can request Addy Osmani's <a href="https://github.com/addyosmani/agent-skills" target="_blank" rel="noopener noreferrer">review and code-simplification skills</a> in the guidance above if installed. They are optional; nothing is installed automatically.</p>`
+        + (state.agentReviewSettingsAvailable
+            ? `<fieldset class="choices"><legend>User defaults for all repositories</legend>`
+                + `<label class="choice"><input type="checkbox" name="review-save-defaults"${d.saveDefaults ? " checked" : ""}${d.saving ? " disabled" : ""}><span>Save these models, focus, and guidance as my defaults</span></label>`
+                + `<label class="choice"><input type="checkbox" name="review-skip-dialog"${d.skipDialog ? " checked" : ""}${d.saving || !d.saveDefaults ? " disabled" : ""}><span>Run with saved defaults without asking again</span></label>`
+                + `<p class="muted">Each click on Run agentic review authorizes a credit-consuming review. Nothing runs on save or when opening a canvas. Fixes still need approval. Saved guidance applies across repositories; avoid repository-specific instructions.</p></fieldset>` : "")
         + (d.error ? `<div class="modal-error" role="alert">${esc(d.error)}</div>` : "")
-        + `<div class="modal-actions"><button data-action="dialog-cancel"${d.saving ? " disabled" : ""}>Cancel</button><button class="primary" data-action="agent-review-start"${d.saving ? " disabled" : ""}>${d.saving ? "Queuing..." : "Run review"}</button></div></div></div>`;
+        + `<div class="modal-actions"><button data-action="dialog-cancel"${d.saving ? " disabled" : ""}>Cancel</button>`
+        + (state.agentReviewSettingsAvailable ? `<button data-action="agent-review-save-defaults"${d.saving || !d.saveDefaults ? " disabled" : ""}>Save defaults</button>` : "")
+        + `<button class="primary" data-action="agent-review-start"${d.saving ? " disabled" : ""}>${d.saving ? "Please wait..." : "Run review"}</button></div></div></div>`;
 }
 
-function openAgentReview() {
+function openAgentReview(opener = "agent-review") {
     if (!state.agentReviewAvailable || !state.review || state.dialog) return;
     const last = state.review.agentReviews?.at(-1);
+    const defaults = state.agentReviewSettings;
     state.dialog = {
         type: "agent-review", reviewId: state.review.reviewId, revisionId: state.review.currentRevisionId,
-        scope: scopeLabel(scopeOf(state.review)), models: last?.models.join(", ") ?? "", focus: last?.focus ?? "review", intent: "", saving: false, error: "",
+        scope: scopeLabel(scopeOf(state.review)), models: (defaults?.models ?? last?.models ?? state.agentReviewSuggestedModels).join(", "),
+        focus: defaults?.focus ?? last?.focus ?? "review", intent: defaults?.intent ?? "", saving: false,
+        saveDefaults: Boolean(defaults), skipDialog: defaults?.skipDialog ?? false, opener, error: state.agentReviewSettingsError,
     };
     renderDialog();
     focusIn('#dialog input[name="review-models"]');
 }
 
-async function startAgentReview() {
+function agentReviewOptions(d) {
+    return { models: d.models.split(",").map((m) => m.trim()), focus: d.focus, intent: d.intent };
+}
+
+async function saveAgentReviewDefaults(d) {
+    state.agentReviewSettings = await api("POST", "agent-review-settings", { defaults: { ...agentReviewOptions(d), skipDialog: d.skipDialog } });
+    state.agentReviewSettingsError = "";
+}
+
+async function startAgentReview(saveOnly = false) {
     const d = state.dialog;
     if (d?.type !== "agent-review" || d.saving) return;
     d.saving = true;
     d.error = "";
     renderDialog();
     try {
-        if (d.reviewId !== state.review?.reviewId) throw new Error("The review scope changed. Close this dialog and try again.");
-        await api("POST", "agent-reviews", { models: d.models.split(",").map((m) => m.trim()), focus: d.focus, intent: d.intent, revisionId: d.revisionId });
+        if (!saveOnly && (d.reviewId !== state.review?.reviewId || d.revisionId !== state.review?.currentRevisionId)) {
+            throw new Error("The review scope changed or revision is stale. Close this dialog and try again.");
+        }
+        if (saveOnly && !d.saveDefaults) throw new Error("Select Save these models, focus, and guidance first.");
+        if (d.saveDefaults) await saveAgentReviewDefaults(d);
+        if (!saveOnly) {
+            if (d.reviewId !== state.review?.reviewId || d.revisionId !== state.review?.currentRevisionId) {
+                throw new Error("The review scope changed or revision is stale. Close this dialog and try again.");
+            }
+            await api("POST", "agent-reviews", { ...agentReviewOptions(d), revisionId: d.revisionId });
+        }
         state.dialog = null;
         renderDialog();
         focusIn('[data-action="agent-review"]');
         await loadState();
-        toast("Review requested. Model results will appear as suggestions.");
+        toast(saveOnly ? "User defaults saved. No review was started." : "Review requested. Model results will appear as suggestions.");
     } catch (err) {
         d.saving = false;
         d.error = err.message;
@@ -843,17 +904,61 @@ async function startAgentReview() {
     }
 }
 
+async function runAgentReview() {
+    if (!state.agentReviewAvailable || !state.review || state.dialog || state.startingReview
+        || state.review.agentReviews?.some((run) => ["sending", "queued", "running"].includes(run.state))) return;
+    if (!state.agentReviewSettings?.skipDialog || state.agentReviewSettingsError) {
+        openAgentReview();
+        return;
+    }
+    const reviewId = state.review.reviewId;
+    const revisionId = state.review.currentRevisionId;
+    state.startingReview = true;
+    renderTop();
+    try {
+        await loadState();
+        if (state.review?.reviewId !== reviewId || state.review.currentRevisionId !== revisionId) {
+            toast("The review scope or revision changed. Confirm the current review before starting.");
+            return;
+        }
+        if (!state.agentReviewSettings?.skipDialog || state.agentReviewSettingsError) {
+            openAgentReview();
+            return;
+        }
+        await api("POST", "agent-reviews", { useDefaults: true, oneClick: true, revisionId });
+        toast("Review requested with your saved defaults.");
+    } finally {
+        state.startingReview = false;
+        renderTop();
+        await loadState();
+    }
+}
+
+function agentComments() {
+    return state.review?.threads.filter((thread) => thread.agentReview) ?? [];
+}
+
+function agentCommentsView() {
+    const threads = agentComments();
+    const active = threads.filter((thread) => thread.status === "active").length;
+    const older = threads.filter((thread) => thread.agentReview.revisionId !== state.review.currentRevisionId).length;
+    return `<h2>Agent comments (${threads.length})</h2>`
+        + `<p class="muted">${active} active, ${threads.length - active} closed or resolved; ${older} from older revisions. Counts include all agent findings in this scope, not replies or manual threads.</p>`
+        + agentReviewsHtml()
+        + (threads.length ? threads.map((thread) => threadHtml(thread, { showLocation: true })).join("") : `<div class="empty">No agent comments yet. A review may still be running or may have reported no findings; check its status above.</div>`);
+}
+
 function agentReviewsHtml() {
     const runs = state.review?.agentReviews ?? [];
     if (!runs.length) return "";
     const active = (r) => ["sending", "queued", "running"].includes(r.state);
     return `<h2>Agent reviews</h2><p class="muted">Assessments and verification are reported by the coordinating agent, not independently attested by the canvas.</p>${[...runs].reverse().map((r) => `<div class="card agent-review-run">`
-        + `<strong>${esc(r.focus)}: ${esc(r.state)}</strong> <span class="muted">${esc(r.revisionId)}${r.revisionId !== state.review.currentRevisionId ? " (older diff)" : ""}</span>`
+        + `<strong>${esc(r.focus)}: ${esc(r.state)}</strong> <span class="pill">${agentComments().filter((thread) => thread.agentReview.runId === r.runId).length} agent comments</span> <span class="muted">${esc(r.revisionId)}${r.revisionId !== state.review.currentRevisionId ? " (older diff)" : ""}</span>`
         + (r.intent ? `<p class="review-summary">Goal / spec / guidance: ${esc(r.intent)}</p>` : "")
         + (r.error ? `<p class="err">${esc(r.error)}</p>` : "")
         + `<ul>${r.models.map((model) => {
             const result = r.results.find((x) => x.model === model);
-            let outcome = active(r) ? "Awaiting result" : "Not completed";
+            let outcome = active(r) ? (model === "copilot-fusion" ? "Awaiting result from the Copilot Fusion child session" : "Awaiting result") : "Not completed";
             if (result) {
                 if (result.error) {
                     outcome = `Failed: ${esc(result.error)}`;
@@ -1005,6 +1110,7 @@ function renderSide() {
     const overviewCount = r.threads.filter((t) => t.status === "active" && (t.kind === "overview" || !isPlaced(t))).length;
     const html = [
         `<div class="nav-item${v.type === "overview" ? " active" : ""}" data-action="nav" data-view="overview"><span class="name">Overview</span><span class="count${overviewCount ? "" : " zero"}">${overviewCount}</span></div>`,
+        ...(state.agentReviewAvailable || agentComments().length ? [`<div class="nav-item${v.type === "agent-comments" ? " active" : ""}" data-action="nav" data-view="agent-comments"><span class="name">Agent comments</span><span class="count">${agentComments().length}</span></div>`] : []),
         `<div class="nav-item${v.type === "lessons" ? " active" : ""}" data-action="nav" data-view="lessons"><span class="name">Lessons learned</span><span class="muted">${r.lessons.length}</span></div>`,
         `<div class="section">Files (${files.length})</div>`,
     ];
@@ -1038,7 +1144,7 @@ function renderMain() {
         }
         state.view = { type: "overview" };
     }
-    main.innerHTML = state.view.type === "lessons" ? lessonsView() : overviewView();
+    main.innerHTML = state.view.type === "lessons" ? lessonsView() : state.view.type === "agent-comments" ? agentCommentsView() : overviewView();
 }
 
 function composerHtml(key, { label, placeholder, kind, path, side, startLine, endLine, alwaysOpen }) {
@@ -1483,7 +1589,13 @@ async function onClick(e) {
     try {
         switch (action) {
             case "agent-review":
-                openAgentReview();
+                await runAgentReview();
+                break;
+            case "agent-review-configure":
+                openAgentReview("agent-review-configure");
+                break;
+            case "agent-review-save-defaults":
+                await startAgentReview(true);
                 break;
             case "agent-review-start":
                 await startAgentReview();
@@ -1652,6 +1764,12 @@ async function onClick(e) {
 
 async function onChange(e) {
     const el = e.target;
+    if ((el.name === "review-save-defaults" || el.name === "review-skip-dialog") && state.dialog?.type === "agent-review") {
+        state.dialog[el.name === "review-save-defaults" ? "saveDefaults" : "skipDialog"] = el.checked;
+        renderDialog();
+        focusIn(`#dialog input[name="${el.name}"]`);
+        return;
+    }
     if (el.name === "review-focus" && state.dialog?.type === "agent-review") {
         state.dialog.focus = el.value;
         return;

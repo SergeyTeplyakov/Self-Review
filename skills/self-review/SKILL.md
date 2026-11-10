@@ -70,9 +70,26 @@ discuss; they never authorize automatic fixes.
 ## Run an opt-in agent review
 
 Only run agent review when the user explicitly requests it. It may consume
-credits. Use the user's exact selected model IDs and review focus; ask if they
-have not chosen models. Never substitute a different model or claim to have
-dispatched one that the host cannot select.
+credits. Use the user's exact selected model IDs and review focus. Discover
+`get_agent_review_settings` and check for saved user defaults before asking for
+choices. On an explicit review request, use saved defaults with
+`run_agent_review` and `useDefaults: true` without asking again unless the user
+requests different choices. Ask only when neither saved defaults nor explicit
+choices exist. The canvas suggests `gpt-6-astra`, `gpt-6.1-sol`, and
+`copilot-fusion` when nothing is saved; these are not saved choices or consent.
+`copilot-fusion` is not a subagent model: follow the queued review prompt to run
+it in one coordinated child session with Auto and a Fusion tier. Wait for the
+child to finish, reconcile its provisional replies, then report once, possibly
+in a later turn; the saved result is immutable. Never substitute a
+different model or claim to have dispatched one that the host cannot select.
+Saving defaults does not authorize an automatic review, bypass host
+permissions, or approve fixes.
+
+On an explicit configuration request, discover `set_agent_review_settings` to
+save models, focus, optional guidance, and `skipDialog` for this user across
+repositories, or clear them with `defaults: null`. Do not choose paid models on
+the user's behalf. `skipDialog` controls the Run button's configuration dialog;
+it does not cause a review on canvas open.
 
 Discover `run_agent_review`, `get_agent_review`, and `report_agent_review` from
 the live canvas schema. Start against the current review revision, with any
