@@ -111,7 +111,7 @@ export async function checkBundledSkillUpdates({ manifestPath = DEFAULT_MANIFEST
         try {
             const bundled = await readFile(join(root, skill.path), "utf8");
             result.bundledMatchesManifest = sha256Text(bundled) === skill.sha256;
-            const key = `${pinned.repository}@${pinned.releaseCommit}`;
+            const key = JSON.stringify([pinned.repository, pinned.release, pinned.releaseCommit]);
             if (!repositories.has(key)) repositories.set(key, checkRepository(client, pinned.repository, pinned));
             const latest = await repositories.get(key);
             Object.assign(result, { latestRelease: latest.tag, latestCommit: latest.commit, publishedAt: latest.publishedAt, newerRelease: latest.newer });

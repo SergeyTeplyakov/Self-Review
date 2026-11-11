@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { checkBundledSkillUpdates, DEFAULT_MANIFEST, formatReport } from "../scripts/check-bundled-skill-updates.mjs";
@@ -123,4 +124,27 @@ test("a newer release tag on the pinned commit is newer-release-unchanged, and u
     }).fetch });
     assert.equal(moved.exitCode, 2);
     assert.match(moved.results[0].error, /release 0\.6\.15 now points to c+, not the pinned/);
+});
+
+test("pins with different release tags on the same commit are classified independently in either order", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "skill-pins-"));
+    try {
+        await cp(root, dir, { recursive: true });
+        const olderPin = structuredClone(manifest);
+        olderPin.skills.find((s) => s.name === "code-simplification").upstream.release = "0.6.14";
+        const addy = olderPin.skills.filter((s) => s.upstream.repository.includes("agent-skills"));
+        const pony = olderPin.skills.filter((s) => !s.upstream.repository.includes("agent-skills"));
+        for (const order of [addy, [...addy].reverse()]) {
+            const manifestPath = join(dir, "manifest.json");
+            await writeFile(manifestPath, JSON.stringify({ ...olderPin, skills: [...order, ...pony] }));
+            const { fetch, calls } = mockFetch({ ...addyPinned(), ...ponyPinned() });
+            const { results, exitCode } = await checkBundledSkillUpdates({ manifestPath, fetch });
+            const status = Object.fromEntries(results.map((r) => [r.name, r.status]));
+            assert.deepEqual(status, { "code-review-and-quality": "current", "code-simplification": "newer-release-unchanged", "ponytail-review": "current" });
+            assert.equal(exitCode, 1);
+            assert.equal(calls.filter((c) => c.path === `${ADDY}/releases/latest`).length, 2, "distinct pins are looked up separately");
+        }
+    } finally {
+        await rm(dir, { recursive: true, force: true });
+    }
 });
