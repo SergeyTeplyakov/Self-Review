@@ -187,11 +187,13 @@ need the updated extension loaded before the hooks can supply this context.
 
 ### Development checks
 
-Clone the repo, then run `copilot plugin marketplace add <path-to-clone>` and `copilot plugin install self-review-canvas@self-review-canvas`. It loads straight from your checkout, so edits show up in your next session.
+Clone the repo, then run `copilot plugin marketplace add <path-to-clone>` and
+`copilot plugin install self-review-canvas@self-review-canvas`. The checked-in
+`extensions/self-review/dist/` is the generated runtime distribution, so installing
+the plugin does not require TypeScript or a build step. The root `extension.mjs`
+remains the discovered entry point and forwards to emitted `dist/extension.mjs`.
 
-Runtime files stay plain JavaScript: `extension.mjs` remains the entry point, with no
-transpilation, bundler, or production build. Development checks require Node 22.12+
-and npm. From the repository root:
+Development checks require Node 22.12+ and npm. From the repository root:
 
 ```bash
 npm ci --ignore-scripts --omit=optional
@@ -199,39 +201,33 @@ npm run typecheck
 npm test
 ```
 
+`npm run build` compiles the TypeScript sources to ESM and copies the retained
+JavaScript modules and browser assets into `extensions/self-review/dist/`.
+`npm test` performs that build first, then exercises the emitted modules and an
+installation-shaped copy. Commit generated `dist/` changes together with source
+changes; CI checks that the distribution is up to date.
+
 The SDK package is a **development-only** source of its public canvas types, pinned
 for reproducible checking; the installed Copilot runtime still supplies the SDK at
 run time. No extension-local SDK installation is needed. If `tsc` or SDK declarations
 are missing, run the install command above rather than substituting ambient stubs.
 CI runs the same type checks and regression suite.
 
-This is an incremental `checkJs` rollout with `strict: true` and `noEmit: true`.
-The Node and browser projects have separate libraries and ambient types; shared
-contracts are checked in both environments. Currently checked implementation:
+The Node and browser projects use separate libraries and ambient types, with shared
+contracts in `extensions/self-review/types/contracts.d.ts`. Strict TypeScript
+currently checks `src/extension.mts`; `src/lib/anchors.mts`,
+`completion-guidance.mts`, `git-process.mts`, `pull-request.mts`, `server.mts`,
+`settings.mts`, `settings-actions.mts`, and `settings-http.mts`; and
+`src/web/contracts.mts` and `settings-api.mts`. Compile-only negative fixtures
+ensure invalid settings modes, request envelopes, and checkbox values are rejected.
+External HTTP, SDK, and persisted data still receive runtime validation.
 
-- `web/contracts.mjs`: settings/options codecs, saved-settings validation, and the settings portion of review state.
-- `lib/settings.mjs` and `lib/git-process.mjs`: repository identity, effective learning/delivery modes, reviewer defaults, and their producers.
-- `lib/settings-http.mjs` and `lib/settings-actions.mjs`: HTTP settings state/updates and the two SDK settings actions, using public SDK types.
-- `lib/completion-guidance.mjs`: advisory completion hooks, typed against the public SDK hook contract.
-- `web/settings-api.mjs`: browser settings requests and decoded responses, including the settings slice of `/api/state`.
-
-Shared declarations live in `extensions/self-review/types/contracts.d.ts`.
-Compile-only negative fixtures ensure invalid modes, request envelopes, and checkbox
-values are rejected. Raw inputs remain `unknown` until validated: static types do
-not replace HTTP, SDK, or disk validation. Invalid stored settings fail explicitly;
-the existing read-only fallback keeps reviews usable and logs settings read errors.
-Old settings without delivery modes and unknown stored mode strings retain the
-existing defaults.
-
-**Not yet checked:** the rest of `extension.mjs`, HTTP routing, review/thread/snapshot
-persistence and lifecycle, agent-review coordination/delivery, diff/anchor algorithms,
-and the main renderer `web/app.js`. Their integration with the checked settings code
-is covered by runtime tests, not claimed as static coverage. To expand coverage, add
-implementation files to the appropriate project and type their actual dependencies;
-do not disable strict errors or replace boundaries with `any`.
-
-The dependency-free runtime tests can also be run from `extensions/self-review`
-with `node --test test/*.test.mjs`.
+**Remaining unchecked legacy implementation:** `src/lib/agent-review.mjs`,
+`delivery.mjs`, `diff.mjs`, `git.mjs`, `prompt.mjs`, `review-service.mjs`, and
+`store.mjs`, plus the main browser renderer `web/app.js`. Type declarations at the
+TypeScript boundaries describe these JavaScript modules but do not statically check
+their implementations. Runtime regression tests exercise the emitted distribution
+and its integration with the legacy modules; this is not full TypeScript coverage.
 
 The screenshots in this README come from a script that builds a demo repository, seeds a review, and captures the canvas in light and dark themes with Playwright, using your installed Edge or Chrome:
 

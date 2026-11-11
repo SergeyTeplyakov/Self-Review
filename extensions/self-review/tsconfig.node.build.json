@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.node.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": [
+    "types/**/*.d.ts",
+    "src/extension.mts",
+    "src/lib/**/*.mts"
+  ]
+}

@@ -4,15 +4,15 @@ import { mkdtemp, rm, writeFile, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { Store } from "../lib/store.mjs";
-import { ReviewService } from "../lib/review-service.mjs";
-import { AgentReview, FUSION_REVIEWER, SUGGESTED_REVIEWERS } from "../lib/agent-review.mjs";
-import { Delivery } from "../lib/delivery.mjs";
-import { parseUnifiedDiff } from "../lib/diff.mjs";
-import * as git from "../lib/git.mjs";
-import { startReviewServer } from "../lib/server.mjs";
-import { buildCommentPrompt } from "../lib/prompt.mjs";
-import { SettingsService } from "../lib/settings.mjs";
+import { Store } from "../dist/lib/store.mjs";
+import { ReviewService } from "../dist/lib/review-service.mjs";
+import { AgentReview, FUSION_REVIEWER, SUGGESTED_REVIEWERS } from "../dist/lib/agent-review.mjs";
+import { Delivery } from "../dist/lib/delivery.mjs";
+import { parseUnifiedDiff } from "../dist/lib/diff.mjs";
+import * as git from "../dist/lib/git.mjs";
+import { startReviewServer } from "../dist/lib/server.mjs";
+import { buildCommentPrompt } from "../dist/lib/prompt.mjs";
+import { SettingsService } from "../dist/lib/settings.mjs";
 
 const models = ["gpt-review-test", "mai-review-test"];
 const input = { models, focus: "both", revisionId: "r1" };
@@ -456,7 +456,7 @@ test("HTTP settings persist user-wide defaults, expose read failures, and separa
     const delivery = new Delivery({ service: f.service, sessionId: () => "session-a", send: async () => "unused" });
     const server = await startReviewServer({
         instanceId: "c", getReviewId: () => "review", service: f.service, settings, delivery, agentReview: f.agent,
-        webRoot: fileURLToPath(new URL("../web", import.meta.url)), log: (message) => logs.push(message),
+        webRoot: fileURLToPath(new URL("../dist/web", import.meta.url)), log: (message) => logs.push(message),
         findPullRequest: async (repoRoot, branch) => { lookups.push({ repoRoot, branch }); return pullRequest; },
     });
     t.after(() => server.close());
@@ -493,11 +493,11 @@ test("user-wide settings changes reach every open canvas and one-click runs requ
     const delivery = new Delivery({ service: f.service, sessionId: () => "session-a", send: async () => "unused" });
     const server = await startReviewServer({
         instanceId: "first", getReviewId: () => "review", service: f.service, settings, delivery, agentReview: f.agent,
-        webRoot: fileURLToPath(new URL("../web", import.meta.url)),
+        webRoot: fileURLToPath(new URL("../dist/web", import.meta.url)),
     });
     const otherCanvas = await startReviewServer({
         instanceId: "second", getReviewId: () => "other-review", service: f.service, settings, delivery, agentReview: f.agent,
-        webRoot: fileURLToPath(new URL("../web", import.meta.url)),
+        webRoot: fileURLToPath(new URL("../dist/web", import.meta.url)),
     });
     t.after(async () => { await Promise.all([server.close(), otherCanvas.close()]); });
 
@@ -543,7 +543,7 @@ test("HTTP start, model reporting, approval, and discussion use the real deliver
     const delivery = new Delivery({ service: f.service, sessionId: () => "session-a", send: async (p) => { fixes.push(p); return "fix-transport"; } });
     const server = await startReviewServer({
         instanceId: "c", getReviewId: () => "review", service: f.service, delivery, agentReview: f.agent,
-        webRoot: fileURLToPath(new URL("../web", import.meta.url)),
+        webRoot: fileURLToPath(new URL("../dist/web", import.meta.url)),
     });
     t.after(() => server.close());
     const url = new URL(server.url);

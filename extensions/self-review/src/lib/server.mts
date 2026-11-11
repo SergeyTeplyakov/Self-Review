@@ -2,19 +2,27 @@
 // Bound to 127.0.0.1 on an ephemeral port; every /api call needs the per-instance token,
 // and POSTs need it as a header (cross-origin pages cannot set it without a preflight we never answer).
 import { createServer } from "node:http";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { watch } from "node:fs";
+import type { FSWatcher } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
+import { isRecord } from "../web/contracts.mjs";
 import { SCOPES } from "./review-service.mjs";
 import { SUGGESTED_REVIEWERS } from "./agent-review.mjs";
 import { resolveDelivery } from "./settings.mjs";
 import { findOpenPullRequest } from "./pull-request.mjs";
 import { SettingsHttp, HttpError } from "./settings-http.mjs";
+import type { Log } from "../../types/contracts.js";
+import type { AgentReview } from "./agent-review.mjs";
+import type { Delivery } from "./delivery.mjs";
+import type { Review, ReviewService } from "./review-service.mjs";
+import type { SettingsService } from "./settings.mjs";
 
 const MAX_JSON = 1024 * 1024;
 const PULL_REQUEST_CACHE_MS = 30_000;
-const STATIC = {
+const STATIC: Record<string, [file: string, contentType: string]> = {
     "/": ["index.html", "text/html; charset=utf-8"],
     "/index.html": ["index.html", "text/html; charset=utf-8"],
     "/app.js": ["app.js", "text/javascript; charset=utf-8"],
@@ -25,8 +33,9 @@ const STATIC = {
 const ASSET_FILES = [...new Set(Object.values(STATIC).map(([file]) => file))];
 const ASSET_DEBOUNCE_MS = 250;
 
-function send(res, status, body, type = "application/json; charset=utf-8") {
+function send(res: ServerResponse, status: number, body: unknown, type = "application/json; charset=utf-8"): void {
     const payload = typeof body === "string" || Buffer.isBuffer(body) ? body : JSON.stringify(body);
+    if (payload === undefined) throw new TypeError("Response body is not JSON serializable.");
     res.writeHead(status, {
         "Content-Type": type,
         "Cache-Control": "no-store",
@@ -36,16 +45,16 @@ function send(res, status, body, type = "application/json; charset=utf-8") {
     res.end(payload);
 }
 
-function readJsonBody(req) {
-    return new Promise((resolve, reject) => {
+function readJsonBody(req: IncomingMessage): Promise<unknown> {
+    return new Promise<unknown>((resolve, reject) => {
         const type = req.headers["content-type"] ?? "";
-        if (!type.startsWith("application/json")) {
+        if (typeof type !== "string" || !type.startsWith("application/json")) {
             reject(new HttpError(415, "invalid_input", "Expected application/json."));
             return;
         }
-        const chunks = [];
+        const chunks: Buffer[] = [];
         let size = 0;
-        req.on("data", (chunk) => {
+        req.on("data", (chunk: Buffer) => {
             size += chunk.length;
             if (size > MAX_JSON) {
                 reject(new HttpError(413, "invalid_input", "Request body too large."));
@@ -65,41 +74,78 @@ function readJsonBody(req) {
     });
 }
 
-function tokenMatches(expected, provided) {
+function tokenMatches(expected: string, provided: string | string[] | null | undefined): boolean {
     if (typeof provided !== "string" || provided.length !== expected.length) return false;
     return timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
 }
 
-const STATUS_FOR_CODE = { invalid_input: 400, not_found: 404, conflict: 409, git_error: 502 };
+const STATUS_FOR_CODE: Record<string, number> = { invalid_input: 400, not_found: 404, conflict: 409, git_error: 502 };
 
-/**
- * @param {object} p
- * @param {string} p.instanceId
- * @param {() => string} p.getReviewId
- * @param {import("./review-service.mjs").ReviewService} p.service
- * @param {import("./delivery.mjs").Delivery} p.delivery
- * @param {string} p.webRoot
- * @param {(msg: string, level?: string) => void} p.log
- * @param {import("./settings.mjs").SettingsService} [p.settings] per-repository settings; the UI hides them when absent
- * @param {import("./agent-review.mjs").AgentReview} [p.agentReview] optional multi-model review coordinator
- * @param {(reviewId: string) => Promise<void> | void} [p.onReviewChange] makes getReviewId return the new review; required to switch scope
- * @param {(repoRoot: string, branch: string) => Promise<{number: number, url: string} | null>} [p.findPullRequest]
- */
-export async function startReviewServer({ instanceId, getReviewId, service, delivery, webRoot, log = () => {}, settings, onReviewChange, agentReview, findPullRequest = findOpenPullRequest }) {
+interface StartReviewServerOptions {
+    instanceId: string;
+    getReviewId: () => string;
+    service: ReviewService;
+    delivery: Delivery;
+    webRoot: string;
+    log?: Log;
+    settings?: SettingsService;
+    agentReview?: AgentReview;
+    onReviewChange?: (reviewId: string) => Promise<void> | void;
+    findPullRequest?: typeof findOpenPullRequest;
+}
+
+interface PullRequestInfo {
+    number: number;
+    url: string;
+}
+
+type PullRequestCacheEntry =
+    | { value: PullRequestInfo | null; expiresAt: number }
+    | { promise: Promise<PullRequestInfo | null>; expiresAt: number };
+
+function errorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+}
+
+function recordBody(value: unknown): Record<string, unknown> {
+    if (!isRecord(value)) throw new HttpError(400, "invalid_input", "Expected a JSON object.");
+    return value;
+}
+
+function isReviewScope(value: unknown): value is (typeof SCOPES)[number] {
+    return typeof value === "string" && SCOPES.some((scope) => scope === value);
+}
+
+export async function startReviewServer({
+    instanceId,
+    getReviewId,
+    service,
+    delivery,
+    webRoot,
+    log = () => {},
+    settings,
+    onReviewChange,
+    agentReview,
+    findPullRequest = findOpenPullRequest,
+}: StartReviewServerOptions): Promise<{
+    url: string;
+    notify: (event: string, data: unknown) => void;
+    close(): Promise<void>;
+}> {
     const settingsHttp = new SettingsHttp(settings, log);
     const token = randomBytes(24).toString("base64url");
-    const clients = new Set();
-    const pullRequestCache = new Map();
+    const clients = new Set<ServerResponse>();
+    const pullRequestCache = new Map<string, PullRequestCacheEntry>();
     let port = 0;
 
-    const broadcast = (event, data) => {
+    const broadcast = (event: string, data: unknown): void => {
         const frame = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
         for (const res of clients) res.write(frame);
     };
-    const onChanged = (e) => {
+    const onChanged = (e: { reason: string; reviewId: string }): void => {
         if (e.reason === "agent-review-settings" || e.reviewId === getReviewId()) broadcast("changed", e);
     };
-    const onSession = (e) => broadcast("session", e);
+    const onSession = (e: unknown): void => broadcast("session", e);
     service.on("changed", onChanged);
     delivery.on("session", onSession);
     const heartbeat = setInterval(() => {
@@ -114,8 +160,8 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         () => `${file}:missing`,
     )))).join("|");
     let signature = await assetSignature();
-    let assetTimer;
-    let watcher;
+    let assetTimer: ReturnType<typeof setTimeout> | undefined;
+    let watcher: FSWatcher | undefined;
     try {
         watcher = watch(webRoot, { persistent: false }, () => {
             clearTimeout(assetTimer);
@@ -127,27 +173,28 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
             }, ASSET_DEBOUNCE_MS);
             assetTimer.unref?.();
         });
-        watcher.on("error", (err) => log(`self-review: asset watcher stopped: ${err?.message ?? err}`, "warning"));
-    } catch (err) {
-        log(`self-review: asset watcher unavailable: ${err?.message ?? err}`, "warning");
+        watcher.on("error", (error: Error) => log(`self-review: asset watcher stopped: ${error.message}`, "warning"));
+    } catch (error) {
+        log(`self-review: asset watcher unavailable: ${errorMessage(error)}`, "warning");
     }
 
-    const deliverAsync = (reviewId, threadId, messageId) => {
+    const deliverAsync = (reviewId: string, threadId: string, messageId: string): void => {
         delivery.deliver(reviewId, threadId, messageId, instanceId).catch((err) => {
-            log(`self-review: delivery error for ${messageId}: ${err?.message ?? err}`, "warning");
-            service.setDelivery(reviewId, messageId, { state: "failed", error: String(err?.message ?? err) }).catch(() => {});
+            log(`self-review: delivery error for ${messageId}: ${errorMessage(err)}`, "warning");
+            service.setDelivery(reviewId, messageId, { state: "failed", error: errorMessage(err) }).catch(() => {});
         });
     };
 
-    async function readPullRequest(review) {
-        if (!review.branch) return null;
-        const key = `${review.repoRoot}\0${review.branch}`;
+    async function readPullRequest(review: Review): Promise<PullRequestInfo | null> {
+        const branch = review.branch;
+        if (!branch) return null;
+        const key = `${review.repoRoot}\0${branch}`;
         const cached = pullRequestCache.get(key);
-        if (cached && cached.expiresAt > Date.now()) return cached.promise ?? cached.value;
+        if (cached && cached.expiresAt > Date.now()) return "promise" in cached ? cached.promise : cached.value;
         const promise = Promise.resolve()
-            .then(() => findPullRequest(review.repoRoot, review.branch))
-            .catch((err) => {
-                log(`self-review: could not discover an open pull request: ${err.message}`, "warning");
+            .then(() => findPullRequest(review.repoRoot, branch))
+            .catch((error: unknown) => {
+                log(`self-review: could not discover an open pull request: ${errorMessage(error)}`, "warning");
                 return null;
             })
             .then((value) => {
@@ -159,7 +206,7 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
     }
 
     // An explicit draft flag wins; otherwise the repository's delivery mode decides, and an undecided ask-mode review holds.
-    async function shouldHold(reviewId, draft) {
+    async function shouldHold(reviewId: string, draft: unknown): Promise<boolean> {
         if (draft !== undefined) {
             if (typeof draft !== "boolean") throw new HttpError(400, "invalid_input", "draft must be a boolean.");
             return draft;
@@ -169,7 +216,7 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         return resolveDelivery((await settingsHttp.repo(review.repoRoot))?.delivery, review) !== "immediate";
     }
 
-    async function api(req, res, url) {
+    async function api(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
         const provided = req.headers["x-mr-token"] ?? (req.method === "GET" ? url.searchParams.get("t") : null);
         if (!tokenMatches(token, provided)) throw new HttpError(403, "forbidden", "Invalid token.");
         const origin = req.headers.origin;
@@ -212,7 +259,7 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         if (pageReview !== undefined && pageReview !== reviewId) {
             throw new HttpError(409, "conflict", "This canvas now shows a different review. Your comment was not saved; reload and try again.");
         }
-        const body = await readJsonBody(req);
+        const body = recordBody(await readJsonBody(req));
 
         if (parts[0] === "agent-review-settings" && parts.length === 1) {
             const saved = await settingsHttp.updateAgentReview(body);
@@ -235,7 +282,11 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         if (parts[0] === "threads" && parts.length === 3 && parts[2] === "approve") {
             if (!agentReview) throw new HttpError(501, "unsupported", "Agent review is not available. Reload the extension.");
             if (pageReview !== reviewId) throw new HttpError(409, "conflict", "Refresh the canvas before approving a finding.");
-            const approved = await agentReview.approve(reviewId, parts[1], body.revisionId);
+            const revisionId = body.revisionId;
+            if (revisionId !== undefined && typeof revisionId !== "string") {
+                throw new HttpError(400, "invalid_input", "revisionId must be a string.");
+            }
+            const approved = await agentReview.approve(reviewId, parts[1], revisionId);
             const result = await delivery.deliver(reviewId, approved.threadId, approved.messageId, instanceId);
             return send(res, 200, { ...approved, ...result });
         }
@@ -292,7 +343,7 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
             return send(res, 200, await settingsHttp.update(review.repoRoot, body));
         }
         if (parts[0] === "scope" && parts.length === 1) {
-            if (!SCOPES.includes(body.scope)) throw new HttpError(400, "invalid_input", `scope must be one of ${SCOPES.join(", ")}.`);
+            if (!isReviewScope(body.scope)) throw new HttpError(400, "invalid_input", `scope must be one of ${SCOPES.join(", ")}.`);
             if (!onReviewChange) throw new HttpError(501, "unsupported", "Switching scope is not available.");
             const nextId = await service.openSibling(reviewId, body.scope);
             if (nextId !== reviewId) {
@@ -318,20 +369,25 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
             const asset = STATIC[url.pathname];
             if (req.method !== "GET" || !asset) throw new HttpError(404, "not_found", "Not found.");
             send(res, 200, await readFile(path.join(webRoot, asset[0])), asset[1]);
-        } catch (err) {
-            const status = err instanceof HttpError ? err.status : STATUS_FOR_CODE[err?.code] ?? 500;
-            const code = err?.code ?? "internal";
-            if (status >= 500) log(`self-review: ${req.method} ${req.url?.split("?")[0]} failed: ${err?.message ?? err}`, "warning");
-            if (!res.headersSent) send(res, status, { error: { code, message: err?.message ?? String(err) } });
+        } catch (error: unknown) {
+            const code = error instanceof HttpError
+                ? error.code
+                : isRecord(error) && typeof error.code === "string" ? error.code : "internal";
+            const status = error instanceof HttpError ? error.status : STATUS_FOR_CODE[code] ?? 500;
+            const message = errorMessage(error);
+            if (status >= 500) log(`self-review: ${req.method} ${req.url?.split("?")[0]} failed: ${message}`, "warning");
+            if (!res.headersSent) send(res, status, { error: { code, message } });
             else res.end();
         }
     });
 
-    await new Promise((resolve, reject) => {
+    await new Promise<void>((resolve, reject) => {
         server.once("error", reject);
         server.listen(0, "127.0.0.1", resolve);
     });
-    port = server.address().port;
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Review server did not bind to a TCP address.");
+    port = address.port;
 
     return {
         url: `http://127.0.0.1:${port}/?t=${token}`,
@@ -344,7 +400,7 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
             delivery.off("session", onSession);
             for (const res of clients) res.end();
             clients.clear();
-            const closed = new Promise((resolve) => server.close(() => resolve()));
+            const closed = new Promise<void>((resolve) => server.close(() => resolve()));
             server.closeAllConnections?.();
             await closed;
         },

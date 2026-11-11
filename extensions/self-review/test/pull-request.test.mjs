@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { findOpenPullRequest } from "../lib/pull-request.mjs";
+import { findOpenPullRequest } from "../dist/lib/pull-request.mjs";
 
 const response = (entries) => (command, args, options, callback) => {
     assert.equal(command, "gh");

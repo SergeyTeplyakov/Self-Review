@@ -1,9 +1,22 @@
 import { execFile } from "node:child_process";
 
-function matchingPullRequests(entries, branch) {
+interface PullRequestEntry {
+    headRefName?: unknown;
+    number?: unknown;
+    url?: unknown;
+}
+
+interface PullRequest {
+    number: number;
+    url: string;
+}
+
+type ExecFileRunner = typeof execFile;
+
+function matchingPullRequests(entries: unknown, branch: string): PullRequest[] {
     if (!Array.isArray(entries)) throw new Error("GitHub CLI returned an invalid pull request list.");
-    return entries.flatMap((entry) => {
-        if (entry?.headRefName !== branch || !Number.isSafeInteger(entry.number) || entry.number < 1) return [];
+    return entries.flatMap((entry: PullRequestEntry) => {
+        if (entry?.headRefName !== branch || typeof entry.number !== "number" || !Number.isSafeInteger(entry.number) || entry.number < 1) return [];
         if (typeof entry.url !== "string") return [];
         let url;
         try {
@@ -18,7 +31,7 @@ function matchingPullRequests(entries, branch) {
     });
 }
 
-export function findOpenPullRequest(repoRoot, branch, run = execFile) {
+export function findOpenPullRequest(repoRoot: string, branch: string, run: ExecFileRunner = execFile): Promise<PullRequest | null> {
     return new Promise((resolve, reject) => {
         run("gh", [
             "pr", "list", "--state", "open", "--head", branch, "--limit", "100",

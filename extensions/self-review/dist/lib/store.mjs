@@ -226,7 +226,7 @@ export class Store {
     // Read-modify-write of the per-user settings file. mutate(settings) edits it in place and may return a value.
     /**
      * @template T
-     * @param {(settings: import("../types/contracts.js").SettingsDocument) => T | Promise<T>} mutate
+     * @param {(settings: import("../../types/contracts.js").SettingsDocument) => T | Promise<T>} mutate
      * @returns {Promise<T>}
      */
     async updateSettings(mutate) {

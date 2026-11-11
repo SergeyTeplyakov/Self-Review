@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
-import { parseUnifiedDiff } from "../lib/diff.mjs";
+import { parseUnifiedDiff } from "../dist/lib/diff.mjs";
 import { loadApp as runApp } from "./load-app.mjs";
 
 // Loads the page script into a bare vm context. Elements are created on demand and remembered per selector,
@@ -49,7 +49,7 @@ const clicker = (app) => (action, dataset = {}) => {
 };
 
 test("the page provides every container the scope and learning controls render into", async () => {
-    const html = await readFile(new URL("../web/index.html", import.meta.url), "utf8");
+    const html = await readFile(new URL("../dist/web/index.html", import.meta.url), "utf8");
     for (const id of ["top", "banner", "layout", "side", "main", "ruler", "dialog", "toast"]) assert.match(html, new RegExp(`id="${id}"`), id);
 });
 

@@ -7,8 +7,12 @@ import { execFile } from "node:child_process";
  * @param {{allowFail?: boolean}} [options]
  * @returns {Promise<{ok: boolean, stdout: string, stderr: string}>}
  */
-export function runGit(cwd, args, { allowFail = false } = {}) {
-    return new Promise((resolve, reject) => {
+export function runGit(cwd: string, args: string[], { allowFail = false }: { allowFail?: boolean } = {}): Promise<{
+    ok: boolean;
+    stdout: string;
+    stderr: string;
+}> {
+    return new Promise<{ ok: boolean; stdout: string; stderr: string }>((resolve, reject) => {
         execFile(
             "git",
             ["--no-pager", "-c", "core.quotepath=false", ...args],

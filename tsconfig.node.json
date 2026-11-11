@@ -1,7 +1,5 @@
 {
   "compilerOptions": {
-    "allowJs": true,
-    "checkJs": true,
     "strict": true,
     "noEmit": true,
     "target": "ES2022",
@@ -12,11 +10,9 @@
   },
   "include": [
     "extensions/self-review/types/**/*.d.ts",
-    "extensions/self-review/web/contracts.mjs",
-    "extensions/self-review/lib/settings.mjs",
-    "extensions/self-review/lib/git-process.mjs",
-    "extensions/self-review/lib/settings-actions.mjs",
-    "extensions/self-review/lib/settings-http.mjs",
-    "extensions/self-review/lib/completion-guidance.mjs"
+    "extensions/self-review/src/extension.mts",
+    "extensions/self-review/src/lib/**/*.mts",
+    "extensions/self-review/src/web/contracts.mts",
+    "extensions/self-review/type-tests/runtime-apis.mts"
   ]
 }
