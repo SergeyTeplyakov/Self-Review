@@ -695,11 +695,15 @@ test("retired historical commit reviews stay on disk but are never reopened, ref
     await rejects(service.openSibling(reviewId, "pending"));
     await rejects(service.createThread(reviewId, { kind: "overview", body: "New note", author: "user" }));
     await rejects(service.addMessage(reviewId, thread.threadId, { author: "user", body: "Reply" }));
+    await rejects(service.setThreadStatus(reviewId, thread.threadId, "resolved"));
+    await rejects(service.updateDescription(reviewId, { body: "New description", expectedVersion: 0 }));
     assert.equal(scopeOf(await service.getReview(reviewId)), "all", "the UI scope helper never presents commit as a selectable scope");
 
     const stored = await store.readReview(reviewId);
     assert.equal(stored.scope, "commit");
     assert.deepEqual(stored.threads.map((t) => t.messages.map((m) => m.body)), [["Old local note"]], "retired notes are preserved untouched");
+    assert.deepEqual(stored.threads.map((t) => t.status), [thread.status], "retired thread statuses are unchanged");
+    assert.equal(stored.description ?? null, null, "retired descriptions are unchanged");
 
     const other = fresh();
     const allId = await other.service.ensureReview({ repoPath: repo, base: "main" });

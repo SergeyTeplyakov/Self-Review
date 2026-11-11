@@ -913,6 +913,7 @@ function agentReviewDialogHtml(d) {
         + (d.error ? `<div class="modal-error" role="alert">${esc(d.error)}</div>` : "")
         + `<div class="modal-actions"><button data-action="dialog-cancel"${d.saving ? " disabled" : ""}>Cancel</button>`
         + (state.agentReviewSettingsAvailable ? `<button${d.settingsOnly ? ' class="primary"' : ""} data-action="agent-review-save-defaults"${d.saving || d.skillsLoading || !(d.saveDefaults || d.saveSkillDefaults) ? " disabled" : ""}>Save defaults</button>` : "")
+        + (d.settingsOnly && state.reviewSkillsAvailable ? `<button data-action="agent-review-apply-skills"${d.saving || d.skillsLoading || !d.skillCatalog ? " disabled" : ""}>Apply for this review</button>` : "")
         + (d.settingsOnly ? "" : `<button class="primary" data-action="agent-review-start"${d.saving || d.skillsLoading ? " disabled" : ""}>${d.saving ? "Please wait..." : "Run review"}</button>`)
         + `</div></div></div>`;
 }
@@ -979,6 +980,21 @@ async function startAgentReview(saveOnly = false) {
         if (state.dialog === d) renderDialog();
         await loadState().catch((loadError) => toast(loadError.message, true));
     }
+}
+
+function applyReviewSkills() {
+    const d = state.dialog;
+    if (d?.type !== "agent-review" || d.saving || !d.skillCatalog) return;
+    if (d.reviewId !== state.review?.reviewId) {
+        d.error = "The review changed. Close this dialog and try again.";
+        renderDialog();
+        return;
+    }
+    state.skillOverrides.set(d.reviewId, [...(d.skillNames ?? [])]);
+    state.dialog = null;
+    renderDialog();
+    focusIn('[data-action="agent-review-configure"]');
+    toast("Review skills applied to this review only. Defaults are unchanged and no review was started.");
 }
 
 async function runAgentReview() {
@@ -1681,6 +1697,9 @@ async function onClick(e) {
                 break;
             case "agent-review-save-defaults":
                 await startAgentReview(true);
+                break;
+            case "agent-review-apply-skills":
+                applyReviewSkills();
                 break;
             case "agent-review-start":
                 await startAgentReview();

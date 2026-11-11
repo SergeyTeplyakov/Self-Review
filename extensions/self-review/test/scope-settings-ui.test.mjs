@@ -140,6 +140,27 @@ test("skill defaults require explicit opt-in; Save defaults never starts a revie
     assert.equal(posts[1][1].useDefaults, true);
 });
 
+test("Apply for this review stores a per-review skill choice on a fresh profile without saving defaults or starting a review", async () => {
+    const { app, posts, click } = await skillsApp(bundledCatalog());
+    await click("agent-review-configure");
+    await settle();
+    let html = app.node("#dialog").innerHTML;
+    assert.match(html, /data-action="agent-review-save-defaults" disabled/, "a fresh profile has nothing to save");
+    assert.match(html, /data-action="agent-review-apply-skills">Apply for this review/);
+    await app.run("onChange")({ target: { name: "review-skill", value: "code-simplification", checked: false } });
+    await click("agent-review-apply-skills");
+    assert.equal(posts.length, 0, "applying never saves defaults or starts a review");
+    assert.equal(app.state.dialog, null);
+    assert.deepEqual([...app.state.skillOverrides.get("r")], ["code-review-and-quality", "ponytail-review"]);
+    assert.match(app.node("#toast").textContent, /this review only.*no review was started/i);
+    await click("agent-review");
+    await settle();
+    assert.deepEqual(app.read("state.dialog.skillNames"), ["code-review-and-quality", "ponytail-review"], "the run dialog reuses the applied choice");
+    await click("agent-review-start");
+    assert.deepEqual(posts.map(([url]) => url), ["/api/agent-reviews"]);
+    assert.deepEqual(posts[0][1].skillNames, ["code-review-and-quality", "ponytail-review"]);
+});
+
 test("Run review sends this review's skill opt-outs without saving skill defaults", async () => {
     const { app, posts, click } = await skillsApp(bundledCatalog());
     await click("agent-review");

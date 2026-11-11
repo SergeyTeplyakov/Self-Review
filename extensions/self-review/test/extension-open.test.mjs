@@ -1,7 +1,7 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
-import { registerHooks } from "node:module";
+import { register } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -22,12 +22,12 @@ export async function joinSession(config) {
     fake.config = config;
     return { sessionId: "test-session", workspacePath: undefined, log: async (message, options) => { fake.logs.push({ message, level: options?.level }); }, send: async () => "message-1", on: () => () => {} };
 }`)}`;
-registerHooks({
-    resolve(specifier, context, nextResolve) {
-        if (specifier === "@github/copilot-sdk/extension") return { url: FAKE_SDK, shortCircuit: true };
-        return nextResolve(specifier, context);
-    },
-});
+// module.register (Node 20.6+) keeps this working on the documented Node 22.12 minimum; the fake module itself runs on this thread.
+const LOADER = `export async function resolve(specifier, context, nextResolve) {
+    if (specifier === "@github/copilot-sdk/extension") return { url: ${JSON.stringify(FAKE_SDK)}, shortCircuit: true };
+    return nextResolve(specifier, context);
+}`;
+register(`data:text/javascript,${encodeURIComponent(LOADER)}`);
 
 const { runGit } = await import("../dist/lib/git.mjs");
 const { Store, defaultDataRoot } = await import("../dist/lib/store.mjs");

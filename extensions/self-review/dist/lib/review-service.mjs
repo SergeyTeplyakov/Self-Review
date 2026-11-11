@@ -246,6 +246,7 @@ export class ReviewService extends EventEmitter {
         if (!Number.isInteger(expectedVersion) || expectedVersion < 0) throw invalid("expectedVersion must be a non-negative integer.");
         const description = await this.store.updateReview(reviewId, (review) => {
             if (!review) throw notFound(`Review ${reviewId} not found.`);
+            if (isRetiredCommitReview(review)) throw retiredCommitError(review);
             const current = review.description;
             if ((current?.version ?? 0) !== expectedVersion) {
                 throw new ReviewError("conflict", "Description changed. Read the current description before revising it.");
@@ -673,6 +674,7 @@ export class ReviewService extends EventEmitter {
         if (!THREAD_STATUSES.includes(status)) throw invalid(`status must be one of ${THREAD_STATUSES.join(", ")}.`);
         const thread = await this.store.updateReview(reviewId, (review) => {
             if (!review) throw notFound(`Review ${reviewId} not found.`);
+            if (isRetiredCommitReview(review)) throw retiredCommitError(review);
             const t = findThread(review, threadId);
             t.status = status;
             return { review, value: t };

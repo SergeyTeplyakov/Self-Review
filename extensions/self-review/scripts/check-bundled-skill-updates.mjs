@@ -59,15 +59,41 @@ async function checkRepository(client, repository, pinned) {
     if (typeof tag !== "string" || !tag) throw new Error(`${owner}/${repo} latest release has no tag name`);
     const commit = await client.request(`${base}/commits/${encodeURIComponent(tag)}`);
     if (typeof commit?.sha !== "string") throw new Error(`could not resolve ${owner}/${repo} tag ${tag} to a commit`);
-    let relation = "identical";
-    if (commit.sha !== pinned.releaseCommit) {
-        const compare = await client.request(`${base}/compare/${pinned.releaseCommit}...${commit.sha}`);
-        relation = compare?.status;
-        if (!["ahead", "behind", "diverged", "identical"].includes(relation)) {
-            throw new Error(`unexpected compare status for ${owner}/${repo}: ${relation}`);
+    const latest = { base, owner, repo, tag, commit: commit.sha, publishedAt: release.published_at ?? null, newer: true };
+    const id = `${owner}/${repo}`;
+    if (tag === pinned.release) {
+        if (commit.sha !== pinned.releaseCommit) {
+            throw new Error(`${id} release ${tag} now points to ${commit.sha}, not the pinned ${pinned.releaseCommit}; review manually`);
         }
+        return { ...latest, newer: false };
     }
-    return { base, owner, repo, tag, commit: commit.sha, publishedAt: release.published_at ?? null, relation };
+    // A different tag must be provably newer: by version order when both tags are versions, and by ancestry when the commits differ.
+    const order = compareReleaseTags(tag, pinned.release);
+    if (order !== null && order <= 0) throw new Error(`${id} latest release ${tag} is not newer than pinned ${pinned.release}; review manually`);
+    if (commit.sha === pinned.releaseCommit) {
+        if (order === null) {
+            throw new Error(`cannot establish whether ${id} release ${tag} is newer than pinned ${pinned.release}: both point to the same commit and the tags are not comparable versions`);
+        }
+        return latest;
+    }
+    const compare = await client.request(`${base}/compare/${pinned.releaseCommit}...${commit.sha}`);
+    if (compare?.status !== "ahead") {
+        throw new Error(`${id} latest release ${tag} is ${compare?.status ?? "unknown"} relative to pinned ${pinned.release}; review manually`);
+    }
+    return latest;
+}
+
+// Orders dotted numeric release tags such as 0.6.15 or v5.3.3; returns null when either tag is not of that form.
+export function compareReleaseTags(a, b) {
+    const parse = (tag) => /^v?(\d+(?:\.\d+)*)$/.exec(tag ?? "")?.[1].split(".").map(Number);
+    const x = parse(a);
+    const y = parse(b);
+    if (!x || !y) return null;
+    for (let i = 0; i < Math.max(x.length, y.length); i++) {
+        const delta = (x[i] ?? 0) - (y[i] ?? 0);
+        if (delta) return Math.sign(delta);
+    }
+    return 0;
 }
 
 /**
@@ -88,22 +114,20 @@ export async function checkBundledSkillUpdates({ manifestPath = DEFAULT_MANIFEST
             const key = `${pinned.repository}@${pinned.releaseCommit}`;
             if (!repositories.has(key)) repositories.set(key, checkRepository(client, pinned.repository, pinned));
             const latest = await repositories.get(key);
-            Object.assign(result, { latestRelease: latest.tag, latestCommit: latest.commit, publishedAt: latest.publishedAt, relation: latest.relation });
+            Object.assign(result, { latestRelease: latest.tag, latestCommit: latest.commit, publishedAt: latest.publishedAt, newerRelease: latest.newer });
             const upstream = await client.request(
                 `${latest.base}/contents/${pinned.path.split("/").map(encodeURIComponent).join("/")}?ref=${latest.commit}`,
                 { raw: true, notFound: `${pinned.path} does not exist in ${latest.owner}/${latest.repo} release ${latest.tag}` },
             );
             result.latestSha256 = sha256Text(upstream);
             result.contentChanged = result.latestSha256 !== skill.sha256;
-            result.status = latest.relation === "identical"
-                ? (result.contentChanged ? "error" : "current")
-                : latest.relation === "ahead"
-                    ? (result.contentChanged ? "update-available" : "newer-release-unchanged")
-                    : "error";
-            if (latest.relation === "identical" && result.contentChanged) {
+            if (latest.newer) {
+                result.status = result.contentChanged ? "update-available" : "newer-release-unchanged";
+            } else if (result.contentChanged) {
+                result.status = "error";
                 result.error = `latest release ${latest.tag} is the pinned commit but its file does not match the manifest hash`;
-            } else if (result.status === "error") {
-                result.error = `latest release ${latest.tag} is ${latest.relation} relative to pinned ${pinned.release}; review manually`;
+            } else {
+                result.status = "current";
             }
         } catch (error) {
             result.status = "error";

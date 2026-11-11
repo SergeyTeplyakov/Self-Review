@@ -100,5 +100,27 @@ test("missing releases, rate limits, network failures and non-ahead releases are
         ...ponyPinned(),
     }).fetch });
     assert.equal(behind.exitCode, 2);
-    assert.match(behind.results[0].error, /0\.6\.14 is behind relative to pinned 0\.6\.15/);
+    assert.match(behind.results[0].error, /0\.6\.14 is not newer than pinned 0\.6\.15/);
+});
+
+test("a newer release tag on the pinned commit is newer-release-unchanged, and unorderable tags are errors", async () => {
+    const pinnedCommit = "8bfcc1f9916f2eea55494d8c1fa7f4bde867dd9e";
+    const sameCommit = (tag) => pinnedRoutes(ADDY, tag, pinnedCommit, [
+        ["skills/code-review-and-quality/SKILL.md", bundled["skills/code-review-and-quality/SKILL.md"]],
+        ["skills/code-simplification/SKILL.md", bundled["skills/code-simplification/SKILL.md"]],
+    ]);
+    const retagged = await checkBundledSkillUpdates({ fetch: mockFetch({ ...sameCommit("0.6.16"), ...ponyPinned() }).fetch });
+    assert.equal(retagged.exitCode, 1);
+    assert.deepEqual(retagged.results.map((r) => r.status), ["newer-release-unchanged", "newer-release-unchanged", "current"]);
+
+    const unordered = await checkBundledSkillUpdates({ fetch: mockFetch({ ...sameCommit("stable"), ...ponyPinned() }).fetch });
+    assert.equal(unordered.exitCode, 2);
+    assert.match(unordered.results[0].error, /cannot establish whether .*stable is newer than pinned 0\.6\.15/);
+
+    const moved = await checkBundledSkillUpdates({ fetch: mockFetch({
+        ...pinnedRoutes(ADDY, "0.6.15", "cccccccccccccccccccccccccccccccccccccccc", []),
+        ...ponyPinned(),
+    }).fetch });
+    assert.equal(moved.exitCode, 2);
+    assert.match(moved.results[0].error, /release 0\.6\.15 now points to c+, not the pinned/);
 });
