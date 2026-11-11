@@ -13,7 +13,7 @@ export const THREAD_KINDS = ["overview", "file", "change", "line"];
 export const THREAD_STATUSES = ["active", "resolved", "wontfix", "closed"];
 export const OUTCOMES = ["answered", "changed", "blocked", "disagreed", "needs-input"];
 export const LESSON_STATUSES = ["proposed", "saved", "declined"];
-export const SCOPES = ["all", "pending", "commit"];
+export const SCOPES = ["all", "pending"];
 const PENDING_SUFFIX = " (pending changes)";
 const MAX_BODY = 20000;
 const MAX_RANGE = 2000;
@@ -36,16 +36,20 @@ export function checkScope(value) {
 
 // Reviews saved before scopes existed have no scope field and are "all" reviews.
 export function scopeOf(review) {
-    if (review?.scope === "commit") return "commit";
     return review?.scope === "pending" ? "pending" : "all";
 }
 
+// Historical single-commit reviews were removed; their records stay on disk but are never reopened as All or Pending reviews.
+export function isRetiredCommitReview(review) {
+    return review?.scope === "commit";
+}
+
+export function retiredCommitError(review) {
+    return new ReviewError("unsupported", `Review ${review.reviewId} is a historical single-commit review. That mode was removed; its local notes remain stored but it can no longer be opened. Open an All changes or Pending changes review instead.`);
+}
+
 // The "all" id must stay identical to the pre-scope computation so existing reviews keep their threads.
-export function computeReviewId({ repoRoot, branch, base, paths = [], exclude = [], scope = "all", commit }) {
-    if (scope === "commit") {
-        const hash = createHash("sha256").update(JSON.stringify([path.resolve(repoRoot).toLowerCase(), commit, [...paths].sort(), [...exclude].sort()])).digest("hex").slice(0, 16);
-        return `${slug(path.basename(repoRoot)).slice(0, 50) || "review"}-commit-${commit.slice(0, 12)}-${hash}`;
-    }
+export function computeReviewId({ repoRoot, branch, base, paths = [], exclude = [], scope = "all" }) {
     const parts = [path.resolve(repoRoot).toLowerCase(), branch, base, [...paths].sort().join(","), [...exclude].sort().join(",")];
     if (scope === "pending") parts.push("pending");
     const hash = createHash("sha256").update(parts.join("|")).digest("hex").slice(0, 8);
@@ -242,6 +246,7 @@ export class ReviewService extends EventEmitter {
         if (!Number.isInteger(expectedVersion) || expectedVersion < 0) throw invalid("expectedVersion must be a non-negative integer.");
         const description = await this.store.updateReview(reviewId, (review) => {
             if (!review) throw notFound(`Review ${reviewId} not found.`);
+            if (isRetiredCommitReview(review)) throw retiredCommitError(review);
             const current = review.description;
             if ((current?.version ?? 0) !== expectedVersion) {
                 throw new ReviewError("conflict", "Description changed. Read the current description before revising it.");
@@ -267,8 +272,9 @@ export class ReviewService extends EventEmitter {
         const requestedScope = input.scope == null ? null : checkScope(input.scope);
         if (input.reviewId) {
             const existing = await this.getReview(input.reviewId);
-            const switching = (requestedScope !== null && requestedScope !== scopeOf(existing)) || input.commit !== undefined;
-            const reviewId = switching ? await this.openSibling(input.reviewId, requestedScope ?? "commit", { base: input.base, commit: input.commit }) : input.reviewId;
+            if (isRetiredCommitReview(existing)) throw retiredCommitError(existing);
+            const switching = requestedScope !== null && requestedScope !== scopeOf(existing);
+            const reviewId = switching ? await this.openSibling(input.reviewId, requestedScope, { base: input.base }) : input.reviewId;
             const hasOptions = input.title || input.includeUntracked !== undefined || input.context !== undefined;
             if (hasOptions) {
                 await this.store.updateReview(reviewId, (r) => ({ review: applyOpenOptions(r, input) }));
@@ -284,24 +290,6 @@ export class ReviewService extends EventEmitter {
             throw invalid(`Not a git repository: ${input.repoPath || cwd} (${err.message})`);
         }
         const scope = requestedScope ?? "all";
-        if (scope === "commit") {
-            const commit = await this.git.resolveCommit(repoRoot, input.commit);
-            const branch = (await this.git.runGit(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])).stdout.trim();
-            const reviewId = computeReviewId({ repoRoot, scope, commit, paths: input.paths, exclude: input.exclude });
-            await this.store.updateReview(reviewId, (existing) => ({
-                review: existing ? applyOpenOptions(existing, input) : {
-                    ...newReviewRecord({
-                        reviewId, repoRoot, branch, base: input.base ?? null, scope,
-                        title: `Commit ${commit.slice(0, 12)} (local notes)`, paths: input.paths ?? [], exclude: input.exclude ?? [],
-                        includeUntracked: false, contextLines: input.context ?? 5,
-                    }),
-                    commit,
-                },
-            }));
-            await this.refresh(reviewId);
-            return reviewId;
-        }
-        if (input.commit !== undefined) throw invalid("commit requires scope commit.");
         const base = input.base || (scope === "pending" ? null : await this.git.defaultBase(repoRoot));
         const branch = (await this.git.runGit(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])).stdout.trim();
         const paths = input.paths ?? [];
@@ -332,18 +320,10 @@ export class ReviewService extends EventEmitter {
     }
 
     // Opens the other-scope review of the same repository, branch, base, and pathspecs, creating it on first use.
-    async openSibling(reviewId, scope, { base: requestedBase, commit } = {}) {
+    async openSibling(reviewId, scope, { base: requestedBase } = {}) {
         const target = checkScope(scope);
         const source = await this.getReview(reviewId);
-        if (target === "commit") {
-            return this.ensureReview({
-                repoPath: source.repoRoot, scope: "commit", commit, base: source.base, paths: source.paths, exclude: source.exclude,
-                context: source.contextLines,
-            });
-        }
-        if (scopeOf(source) === "commit") {
-            return this.ensureReview({ repoPath: source.repoRoot, scope: target, base: requestedBase, paths: source.paths, exclude: source.exclude });
-        }
+        if (isRetiredCommitReview(source)) throw retiredCommitError(source);
         if (target === scopeOf(source)) return reviewId;
         if (source.siblingReviewId && !requestedBase) {
             await this.refresh(source.siblingReviewId);
@@ -408,6 +388,7 @@ export class ReviewService extends EventEmitter {
 
     async refreshOnce(reviewId) {
         const before = await this.getReview(reviewId);
+        if (isRetiredCommitReview(before)) throw retiredCommitError(before);
         let snapshot;
         try {
             snapshot = await this.git.captureSnapshot({
@@ -418,7 +399,6 @@ export class ReviewService extends EventEmitter {
                 includeUntracked: before.includeUntracked,
                 contextLines: before.contextLines,
                 scope: scopeOf(before),
-                commit: before.commit,
             });
         } catch (err) {
             throw new ReviewError("git_error", err.message);
@@ -469,9 +449,7 @@ export class ReviewService extends EventEmitter {
             if (!cache.has(key)) {
                 cache.set(key, side === "old"
                     ? await this.git.readCommitFile(review.repoRoot, baseCommit, filePath)
-                    : scopeOf(review) === "commit"
-                        ? await this.git.readCommitFile(review.repoRoot, review.commit, filePath)
-                        : await this.git.readWorkingFile(review.repoRoot, filePath));
+                    : await this.git.readWorkingFile(review.repoRoot, filePath));
             }
             return cache.get(key);
         };
@@ -513,9 +491,7 @@ export class ReviewService extends EventEmitter {
         if (file.binary) return { ...base, available: false, reason: "binary" };
         if (file.status === "deleted") return { ...base, available: false, reason: "deleted" };
 
-        const lines = scopeOf(review) === "commit"
-            ? await this.git.readCommitFile(review.repoRoot, snapshot.headCommit, filePath)
-            : await this.git.readWorkingFile(review.repoRoot, filePath);
+        const lines = await this.git.readWorkingFile(review.repoRoot, filePath);
         if (!lines) return { ...base, available: false, reason: "missing", stale: true };
         const endsWithNewline = lines[lines.length - 1] === "";
         if (lines[lines.length - 1] === "") lines.pop();
@@ -580,7 +556,7 @@ export class ReviewService extends EventEmitter {
     }
 
     async buildThread(review, input) {
-        if (scopeOf(review) === "commit" && input.author === "agent") throw new ReviewError("conflict", "Historical commit reviews support user-local notes only.");
+        if (isRetiredCommitReview(review)) throw retiredCommitError(review);
         const kind = input.kind ?? "line";
         if (!THREAD_KINDS.includes(kind)) throw invalid(`kind must be one of ${THREAD_KINDS.join(", ")}.`);
         const author = input.author === "agent" ? "agent" : "user";
@@ -592,7 +568,7 @@ export class ReviewService extends EventEmitter {
             body,
             createdAt: nowIso(),
             clientRequestId: input.clientRequestId ?? null,
-            ...(author === "user" ? { delivery: scopeOf(review) === "commit" ? { state: "local", attempts: 0 } : input.hold ? { state: "draft", attempts: 0 } : { state: "saving", attempts: 0, claimPid: this.pid } } : { outcome: input.outcome ?? null }),
+            ...(author === "user" ? { delivery: input.hold ? { state: "draft", attempts: 0 } : { state: "saving", attempts: 0, claimPid: this.pid } } : { outcome: input.outcome ?? null }),
             ...(kind === "overview" ? { descriptionContext: this.descriptionContext(review, input) } : {}),
         };
         const thread = {
@@ -641,7 +617,7 @@ export class ReviewService extends EventEmitter {
         const touchedLessons = new Map();
         const result = await this.store.updateReview(reviewId, async (review) => {
             if (!review) throw notFound(`Review ${reviewId} not found.`);
-            if (scopeOf(review) === "commit" && author === "agent") throw new ReviewError("conflict", "Historical commit reviews support user-local notes only.");
+            if (isRetiredCommitReview(review)) throw retiredCommitError(review);
             const dup = findDuplicate(review, input.clientRequestId);
             if (dup) return { write: false, value: { thread: dup.thread, message: dup.message, duplicate: true } };
             const thread = findThread(review, threadId);
@@ -655,7 +631,7 @@ export class ReviewService extends EventEmitter {
                 ...(thread.kind === "overview" && author === "user" ? { descriptionContext: this.descriptionContext(review, input) } : {}),
             };
             if (author === "user") {
-                message.delivery = scopeOf(review) === "commit" ? { state: "local", attempts: 0 } : input.hold ? { state: "draft", attempts: 0 } : { state: "saving", attempts: 0, claimPid: this.pid };
+                message.delivery = input.hold ? { state: "draft", attempts: 0 } : { state: "saving", attempts: 0, claimPid: this.pid };
                 if (thread.status !== "active") thread.status = "active";
             } else {
                 message.outcome = input.outcome ?? null;
@@ -698,6 +674,7 @@ export class ReviewService extends EventEmitter {
         if (!THREAD_STATUSES.includes(status)) throw invalid(`status must be one of ${THREAD_STATUSES.join(", ")}.`);
         const thread = await this.store.updateReview(reviewId, (review) => {
             if (!review) throw notFound(`Review ${reviewId} not found.`);
+            if (isRetiredCommitReview(review)) throw retiredCommitError(review);
             const t = findThread(review, threadId);
             t.status = status;
             return { review, value: t };
@@ -710,7 +687,7 @@ export class ReviewService extends EventEmitter {
     async claimDelivery(reviewId, threadId, messageId, { retry = false, senderSessionId } = {}) {
         const claim = await this.store.updateReview(reviewId, (review) => {
             if (!review) throw notFound(`Review ${reviewId} not found.`);
-            if (scopeOf(review) === "commit") throw new ReviewError("conflict", "Historical commit notes cannot be sent to the agent.");
+            if (isRetiredCommitReview(review)) throw retiredCommitError(review);
             const message = findThread(review, threadId).messages.find((m) => m.messageId === messageId);
             if (!message || message.author !== "user") throw invalid(`Message ${messageId} is not a user message in ${threadId}.`);
             const current = message.delivery;
@@ -728,7 +705,7 @@ export class ReviewService extends EventEmitter {
     async claimDrafts(reviewId, { senderSessionId } = {}) {
         const claims = await this.store.updateReview(reviewId, (review) => {
             if (!review) throw notFound(`Review ${reviewId} not found.`);
-            if (scopeOf(review) === "commit") throw new ReviewError("conflict", "Historical commit notes cannot be sent to the agent.");
+            if (isRetiredCommitReview(review)) throw retiredCommitError(review);
             const drafts = allMessages(review).filter((e) => e.message.author === "user" && e.message.delivery?.state === "draft");
             if (!drafts.length) return { write: false, value: [] };
             const batchId = randomUUID();
@@ -910,6 +887,7 @@ export class ReviewService extends EventEmitter {
 
     // The agent's view of a review. Drafts are still held by the reviewer, so only their count is shown.
     summarize(review, { threadId, includeResolved = false, maxBody = 2000 } = {}) {
+        if (isRetiredCommitReview(review)) throw retiredCommitError(review);
         const isDraft = (m) => m.author === "user" && m.delivery?.state === "draft";
         const visible = review.threads.filter((t) => t.messages.some((m) => !isDraft(m)));
         const threads = visible.filter((t) => (threadId ? t.threadId === threadId : includeResolved || t.status === "active"));
@@ -921,7 +899,6 @@ export class ReviewService extends EventEmitter {
             branch: review.branch,
             base: review.base,
             scope: scopeOf(review),
-            commit: review.commit ?? null,
             currentRevisionId: review.currentRevisionId,
             git: review.git,
             counts: {

@@ -17,7 +17,7 @@ import { isRecord } from "./web/contracts.mjs";
 import { ReviewSkills } from "./lib/review-skills.mjs";
 const CANVAS_ID = "self-review";
 const WEB_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "web");
-const REPO_FIELDS = ["repoPath", "base", "paths", "exclude", "includeUntracked", "context", "commit"];
+const REPO_FIELDS = ["repoPath", "base", "paths", "exclude", "includeUntracked", "context"];
 let session = null;
 const log = (message, level = "info") => {
     try {
@@ -47,11 +47,7 @@ const delivery = new Delivery({
     learning: async (repoRoot) => (await settings.get(repoRoot)).learning,
     sessionId: () => session?.sessionId,
 });
-const reviewSkills = new ReviewSkills({ store, list: async () => {
-        if (!session?.rpc?.skills?.list)
-            throw new ReviewError("unsupported", "This host does not expose session skill discovery. Manage skills in host settings.");
-        return session.rpc.skills.list();
-    } });
+const reviewSkills = new ReviewSkills({ store });
 const agentReview = new AgentReview({ service, settings, reviewSkills, send, sessionId: () => session?.sessionId, log });
 // Comments a stopped provider claimed but never sent become failed so the reviewer can resend them.
 function errorMessage(error) {
@@ -101,7 +97,7 @@ async function reviewIdFor(ctx, input) {
         return mapped;
     throw new CanvasError("invalid_input", `No review is associated with canvas instance ${ctx.instanceId}; pass reviewId or open the canvas first.`);
 }
-async function ensureServer(instanceId, reviewId, sourceReviewId) {
+async function ensureServer(instanceId, reviewId) {
     let entry = instances.get(instanceId);
     if (!entry) {
         const created = { reviewId, server: null, ready: null };
@@ -111,6 +107,7 @@ async function ensureServer(instanceId, reviewId, sourceReviewId) {
             getReviewId: () => created.reviewId,
             onReviewChange: async (nextId) => {
                 created.reviewId = nextId;
+                await store.setInstanceReview(instanceId, nextId);
                 recoverClaims(nextId);
             },
             service,
@@ -130,11 +127,10 @@ async function ensureServer(instanceId, reviewId, sourceReviewId) {
         entry = created;
     }
     const switched = entry.reviewId !== reviewId;
+    entry.reviewId = reviewId;
     if (!entry.ready)
         throw new Error(`Review server for ${instanceId} was not initialized.`);
     const server = await entry.ready;
-    await server.bindReview(reviewId, sourceReviewId);
-    entry.reviewId = reviewId;
     entry.server = server;
     recoverClaims(reviewId);
     // A page that is already open keeps showing the previous review until told to reload.
@@ -146,27 +142,43 @@ async function openReview(ctx) {
     const input = inputOf(ctx);
     const cwd = ctx.session?.workingDirectory || process.cwd();
     const hasRepoFields = REPO_FIELDS.some((k) => input[k] !== undefined);
-    const mapped = await store.getInstanceContext(ctx.instanceId);
-    const previous = instances.get(ctx.instanceId)?.reviewId ?? mapped?.reviewId;
-    const sourceReviewId = typeof input.reviewId === "string" && input.reviewId ? input.reviewId : hasRepoFields ? null : previous;
-    const returnReviewId = mapped && mapped.reviewId === sourceReviewId && input.scope && input.scope !== "commit" ? mapped.returnReviewId : null;
     let reviewId;
     if (input.reviewId || hasRepoFields) {
-        reviewId = await service.ensureReview(returnReviewId && input.reviewId ? { ...input, reviewId: returnReviewId } : input, { cwd });
+        reviewId = await service.ensureReview(input, { cwd });
     }
     else {
+        const mapped = await store.getInstanceContext(ctx.instanceId);
+        const previous = instances.get(ctx.instanceId)?.reviewId ?? mapped?.reviewId;
         if (previous) {
             try {
-                reviewId = await service.ensureReview({ reviewId: returnReviewId ?? previous, title: input.title, scope: input.scope }, { cwd });
+                reviewId = await service.ensureReview({ reviewId: previous, title: input.title, scope: input.scope }, { cwd });
             }
             catch (error) {
-                if (!(error instanceof ReviewError) || error.code !== "not_found")
+                if (!(error instanceof ReviewError) || (error.code !== "not_found" && error.code !== "unsupported"))
                     throw error;
+                if (error.code === "unsupported") {
+                    // The panel last showed a retired single-commit review: return to the review it was opened from, or the repository's default review.
+                    const retired = await service.getReview(previous);
+                    const origin = mapped?.reviewId === previous ? mapped.returnReviewId : null;
+                    if (origin) {
+                        try {
+                            reviewId = await service.ensureReview({ reviewId: origin, title: input.title, scope: input.scope }, { cwd });
+                        }
+                        catch (originError) {
+                            if (!(originError instanceof ReviewError) || originError.code !== "not_found")
+                                throw originError;
+                        }
+                    }
+                    // Keep the retired review's pathspecs so the fallback never widens what the panel shows.
+                    reviewId ??= await service.ensureReview({ repoPath: retired.repoRoot, paths: retired.paths, exclude: retired.exclude, scope: input.scope }, { cwd });
+                    log(`self-review: ${error.message} This panel now shows ${reviewId}.`, "warning");
+                }
             }
         }
         reviewId ??= await service.ensureReview(input, { cwd });
     }
-    const entry = await ensureServer(ctx.instanceId, reviewId, sourceReviewId);
+    await store.setInstanceReview(ctx.instanceId, reviewId);
+    const entry = await ensureServer(ctx.instanceId, reviewId);
     if (!entry.server)
         throw new Error(`Review server for ${ctx.instanceId} did not start.`);
     const review = await service.getReview(reviewId);
@@ -216,7 +228,7 @@ const actions = [
                 models: { type: "array", minItems: 1, maxItems: 4, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 120 } },
                 focus: { type: "string", enum: REVIEW_FOCUSES },
                 intent: { type: "string", maxLength: 4000, description: "Optional goal, acceptance criteria, spec references, or review guidance; not permission to edit." },
-                skillNames: { type: "array", maxItems: 3, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 240 }, description: "Per-run override of exact installed skill names. Empty array explicitly opts out; omission uses saved skill defaults." },
+                skillNames: { type: "array", maxItems: 3, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 240 }, description: "Per-run override of bundled review skills (code-review-and-quality, code-simplification, ponytail-review). Empty array explicitly opts out; omission uses saved skill defaults, which are all three until changed." },
                 useDefaults: { const: true, description: "Use the user's saved models, focus, and guidance instead of supplying them." },
             },
             required: ["revisionId"],
@@ -474,8 +486,7 @@ session = await joinSession({
                     reviewId: { type: "string", description: "Reopen an existing review." },
                     repoPath: { type: "string", description: "Repository path (defaults to the session working directory)." },
                     base: { type: "string", description: "Base ref; with scope all, the diff is working tree vs merge-base(base, HEAD). Defaults to origin/HEAD, main, or master." },
-                    scope: { type: "string", enum: SCOPES, description: "all (default): working tree vs merge-base(base, HEAD). pending: uncommitted changes vs HEAD. commit: immutable commit vs first parent (empty tree for root), local notes only. Scope switches use separate review identities." },
-                    commit: { type: "string", pattern: "^[0-9a-fA-F]{7,64}$", description: "Required with scope commit: immutable commit compared to its first parent (empty tree for root). Local notes only, never delivered for fixes." },
+                    scope: { type: "string", enum: SCOPES, description: "all (default): the whole branch or PR, working tree vs merge-base(base, HEAD). pending: only uncommitted changes, working tree vs HEAD. On an open review, the other scope opens its sibling review." },
                     title: { type: "string" },
                     paths: { type: "array", items: { type: "string" }, description: "Limit the review to these pathspecs." },
                     exclude: { type: "array", items: { type: "string" }, description: "Pathspecs to exclude, e.g. agency.toml." },

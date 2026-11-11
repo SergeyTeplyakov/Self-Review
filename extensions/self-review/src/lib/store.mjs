@@ -254,14 +254,12 @@ export class Store {
         };
     }
 
-    async setInstanceReview(instanceId, reviewId, returnReviewId = null) {
-        assertReviewId(reviewId);
-        if (returnReviewId !== null) assertReviewId(returnReviewId);
+    async setInstanceReview(instanceId, reviewId) {
         await this.lock("instances", async () => {
             const file = path.join(this.root, "instances.json");
             const map = (await readJson(file)) ?? {};
-            if (returnReviewId === null && map[instanceId] === reviewId) return;
-            map[instanceId] = returnReviewId === null ? reviewId : { reviewId, returnReviewId };
+            if (map[instanceId] === reviewId) return;
+            map[instanceId] = reviewId;
             await writeJsonAtomic(file, map);
         });
     }

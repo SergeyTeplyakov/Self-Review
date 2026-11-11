@@ -12,8 +12,6 @@ import { ReviewService, computeReviewId, scopeOf } from "../dist/lib/review-serv
 import { Delivery } from "../dist/lib/delivery.mjs";
 import { startReviewServer } from "../dist/lib/server.mjs";
 import { SettingsService, normalizeRemoteUrl, pathKey, repoIdentity } from "../dist/lib/settings.mjs";
-import { AgentReview } from "../dist/lib/agent-review.mjs";
-import { listCommits } from "../dist/lib/git.mjs";
 
 const WEB_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "dist", "web");
 const lines = (n, f = (i) => `line ${i}`) => Array.from({ length: n }, (_, i) => f(i + 1)).join("\n") + "\n";
@@ -92,7 +90,6 @@ async function withServer(options, fn) {
         const headers = { "Content-Type": "application/json", "X-MR-Token": token };
         return await fn({
             headers,
-            bindReview: server.bindReview,
             state: async () => (await request(port, { pathName: `/api/state?t=${token}` })).json,
             post: (pathName, body, extraHeaders = headers) => request(port, { method: "POST", pathName, headers: extraHeaders, body }),
         });
@@ -108,260 +105,6 @@ async function commentThread(service, body = "Prefer early returns") {
 }
 
 const agentReply = (service, reviewId, thread, extra) => service.addMessage(reviewId, thread.threadId, { author: "agent", body: "Reply", ...extra });
-
-test("commit scopes pin both sides, exclude pending work, and isolate local notes across scope switches", async () => {
-    const { service } = fresh();
-    const branchId = await service.ensureReview({ repoPath: repo, base: "main" });
-    const pendingId = await service.openSibling(branchId, "pending");
-    const commit = (await runGit(repo, ["rev-parse", "HEAD"])).stdout.trim();
-    const commitId = await service.openSibling(branchId, "commit", { commit });
-    assert.notEqual(commitId, branchId);
-    assert.notEqual(commitId, pendingId);
-    const snapshot = await service.getSnapshot(commitId);
-    assert.deepEqual(snapshot.files.map((file) => file.path), ["a.cs", "committed.txt"]);
-    const content = await service.getFileContent(commitId, "r1", "a.cs");
-    assert.equal(content.available, true);
-    assert.equal(content.lines[4], "line 5 COMMITTED");
-    assert.equal(content.lines[14], "line 15", "new side comes from the commit, not the dirty working tree");
-    const { thread, message } = await service.createThread(commitId, { kind: "line", path: "a.cs", startLine: 15, side: "new", body: "Historical note", author: "user", hold: true });
-    assert.equal(message.delivery.state, "local");
-    assert.deepEqual(thread.anchor.selectedLines, ["line 15"]);
-    const reply = await service.addMessage(commitId, thread.threadId, { body: "Another local note", author: "user" });
-    assert.equal(reply.message.delivery.state, "local");
-    await assert.rejects(service.claimDelivery(commitId, thread.threadId, message.messageId), /cannot be sent/);
-    await assert.rejects(service.claimDrafts(commitId), /cannot be sent/);
-    await assert.rejects(service.addMessage(commitId, thread.threadId, { body: "Agent reply", author: "agent" }), /user-local notes/);
-    const agent = new AgentReview({ service, sessionId: () => "s", send: () => assert.fail("No agent dispatch") });
-    await assert.rejects(agent.start(commitId, { revisionId: "r1" }, "c"), /local notes only/);
-    await service.refresh(commitId);
-    assert.equal((await service.getReview(commitId)).revisions.length, 1);
-    assert.equal(await service.openSibling(commitId, "all"), branchId);
-    assert.equal(await service.openSibling(commitId, "pending", { base: "main" }), pendingId);
-    assert.equal((await service.getReview(branchId)).threads.length, 0);
-    assert.equal((await service.getReview(pendingId)).threads.length, 0);
-    assert.equal(await service.ensureReview({ repoPath: repo, scope: "commit", commit: commit.slice(0, 10), base: "other-base" }), commitId, "canonical SHA identity does not depend on base labels");
-    const filtered = await service.ensureReview({ repoPath: repo, scope: "commit", commit, paths: ["committed.txt"] });
-    assert.notEqual(filtered, commitId);
-    assert.deepEqual((await service.getSnapshot(filtered)).files.map((file) => file.path), ["committed.txt"]);
-});
-
-test("root commit selection uses an empty tree and never needs a branch comparison base", async () => {
-    const { service } = fresh();
-    const commit = (await runGit(repo, ["rev-parse", "main"])).stdout.trim();
-    const id = await service.ensureReview({ repoPath: repo, scope: "commit", commit });
-    const snapshot = await service.getSnapshot(id);
-    assert.deepEqual(snapshot.files.map((file) => [file.path, file.status]), [["a.cs", "added"], ["keep.txt", "added"]]);
-    assert.equal((await service.getFileContent(id, "r1", "a.cs")).lines[4], "line 5");
-    await assert.rejects(service.ensureReview({ repoPath: repo, scope: "commit", commit: "--all" }));
-    await assert.rejects(service.ensureReview({ repoPath: repo, scope: "commit" }));
-    const catalog = await listCommits(repo);
-    assert.equal(catalog.commits[0].subject, "feature work");
-    assert.equal(catalog.commits[1].commit, commit);
-    assert.equal(catalog.nextOffset, null);
-    assert.deepEqual((await listCommits(repo, 2)).commits, []);
-    await assert.rejects(listCommits(repo, -1));
-});
-
-test("a shallow boundary rejects missing first-parent history instead of appearing as a root", async () => {
-    const root = path.join(tmp, `shallow-${++seq}`);
-    await runGit(tmp, ["clone", "-q", "--depth=1", "--branch=feature", pathToFileURL(repo).href, root]);
-    const commit = (await runGit(root, ["rev-parse", "HEAD"])).stdout.trim();
-    const { service } = fresh();
-    await assert.rejects(
-        service.ensureReview({ repoPath: root, scope: "commit", commit }),
-        (error) => error.code === "git_error" && /First-parent history is unavailable.*Fetch or deepen/.test(error.message),
-    );
-    const id = computeReviewId({ repoRoot: root, scope: "commit", commit });
-    assert.equal((await service.getReview(id)).currentRevisionId, null, "unavailable history must not create a misleading snapshot");
-    await runGit(root, ["fetch", "-q", "--deepen=1", "origin", "feature"]);
-    assert.equal(await service.ensureReview({ repoPath: root, scope: "commit", commit }), id);
-    const snapshot = await service.getSnapshot(id);
-    assert.equal(snapshot.baseCommit, (await runGit(root, ["rev-parse", "HEAD^"])).stdout.trim());
-    assert.deepEqual(snapshot.files.map((file) => file.path), ["a.cs", "committed.txt"]);
-});
-
-test("non-Latin-only repository names support commit snapshots and stable local notes", async () => {
-    const root = path.join(tmp, "\u9879\u76ee");
-    await runGit(tmp, ["clone", "-q", "--no-hardlinks", repo, root]);
-    const commit = (await runGit(root, ["rev-parse", "HEAD"])).stdout.trim();
-    const { service } = fresh();
-    const id = await service.ensureReview({ repoPath: root, scope: "commit", commit });
-    assert.match(id, /^review-commit-/);
-    assert.deepEqual((await service.getSnapshot(id)).files.map((file) => file.path), ["a.cs", "committed.txt"]);
-    const note = await service.createThread(id, { kind: "overview", body: "Historical note", author: "user" });
-    assert.equal(note.message.delivery.state, "local");
-    assert.equal(await service.ensureReview({ repoPath: root, scope: "commit", commit }), id);
-    assert.equal((await service.getReview(id)).threads[0].threadId, note.thread.threadId);
-});
-
-test("direct canvas reopening on another repository invalidates historical return navigation", async () => {
-    const root = path.join(tmp, `reopened-${++seq}`);
-    await runGit(tmp, ["clone", "-q", "--no-hardlinks", repo, root]);
-    const { service, store } = fresh();
-    const firstId = await service.ensureReview({ repoPath: repo, base: "main" });
-    const commit = (await runGit(repo, ["rev-parse", "HEAD"])).stdout.trim();
-    let reviewId = firstId;
-    const delivery = new Delivery({ service, send: () => assert.fail("No agent dispatch") });
-    await withServer({ instanceId: "reopened", getReviewId: () => reviewId, onReviewChange: (id) => { reviewId = id; }, service, delivery }, async ({ post, bindReview }) => {
-        assert.equal((await post("/api/scope", { scope: "commit", commit })).status, 200);
-        assert.equal((await store.getInstanceContext("reopened")).returnReviewId, firstId);
-        const otherCommit = await service.ensureReview({ repoPath: root, scope: "commit", commit });
-        await bindReview(otherCommit, reviewId);
-        reviewId = otherCommit;
-        assert.equal((await post("/api/scope", { scope: "all" })).status, 200);
-        assert.equal((await service.getReview(reviewId)).repoRoot, root);
-        assert.notEqual(reviewId, firstId);
-        // Also protect a caller that changes the active review without an explicit bind.
-        reviewId = firstId;
-        assert.equal((await post("/api/scope", { scope: "commit", commit })).status, 200);
-        reviewId = otherCommit;
-        assert.equal((await post("/api/scope", { scope: "pending" })).status, 200);
-        assert.equal((await service.getReview(reviewId)).repoRoot, root);
-    });
-});
-
-test("each canvas preserves its own return review across provider restarts and direct reopens", async () => {
-    const { service, store } = fresh();
-    const firstId = await service.ensureReview({ repoPath: repo, base: "main" });
-    const otherId = await service.ensureReview({ repoPath: repo, base: "HEAD~1", scope: "pending" });
-    const commit = (await runGit(repo, ["rev-parse", "HEAD"])).stdout.trim();
-    const commitId = await service.openSibling(firstId, "commit", { commit });
-    const delivery = new Delivery({ service, send: () => assert.fail("No agent dispatch") });
-    for (const [instanceId, sourceId] of [["first", firstId], ["second", otherId]]) {
-        let reviewId = sourceId;
-        await withServer({ instanceId, getReviewId: () => reviewId, onReviewChange: (id) => { reviewId = id; }, service, delivery }, async ({ post, bindReview }) => {
-            assert.equal((await post("/api/scope", { scope: "commit", commit })).status, 200);
-            assert.equal(reviewId, commitId);
-            await bindReview(reviewId, sourceId);
-            assert.deepEqual(await store.getInstanceContext(instanceId), { reviewId: commitId, returnReviewId: sourceId });
-        });
-    }
-    const restartedStore = new Store(store.root);
-    const restartedService = new ReviewService({ store: restartedStore });
-    const restartedDelivery = new Delivery({ service: restartedService, send: () => assert.fail("No agent dispatch") });
-    let reviewId = await restartedStore.getInstanceReview("second");
-    await withServer({
-        instanceId: "second", getReviewId: () => reviewId, onReviewChange: (id) => { reviewId = id; },
-        service: restartedService, delivery: restartedDelivery,
-    }, async ({ post, bindReview }) => {
-        await bindReview(reviewId, reviewId);
-        assert.equal((await post("/api/scope", { scope: "pending" })).status, 200);
-        assert.equal(reviewId, otherId, "the second canvas must not inherit the first canvas's origin");
-        assert.equal((await post("/api/scope", { scope: "commit", commit })).status, 200);
-        await bindReview(reviewId, null);
-        assert.equal((await restartedStore.getInstanceContext("second")).returnReviewId, null, "a direct repository/commit open resets the old origin even for the same SHA");
-        assert.equal((await post("/api/scope", { scope: "all" })).status, 200);
-        assert.equal(reviewId, firstId, "a direct commit open uses the current default base, not its first saved origin");
-    });
-    assert.deepEqual(await restartedStore.getInstanceContext("first"), { reviewId: commitId, returnReviewId: firstId });
-    await restartedStore.setInstanceReview("legacy", otherId);
-    assert.equal(await restartedStore.getInstanceReview("legacy"), otherId);
-    await restartedStore.setInstanceReview("legacy", otherId, firstId);
-    assert.deepEqual(await restartedStore.getInstanceContext("legacy"), { reviewId: otherId, returnReviewId: firstId });
-});
-
-test("native commit reopening infers the current base instead of reusing the commit record's first base", async () => {
-    const { service } = fresh();
-    const commit = (await runGit(repo, ["rev-parse", "HEAD"])).stdout.trim();
-    const commitId = await service.ensureReview({ repoPath: repo, scope: "commit", commit, base: "HEAD" });
-    const allId = await service.ensureReview({ reviewId: commitId, scope: "all" });
-    assert.equal((await service.getReview(allId)).base, "main");
-    assert.ok((await service.getSnapshot(allId)).files.some((file) => file.path === "committed.txt"));
-    const explicitId = await service.ensureReview({ reviewId: commitId, scope: "all", base: "HEAD~1" });
-    assert.equal((await service.getReview(explicitId)).base, "HEAD~1");
-    const pendingId = await service.ensureReview({ reviewId: commitId, scope: "pending" });
-    assert.equal((await service.getReview(pendingId)).base, null);
-});
-
-test("returning from history refreshes the originating working scope before displaying it", async () => {
-    for (const scope of ["all", "pending"]) {
-        const root = path.join(tmp, `restored-${scope}-${++seq}`);
-        await runGit(tmp, ["clone", "-q", "--no-hardlinks", repo, root]);
-        const { service } = fresh();
-        let reviewId = await service.ensureReview({ repoPath: root, scope, base: "HEAD~1" });
-        const originId = reviewId;
-        const commit = (await runGit(root, ["rev-parse", "HEAD"])).stdout.trim();
-        const delivery = new Delivery({ service, send: () => assert.fail("No agent dispatch") });
-        await withServer({ instanceId: `restored-${scope}`, getReviewId: () => reviewId, onReviewChange: (id) => { reviewId = id; }, service, delivery }, async ({ post }) => {
-            assert.equal((await post("/api/scope", { scope: "commit", commit })).status, 200);
-            await writeFile(path.join(root, "while-browsing.txt"), "new working-tree content\n");
-            assert.equal((await post("/api/scope", { scope })).status, 200);
-            assert.equal(reviewId, originId);
-            const review = await service.getReview(reviewId);
-            assert.equal(review.currentRevisionId, "r2");
-            const snapshot = await service.getSnapshot(reviewId);
-            assert.ok(snapshot.files.some((file) => file.path === "while-browsing.txt"), scope);
-        });
-    }
-});
-
-test("HTTP commit switching keeps notes local and rejects writes from the previous scope", async () => {
-    const { service } = fresh();
-    let reviewId = await service.ensureReview({ repoPath: repo, base: "main" });
-    const initialId = reviewId;
-    const commit = (await runGit(repo, ["rev-parse", "HEAD"])).stdout.trim();
-    const delivery = new Delivery({ service, send: () => assert.fail("Historical notes must not dispatch") });
-    await withServer({ instanceId: "commit-test", getReviewId: () => reviewId, onReviewChange: (id) => { reviewId = id; }, service, delivery }, async ({ post, headers, state }) => {
-        assert.equal((await post("/api/scope", { scope: "commit", commit })).status, 200);
-        const current = await state();
-        assert.equal(current.review.commit, commit);
-        assert.equal(current.agentReviewAvailable, false);
-        assert.equal(current.commits[0].commit, commit);
-        const stale = await post("/api/threads", { kind: "overview", body: "stale" }, { ...headers, "X-MR-Review": initialId });
-        assert.equal(stale.status, 409);
-        const note = await post("/api/threads", { kind: "overview", body: "local" });
-        assert.equal(note.status, 200);
-        assert.equal((await state()).review.threads[0].messages[0].delivery.state, "local");
-        assert.equal((await post("/api/submit", {})).status, 409);
-    });
-});
-
-test("merge commits compare only with the first parent and old snapshots survive HEAD changes", async () => {
-    const root = path.join(tmp, `merge-${++seq}`);
-    await runGit(tmp, ["init", "-q", "-b", "main", root]);
-    await writeFile(path.join(root, "base.txt"), "base\n");
-    await git(root, "add", ".");
-    await git(root, "commit", "-q", "-m", "root");
-    await git(root, "checkout", "-q", "-b", "side");
-    await writeFile(path.join(root, "side.txt"), "side\n");
-    await git(root, "add", ".");
-    await git(root, "commit", "-q", "-m", "side");
-    await git(root, "checkout", "-q", "main");
-    await writeFile(path.join(root, "main.txt"), "main\n");
-    await git(root, "add", ".");
-    await git(root, "commit", "-q", "-m", "main");
-    const parent = (await runGit(root, ["rev-parse", "HEAD"])).stdout.trim();
-    await git(root, "merge", "--no-ff", "-q", "-m", "merge side", "side");
-    const commit = (await runGit(root, ["rev-parse", "HEAD"])).stdout.trim();
-    const { service } = fresh();
-    const id = await service.ensureReview({ repoPath: root, scope: "commit", commit });
-    const snapshot = await service.getSnapshot(id);
-    assert.equal(snapshot.baseCommit, parent);
-    assert.deepEqual(snapshot.files.map((file) => file.path), ["side.txt"]);
-    await git(root, "checkout", "-q", "side");
-    await writeFile(path.join(root, "side.txt"), "live content must not leak\n");
-    await service.refresh(id);
-    assert.equal((await service.getReview(id)).revisions.length, 1);
-    assert.deepEqual((await service.getFileContent(id, "r1", "side.txt")).lines, ["side"]);
-    assert.equal(await service.ensureReview({ repoPath: root, scope: "commit", commit }), id);
-});
-
-test("commit history pagination is bounded to 50 entries without losing the root or empty commits", async () => {
-    const root = path.join(tmp, `history-${++seq}`);
-    await runGit(tmp, ["init", "-q", "-b", "main", root]);
-    for (let i = 0; i < 51; i++) await git(root, "commit", "-q", "--allow-empty", "-m", `Commit ${i}`);
-    const page = await listCommits(root);
-    assert.equal(page.commits.length, 50);
-    assert.equal(page.nextOffset, 50);
-    assert.equal(page.commits[0].subject, "Commit 50");
-    const next = await listCommits(root, page.nextOffset);
-    assert.equal(next.commits.length, 1);
-    assert.equal(next.commits[0].subject, "Commit 0");
-    assert.equal(next.nextOffset, null);
-    const { service } = fresh();
-    const id = await service.ensureReview({ repoPath: root, scope: "commit", commit: page.commits[0].commit });
-    assert.deepEqual((await service.getSnapshot(id)).files, []);
-});
 
 test("each scope diffs against its own base and gets its own review", async () => {
     const { service } = fresh();
@@ -939,4 +682,35 @@ test("a failing settings read leaves the review usable", async () => {
         assert.equal(view.review.reviewId, reviewId);
     });
     assert.ok(logs.some(({ m, level }) => level === "warning" && /could not read settings: settings disk error/.test(m)));
+});
+
+test("retired historical commit reviews stay on disk but are never reopened, refreshed, or written as All/Pending reviews", async () => {
+    const { store, service } = fresh();
+    const { reviewId, thread } = await commentThread(service, "Old local note");
+    await store.updateReview(reviewId, (review) => ({ review: { ...review, scope: "commit", commit: review.git.headCommit } }));
+    const retired = /historical single-commit review.*local notes remain stored/;
+    const rejects = (promise) => assert.rejects(promise, (error) => error.code === "unsupported" && retired.test(error.message));
+    await rejects(service.ensureReview({ reviewId }));
+    await rejects(service.refresh(reviewId));
+    await rejects(service.openSibling(reviewId, "pending"));
+    await rejects(service.createThread(reviewId, { kind: "overview", body: "New note", author: "user" }));
+    await rejects(service.addMessage(reviewId, thread.threadId, { author: "user", body: "Reply" }));
+    await rejects(service.setThreadStatus(reviewId, thread.threadId, "resolved"));
+    await rejects(service.updateDescription(reviewId, { body: "New description", expectedVersion: 0 }));
+    assert.equal(scopeOf(await service.getReview(reviewId)), "all", "the UI scope helper never presents commit as a selectable scope");
+
+    const stored = await store.readReview(reviewId);
+    assert.equal(stored.scope, "commit");
+    assert.deepEqual(stored.threads.map((t) => t.messages.map((m) => m.body)), [["Old local note"]], "retired notes are preserved untouched");
+    assert.deepEqual(stored.threads.map((t) => t.status), [thread.status], "retired thread statuses are unchanged");
+    assert.equal(stored.description ?? null, null, "retired descriptions are unchanged");
+
+    const other = fresh();
+    const allId = await other.service.ensureReview({ repoPath: repo, base: "main" });
+    const delivery = new Delivery({ service: other.service, send: async () => "sm-1" });
+    await withServer({ instanceId: "inst-retired", getReviewId: () => allId, service: other.service, delivery }, async ({ post }) => {
+        const commit = await post("/api/scope", { scope: "commit", commit: stored.commit });
+        assert.equal(commit.status, 400);
+        assert.match(commit.json.error.message, /scope must be one of all, pending/);
+    });
 });

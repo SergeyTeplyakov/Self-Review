@@ -12,7 +12,6 @@ import { SUGGESTED_REVIEWERS } from "./agent-review.mjs";
 import { resolveDelivery } from "./settings.mjs";
 import { findOpenPullRequest } from "./pull-request.mjs";
 import { SettingsHttp, HttpError } from "./settings-http.mjs";
-import { listCommits } from "./git.mjs";
 const MAX_JSON = 1024 * 1024;
 const PULL_REQUEST_CACHE_MS = 30_000;
 const STATIC = {
@@ -88,30 +87,7 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
     const token = randomBytes(24).toString("base64url");
     const clients = new Set();
     const pullRequestCache = new Map();
-    let reviewContext = await service.store.getInstanceContext(instanceId);
     let port = 0;
-    async function bindReview(reviewId, sourceReviewId) {
-        const review = await service.getReview(reviewId);
-        let returnReviewId = null;
-        if (review.scope === "commit") {
-            if (sourceReviewId === undefined && reviewContext?.reviewId === reviewId) {
-                returnReviewId = reviewContext.returnReviewId;
-            }
-            else if (typeof sourceReviewId === "string") {
-                const source = await service.getReview(sourceReviewId);
-                returnReviewId = source.scope === "commit"
-                    ? reviewContext?.reviewId === sourceReviewId ? reviewContext.returnReviewId : null
-                    : sourceReviewId;
-            }
-            if (returnReviewId) {
-                const origin = await service.getReview(returnReviewId);
-                if (origin.scope === "commit" || origin.repoRoot !== review.repoRoot)
-                    returnReviewId = null;
-            }
-        }
-        await service.store.setInstanceReview(instanceId, reviewId, returnReviewId);
-        reviewContext = { reviewId, returnReviewId };
-    }
     const broadcast = (event, data) => {
         const frame = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
         for (const res of clients)
@@ -159,8 +135,6 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         });
     };
     async function readPullRequest(review) {
-        if (review.scope === "commit")
-            return null;
         const branch = review.branch;
         if (!branch)
             return null;
@@ -206,27 +180,11 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         if (req.method === "GET") {
             if (parts[0] === "state" && parts.length === 1) {
                 const review = await service.getReview(reviewId);
-                let catalog;
-                try {
-                    catalog = await listCommits(review.repoRoot);
-                }
-                catch (err) {
-                    const message = errorMessage(err);
-                    log(`self-review: commit listing failed: ${message}`, "warning");
-                    catalog = { commits: [], nextOffset: null, commitsError: message };
-                }
-                return send(res, 200, { instanceId, review, ...catalog, session: { busy: delivery.busy }, pullRequest: await readPullRequest(review), agentReviewAvailable: Boolean(agentReview) && review.scope !== "commit", reviewSkillsAvailable: Boolean(reviewSkills), agentReviewSuggestedModels: SUGGESTED_REVIEWERS, ...await settingsHttp.read(review.repoRoot) });
-            }
-            if (parts[0] === "commits" && parts.length === 1) {
-                const review = await service.getReview(reviewId);
-                const offset = Number(url.searchParams.get("offset") ?? 0);
-                if (!Number.isSafeInteger(offset) || offset < 0)
-                    throw new HttpError(400, "invalid_input", "Commit offset must be a non-negative integer.");
-                return send(res, 200, await listCommits(review.repoRoot, offset));
+                return send(res, 200, { instanceId, review, session: { busy: delivery.busy }, pullRequest: await readPullRequest(review), agentReviewAvailable: Boolean(agentReview), reviewSkillsAvailable: Boolean(reviewSkills), agentReviewSuggestedModels: SUGGESTED_REVIEWERS, ...await settingsHttp.read(review.repoRoot) });
             }
             if (parts[0] === "review-skills" && parts.length === 1) {
                 if (!reviewSkills)
-                    throw new HttpError(501, "unsupported", "Host skill discovery is not available.");
+                    throw new HttpError(501, "unsupported", "Bundled review skills are not available.");
                 return send(res, 200, await reviewSkills.read());
             }
             if (parts[0] === "snapshot" && parts.length === 2) {
@@ -261,7 +219,7 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         const body = recordBody(await readJsonBody(req));
         if (parts[0] === "review-skills" && parts.length === 1) {
             if (!reviewSkills)
-                throw new HttpError(501, "unsupported", "Host skill discovery is not available.");
+                throw new HttpError(501, "unsupported", "Bundled review skills are not available.");
             if (typeof body.saveDefaults !== "boolean")
                 throw new HttpError(400, "invalid_input", "Choose whether to save skill defaults.");
             return send(res, 200, await reviewSkills.update(body.names, { saveDefaults: body.saveDefaults }));
@@ -302,14 +260,14 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         if (parts[0] === "threads" && parts.length === 1) {
             const hold = await shouldHold(reviewId, body.draft);
             const { thread, message, duplicate } = await service.createThread(reviewId, { ...body, author: "user", hold });
-            if (!duplicate && !hold && message.delivery?.state !== "local")
+            if (!duplicate && !hold)
                 deliverAsync(reviewId, thread.threadId, message.messageId);
             return send(res, 200, { threadId: thread.threadId, messageId: message.messageId, duplicate, draft: message.delivery?.state === "draft" });
         }
         if (parts[0] === "threads" && parts.length === 3 && parts[2] === "messages") {
             const hold = await shouldHold(reviewId, body.draft);
             const { thread, message, duplicate } = await service.addMessage(reviewId, parts[1], { body: body.body, clientRequestId: body.clientRequestId, descriptionVersion: body.descriptionVersion, author: "user", hold });
-            if (!duplicate && !hold && message.delivery?.state !== "local")
+            if (!duplicate && !hold)
                 deliverAsync(reviewId, thread.threadId, message.messageId);
             return send(res, 200, { threadId: thread.threadId, messageId: message.messageId, duplicate, draft: message.delivery?.state === "draft" });
         }
@@ -360,20 +318,8 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
                 throw new HttpError(400, "invalid_input", `scope must be one of ${SCOPES.join(", ")}.`);
             if (!onReviewChange)
                 throw new HttpError(501, "unsupported", "Switching scope is not available.");
-            if (body.scope === "commit" && (typeof body.commit !== "string" || !/^[0-9a-f]{7,64}$/i.test(body.commit))) {
-                throw new HttpError(400, "invalid_input", "Select a commit by its hexadecimal object ID.");
-            }
-            if (reviewContext?.reviewId !== reviewId)
-                await bindReview(reviewId);
-            const current = await service.getReview(reviewId);
-            const originId = current.scope === "commit" ? reviewContext?.returnReviewId : reviewId;
-            const nextId = body.scope !== "commit" && !originId
-                ? await service.ensureReview({ repoPath: current.repoRoot, scope: body.scope, paths: current.paths, exclude: current.exclude }, { cwd: current.repoRoot })
-                : await service.openSibling(body.scope === "commit" ? reviewId : originId ?? reviewId, body.scope, { commit: body.commit });
+            const nextId = await service.openSibling(reviewId, body.scope);
             if (nextId !== reviewId) {
-                if (current.scope === "commit" && nextId === originId)
-                    await service.refresh(nextId);
-                await bindReview(nextId, reviewId);
                 await onReviewChange(nextId);
                 service.changed(nextId, "scope");
             }
@@ -422,7 +368,6 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
     return {
         url: `http://127.0.0.1:${port}/?t=${token}`,
         notify: broadcast,
-        bindReview,
         async close() {
             clearInterval(heartbeat);
             clearTimeout(assetTimer);

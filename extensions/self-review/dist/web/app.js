@@ -34,10 +34,6 @@ const state = {
     agentReviewSettingsError: "",
     agentReviewSuggestedModels: [],
     startingReview: false,
-    commits: [],
-    commitsError: "",
-    nextCommitOffset: null,
-    loadingCommits: false,
     reviewSkillsAvailable: false,
     skillOverrides: new Map(),
     approving: new Set(),
@@ -63,14 +59,12 @@ const LESSON_STATUSES = {
     saved: "Saved as a guideline for future work.",
     declined: "Declined; not saved.",
 };
-const scopeOf = (review) => (review?.scope === "commit" ? "commit" : review?.scope === "pending" ? "pending" : "all");
-const scopeLabel = (scope) => (scope === "commit" ? "historical commit (local notes)" : scope === "pending" ? "pending changes" : "all changes");
-const isCommit = () => scopeOf(state.review) === "commit";
+const scopeOf = (review) => (review?.scope === "pending" ? "pending" : "all");
+const scopeLabel = (scope) => (scope === "pending" ? "pending changes" : "all changes");
 const learningMode = () => (LEARNING_MODES.includes(state.settings?.learning) ? state.settings.learning : "off");
 const deliveryRepoMode = () => (DELIVERY_MODES.includes(state.settings?.delivery) ? state.settings.delivery : "immediate");
 // Mirrors the server's resolveDelivery: null while an ask-mode review is undecided. Without settings nothing is held.
 function deliveryMode() {
-    if (isCommit()) return "immediate";
     if (!state.settings) return "immediate";
     const mode = deliveryRepoMode();
     if (mode !== "ask") return mode;
@@ -417,15 +411,8 @@ async function loadState() {
         do {
             reloadAgain = false;
             const data = await api("GET", "state");
-            const keepCommitPages = state.review?.repoRoot === data.review.repoRoot
-                && state.commits.length > 50 && state.commits[0]?.commit === data.commits?.[0]?.commit;
             if (state.review && state.review.reviewId !== data.review.reviewId) resetForReview();
             state.review = data.review;
-            if (!keepCommitPages) {
-                state.commits = data.commits ?? [];
-                state.nextCommitOffset = data.nextOffset ?? null;
-            }
-            state.commitsError = data.commitsError ?? "";
             state.reviewSkillsAvailable = data.reviewSkillsAvailable === true;
             state.pullRequest = data.pullRequest ?? null;
             const settingsState = settingsApi.readState(data);
@@ -713,8 +700,7 @@ function renderTop() {
         `<section class="change-context" role="group" aria-label="Change context">`,
         `<div class="change-context-heading"><span class="title">${esc(r.title)}</span>${branch}`,
         scope === "all" ? `<span class="muted">vs</span><span class="pill mono" title="merge-base ${esc(git.baseCommit ?? "")}">${esc(r.base)}</span>`
-            : isCommit() ? `<span class="pill mono" title="Compared with first parent, or empty tree for root">${esc(r.commit?.slice(0, 12))}</span><span class="muted">Historical snapshot · local notes only · no agent actions</span>`
-                : `<span class="muted">uncommitted changes only</span>`,
+            : `<span class="muted">uncommitted changes only</span>`,
         state.pullRequest ? `<a class="pill pr-link" href="${esc(state.pullRequest.url)}" target="_blank" rel="noopener noreferrer" title="Open pull request #${esc(state.pullRequest.number)} in browser">Open PR #${esc(state.pullRequest.number)}</a>` : "",
         `</div><div class="change-context-details">${scopeToggleHtml(scope)}`,
     ];
@@ -731,32 +717,27 @@ function renderTop() {
     else if (state.busy === false) parts.push(`<span class="pill"><span class="dot muted"></span>Copilot idle${awaiting ? ` · ${awaiting} pending` : ""}</span>`);
     parts.push(`<span class="spacer"></span><button data-action="refresh" title="Re-read the working tree">Refresh</button></div></section>`);
 
-    const findings = agentComments().length;
     const drafts = draftMessages().length;
     const workflows = [];
-    if (state.agentReviewAvailable || findings || (state.reviewSkillsAvailable && !isCommit())) {
+    if (state.agentReviewAvailable) {
+        const running = r.agentReviews?.some((run) => ["sending", "queued", "running"].includes(run.state));
+        const defaults = state.agentReviewSettings;
+        const hint = defaults?.skipDialog
+            ? `Run with saved defaults: ${defaults.models.join(", ")} (${defaults.focus}). May consume credits.`
+            : "Configure and run a read-only agentic review. May consume credits.";
         workflows.push(`<section class="review-lane agent-review-lane" aria-labelledby="agentic-review-title">`
             + `<div class="review-lane-heading"><h2 id="agentic-review-title">Agentic review</h2><p class="muted">Independent, read-only model review. May consume credits.</p></div>`
-            + `<div class="review-lane-actions">`);
-        if (state.agentReviewAvailable) {
-            const running = r.agentReviews?.some((run) => ["sending", "queued", "running"].includes(run.state));
-            const defaults = state.agentReviewSettings;
-            const hint = defaults?.skipDialog
-                ? `Run with saved defaults: ${defaults.models.join(", ")} (${defaults.focus}). May consume credits.`
-                : "Configure and run a read-only agentic review. May consume credits.";
-            workflows.push(`<button class="primary agent-review-launch" data-action="agent-review" title="${esc(hint)}"${running || state.startingReview ? " disabled" : ""}>${running ? "Agentic review running" : state.startingReview ? "Queuing review..." : "Run agentic review"}</button>`);
-        }
-        workflows.push(`<button class="agent-comment-count" data-action="nav" data-view="agent-comments" title="Agent findings in this scope, across all revisions; excludes replies and manual threads">Agent comments (<span aria-live="polite">${findings}</span>)</button>`);
-        if (state.agentReviewAvailable) workflows.push(`<button data-action="agent-review-configure" title="Configure agentic review and user-wide defaults">Review settings</button>`);
-        if (state.reviewSkillsAvailable && !isCommit()) workflows.push(`<button data-action="review-skills">Review skills</button>`);
-        workflows.push(`</div></section>`);
+            + `<div class="review-lane-actions">`
+            + `<button class="primary agent-review-launch" data-action="agent-review" title="${esc(hint)}"${running || state.startingReview ? " disabled" : ""}>${running ? "Agentic review running" : state.startingReview ? "Queuing review..." : "Run agentic review"}</button>`
+            + `<button data-action="agent-review-configure" title="Configure reviewers, focus, guidance, review skills, and user-wide defaults">Review settings</button>`
+            + `</div></section>`);
     }
-    if (!isCommit()) workflows.push(`<section class="review-lane feedback-lane" aria-labelledby="manual-review-title">`
+    workflows.push(`<section class="review-lane feedback-lane" aria-labelledby="manual-review-title">`
         + `<div class="review-lane-heading"><h2 id="manual-review-title">Manual Review</h2><p class="muted">Your comments guide the coding agent; these settings control how they are sent and learned from.</p></div>`
         + `<div class="review-lane-actions">`);
-    if (!isCommit()) workflows.push(`<span class="feedback-draft-count">${drafts} draft ${drafts === 1 ? "comment" : "comments"}</span>`);
+    workflows.push(`<span class="feedback-draft-count">${drafts} draft ${drafts === 1 ? "comment" : "comments"}</span>`);
     if (drafts) workflows.push(`<button class="primary" data-action="submit-review" title="Send every draft comment to Copilot together, as one review"${state.submitting ? " disabled>Submitting…" : `>Submit review (${drafts})`}</button>`);
-    if (state.settings && !isCommit()) {
+    if (state.settings) {
         const repoMode = deliveryRepoMode();
         const chosen = repoMode === "ask" ? deliveryMode() : null;
         workflows.push(chosen
@@ -765,7 +746,7 @@ function renderTop() {
         const mode = LEARNING[learningMode()];
         workflows.push(`<span class="pill" title="${esc(mode.hint)}">Learning: ${esc(mode.pill)}</span><button data-action="configure" title="Change how manual review comments are delivered and used for learning in this repository">Manual review settings</button>`);
     }
-    if (!isCommit()) workflows.push(`</div></section>`);
+    workflows.push(`</div></section>`);
     if (workflows.length) parts.push(`<div class="review-workflows">${workflows.join("")}</div>`);
     $("#top").innerHTML = parts.join("");
 }
@@ -792,7 +773,6 @@ function deliveryBannerHtml() {
 }
 
 function bannerHtml() {
-    if (isCommit()) return "";
     return learningBannerHtml() + deliveryBannerHtml();
 }
 
@@ -812,7 +792,6 @@ function dialogHtml() {
     const d = state.dialog;
     if (!d) return "";
     if (d.type === "agent-review") return agentReviewDialogHtml(d);
-    if (d.type === "review-skills") return reviewSkillsDialogHtml(d);
     return `<div class="modal-backdrop" data-action="dialog-backdrop"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby="dialog-desc">`
         + `<h2 id="dialog-title">Review settings</h2>`
         + `<p id="dialog-desc" class="muted">Settings for ${esc(state.settings?.repoName ?? "this repository")}. They are stored on this machine only and never committed.</p>`
@@ -830,10 +809,19 @@ function focusIn(selector) {
 
 // The dialog is rendered on its own so re-renders of the page never disturb its focus or radio state.
 function renderDialog() {
+    const active = document.activeElement?.closest?.("#dialog") ? document.activeElement : null;
+    const key = active?.name ? `[name="${active.name}"]${active.type === "checkbox" ? `[value="${CSS.escape(active.value)}"]` : ""}`
+        : active?.dataset?.action ? `[data-action="${active.dataset.action}"]` : null;
+    const selection = active && "selectionStart" in active ? [active.selectionStart, active.selectionEnd] : null;
     $("#dialog").innerHTML = dialogHtml();
     for (const id of ["#top", "#banner", "#layout"]) {
         const el = $(id);
         if (el) el.inert = Boolean(state.dialog);
+    }
+    const restored = key ? document.querySelector(`#dialog ${key}`) : null;
+    if (restored && !restored.disabled) {
+        restored.focus();
+        if (selection && selection[0] !== null) try { restored.setSelectionRange(...selection); } catch { /* not a text field */ }
     }
 }
 
@@ -846,102 +834,88 @@ function openConfigure() {
 
 function closeConfigure() {
     if (!state.dialog || state.dialog.saving) return;
-    const opener = state.dialog.type === "review-skills" ? "review-skills" : state.dialog.type === "agent-review" ? state.dialog.opener ?? "agent-review" : "configure";
-    state.dialog = state.dialog.previous ?? null;
+    const opener = state.dialog.type === "agent-review" ? state.dialog.opener ?? "agent-review" : "configure";
+    state.dialog = null;
     renderDialog();
     focusIn(`[data-action="${opener}"]`);
 }
 
-function reviewSkillsDialogHtml(d) {
-    const rows = (d.catalog?.skills ?? []).map((skill) => `<fieldset class="choices"><legend>${esc(skill.name)}${skill.name === "ponytail-review" ? " - top-level benefits report" : " - review guidance"}</legend>`
-        + (skill.installations.length ? skill.installations.map((entry) => `<label class="choice"><input type="checkbox" name="review-skill" value="${esc(entry.name)}"${d.names.has(entry.name) ? " checked" : ""}${d.saving || (!entry.enabled && !d.names.has(entry.name)) ? " disabled" : ""}><span>${esc(entry.name)}${entry.enabled ? "" : " (disabled in host)"}<span class="choice-hint">Source: ${esc(entry.source)}${entry.pluginName ? ` / ${esc(entry.pluginName)}` : ""}<br>${esc(entry.path ?? "No local path reported")}<br>Version/revision: not reported by host. Upstream provenance not verified.</span></span></label>`).join("")
-            : `<p class="muted">Not installed or not available to this session.</p>`) + `</fieldset>`).join("");
-    return `<div class="modal-backdrop" data-action="dialog-backdrop"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby="dialog-desc">`
-        + `<h2 id="dialog-title">Installed review skills</h2><p id="dialog-desc">Choose independent opt-ins for this review. Nothing is selected by default. Saving user defaults is a separate choice.</p>`
-        + `<p>Upstream: <a href="https://github.com/addyosmani/agent-skills" target="_blank" rel="noopener noreferrer">Addy Osmani's agent-skills</a> and <a href="https://github.com/DietrichGebert/ponytail" target="_blank" rel="noopener noreferrer">Ponytail</a> (MIT). Matching names alone do not verify an installation's origin.</p>`
-        + `<p class="muted">Addy's selected skills guide review findings. Ponytail review contributes a separate top-level note with concrete simplification opportunities and their benefits, never inline comments. No supported benefits means no benefits comment; the run records absence or unavailable guidance. This uses ponytail-review, not the always-on ponytail coding mode.</p>`
-        + `<p class="muted">Install, update, and enable skills in the host's skill/plugin settings, then refresh here. Self-Review does not bundle, download, update, overwrite, or globally enable skills; local customizations remain untouched. Skill choices are captured per run, but content is loaded by the host at invocation, not version-pinned. Saving this preference never starts a paid review or authorizes fixes.</p>`
-        + rows + [...d.names].filter((name) => !d.catalog?.skills.some((skill) => skill.installations.some((entry) => entry.name === name))).map((name) => `<label class="choice"><input type="checkbox" name="review-skill" value="${esc(name)}" checked${d.saving ? " disabled" : ""}><span>${esc(name)} - unavailable; uncheck to remove this selection</span></label>`).join("")
-        + `<label class="choice"><input type="checkbox" name="review-skill-defaults"${d.saveDefaults ? " checked" : ""}${d.saving ? " disabled" : ""}><span>Save these skill choices as user defaults across repositories</span></label>`
-        + (d.error ? `<div class="modal-error" role="alert">${esc(d.error)}</div>` : "")
-        + `<div class="modal-actions"><button data-action="dialog-cancel"${d.saving ? " disabled" : ""}>Cancel</button><button data-action="review-skills-refresh"${d.saving ? " disabled" : ""}>Refresh from host</button><button class="primary" data-action="review-skills-save"${d.saving || !d.catalog ? " disabled" : ""}>Apply skill choices</button></div></div></div>`;
-}
-
-async function openReviewSkills() {
-    if (state.dialog?.type === "review-skills") return;
-    state.dialog = { type: "review-skills", reviewId: state.review?.reviewId, previous: state.dialog, names: new Set(), catalog: null, error: "", saving: false, saveDefaults: false };
-    renderDialog();
-    await refreshReviewSkills();
+function reviewSkillsSectionHtml(d) {
+    const disabled = d.saving || d.skillsLoading;
+    const names = d.skillNames ?? [];
+    const rows = (d.skillCatalog?.skills ?? []).map((skill) => {
+        const source = `${skill.upstream.repository}/blob/${skill.upstream.release}/${skill.upstream.path}`;
+        return `<label class="choice skill-choice"><input type="checkbox" name="review-skill" value="${esc(skill.name)}"${names.includes(skill.name) ? " checked" : ""}${disabled ? " disabled" : ""}>`
+            + `<span><span class="skill-group-name">${esc(skill.title)}</span> <code>${esc(skill.name)}</code>${skill.role === "ponytail" ? " - separate top-level benefits note" : " - review guidance"}`
+            + `<span class="choice-hint">${esc(skill.summary)}<br>Bundled with Self-Review: unmodified snapshot of <a href="${esc(source)}" target="_blank" rel="noopener noreferrer">${esc(skill.upstream.repository.replace("https://github.com/", ""))} ${esc(skill.upstream.release)}</a> (file commit ${esc(skill.upstream.fileCommit.slice(0, 7))}). License: ${esc(skill.license.spdx)}.`
+            + `${skill.attribution ? `<br>${esc(skill.attribution)}` : ""}</span></span></label>`;
+    }).join("");
+    return `<fieldset class="choices review-skills-section"><legend>Review skills</legend>`
+        + `<p class="muted">These skills ship with Self-Review and are on by default. Their full text is given to every reviewer in the run. Uncheck any you do not want; nothing is installed or downloaded.</p>`
+        + (d.skillsLoading && !d.skillCatalog ? `<p class="muted" role="status">Loading bundled skills...</p>` : "")
+        + rows
+        + (d.skillsError ? `<div class="modal-error" role="alert">${esc(d.skillsError)}</div><button data-action="review-skills-refresh"${disabled ? " disabled" : ""}>Retry</button>` : "")
+        + (state.agentReviewSettingsAvailable ? `<label class="choice"><input type="checkbox" name="review-skill-defaults"${d.saveSkillDefaults ? " checked" : ""}${disabled || !d.skillCatalog ? " disabled" : ""}><span>Save these skill choices as my defaults across repositories</span></label>` : "")
+        + `<p class="muted">Unchecked choices apply to this review until you save them as defaults. Third-party notices and license texts are in the extension's bundled-skills folder.</p></fieldset>`;
 }
 
 async function refreshReviewSkills() {
     const d = state.dialog;
-    if (d?.type !== "review-skills" || d.saving) return;
-    d.saving = true;
-    d.error = "";
+    if (d?.type !== "agent-review" || d.saving || d.skillsLoading) return;
+    d.skillsLoading = true;
+    d.skillsError = "";
     renderDialog();
     try {
-        const firstLoad = !d.catalog;
-        d.catalog = await api("GET", "review-skills");
-        if (firstLoad) {
-            d.names = new Set(d.previous?.skillNames ?? state.skillOverrides.get(d.reviewId)
-                ?? d.catalog.selected ?? d.catalog.skills.flatMap((skill) => skill.installations).filter((entry) => entry.selected).map((entry) => entry.name));
+        const firstLoad = !d.skillCatalog;
+        const catalog = await api("GET", "review-skills");
+        if (state.dialog !== d) return;
+        d.skillCatalog = catalog;
+        if (firstLoad && d.skillNames === undefined) {
+            d.skillNames = [...catalog.selected];
         }
     } catch (err) {
-        d.error = err.message;
+        d.skillsError = err.message;
     } finally {
-        d.saving = false;
-        if (state.dialog === d) renderDialog();
+        d.skillsLoading = false;
+        if (state.dialog === d) {
+            renderDialog();
+            if (!document.activeElement?.closest?.("#dialog")) focusIn(d.skillsError ? '#dialog [data-action="review-skills-refresh"]' : '#dialog [data-action="review-tab"][aria-selected="true"]');
+        }
     }
 }
 
-async function saveReviewSkills() {
-    const d = state.dialog;
-    if (d?.type !== "review-skills" || d.saving || !d.catalog) return;
-    d.saving = true;
-    d.error = "";
-    renderDialog();
-    try {
-        if (d.reviewId !== state.review?.reviewId) throw new Error("The review changed. Close this dialog and try again.");
-        await api("POST", "review-skills", { names: [...d.names], saveDefaults: d.saveDefaults });
-        state.skillOverrides.set(d.reviewId, [...d.names]);
-        if (d.previous?.type === "agent-review") d.previous.skillNames = [...d.names];
-        d.saving = false;
-        closeConfigure();
-        toast(d.saveDefaults ? "Skill defaults saved. No review was started." : "Skill choices apply to this review only. No review was started.");
-    } catch (err) {
-        d.error = err.message;
-        d.saving = false;
-        renderDialog();
-    }
+function reviewTabsHtml(d) {
+    const tab = (id, label) => `<button role="tab" id="review-tab-${id}" class="review-tab" data-action="review-tab" data-tab="${id}" aria-controls="review-panel-${id}" aria-selected="${d.tab === id}">${label}</button>`;
+    return `<div class="review-tabs" role="tablist" aria-label="Review settings sections">${tab("general", "General")}${tab("skills", "Review skills")}</div>`;
 }
 
 function agentReviewDialogHtml(d) {
     const options = [["review", "Review issues"], ["simplify", "Simplification"], ["both", "Review and simplification"]];
     return `<div class="modal-backdrop" data-action="dialog-backdrop"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby="dialog-desc">`
-        + `<h2 id="dialog-title">Agentic review</h2>`
-        + `<p id="dialog-desc">Review ${esc(d.revisionId)} (${esc(d.scope)}). Each selected model reviews independently and may consume credits. No files are changed until you approve a suggestion or explicitly request a fix.</p>`
+        + (d.settingsOnly
+            ? `<h2 id="dialog-title">Agent review settings</h2><p id="dialog-desc">Configure reviewers, focus, guidance, and review skills. Saving never starts a review; use Run agentic review in the toolbar.</p>`
+            : `<h2 id="dialog-title">Agentic review</h2><p id="dialog-desc">Review ${esc(d.revisionId)} (${esc(d.scope)}). Each selected model reviews independently and may consume credits. No files are changed until you approve a suggestion or explicitly request a fix.</p>`)
+        + reviewTabsHtml(d)
+        + `<div role="tabpanel" id="review-panel-general" aria-labelledby="review-tab-general"${d.tab === "general" ? "" : " hidden"}>`
         + `<label class="review-field">Reviewers (one to four model IDs, comma-separated)<input name="review-models" value="${esc(d.models)}" maxlength="483" autocomplete="off"${d.saving ? " disabled" : ""}></label>`
         + `<p class="muted">Use exact model IDs available in your Copilot session, or copilot-fusion to run Copilot Fusion in a child session that reports back later. An unavailable reviewer is reported as a failure, never silently replaced.</p>`
         + `<label class="review-field"><span id="review-focus-label">Focus</span><select name="review-focus" aria-labelledby="review-focus-label"${d.saving ? " disabled" : ""}>${options.map(([value, label]) => `<option value="${value}"${d.focus === value ? " selected" : ""}>${label}</option>`).join("")}</select></label>`
         + `<label class="review-field">Goal, spec, or review guidance (optional)<textarea name="review-intent" maxlength="4000" rows="3" placeholder="Acceptance criteria, a spec reference, or focused review guidance"${d.saving ? " disabled" : ""}>${esc(d.intent)}</textarea></label>`
         + `<p class="muted">The coordinating agent checks findings against the code, baseline, and relevant callers or tests before reporting them. Missing evidence is reported, not treated as a pass.</p>`
-        + `<p class="muted">You can request Addy Osmani's <a href="https://github.com/addyosmani/agent-skills" target="_blank" rel="noopener noreferrer">review and code-simplification skills</a> in the guidance above if installed. They are optional; nothing is installed automatically.</p>`
-        + (state.reviewSkillsAvailable ? `<fieldset class="choices"><legend>Installed review skills</legend>`
-            + `<p>Addy Osmani: review quality and code simplification. Ponytail: a separate evidence-based, top-level benefits note.</p>`
-            + `<p class="muted">${d.skillNames === undefined ? "Uses saved skill defaults unless you override them for this review."
-                : d.skillNames.length ? `Selected for this review: ${d.skillNames.map(esc).join(", ")}`
-                    : "No review skills selected for this review."}</p>`
-            + `<button data-action="review-skills"${d.saving ? " disabled" : ""}>Configure installed review skills</button></fieldset>` : "")
         + (state.agentReviewSettingsAvailable
             ? `<fieldset class="choices"><legend>User defaults for all repositories</legend>`
                 + `<label class="choice"><input type="checkbox" name="review-save-defaults"${d.saveDefaults ? " checked" : ""}${d.saving ? " disabled" : ""}><span>Save these models, focus, and guidance as my defaults</span></label>`
                 + `<label class="choice"><input type="checkbox" name="review-skip-dialog"${d.skipDialog ? " checked" : ""}${d.saving || !d.saveDefaults ? " disabled" : ""}><span>Run with saved defaults without asking again</span></label>`
                 + `<p class="muted">Each click on Run agentic review authorizes a credit-consuming review. Nothing runs on save or when opening a canvas. Fixes still need approval. Saved guidance applies across repositories; avoid repository-specific instructions.</p></fieldset>` : "")
+        + `</div><div role="tabpanel" id="review-panel-skills" aria-labelledby="review-tab-skills"${d.tab === "skills" ? "" : " hidden"}>`
+        + (state.reviewSkillsAvailable ? reviewSkillsSectionHtml(d) : `<p class="muted" role="status">Bundled review skills are unavailable in this build. Reviews run with the built-in guidance.</p>`)
+        + `</div>`
         + (d.error ? `<div class="modal-error" role="alert">${esc(d.error)}</div>` : "")
         + `<div class="modal-actions"><button data-action="dialog-cancel"${d.saving ? " disabled" : ""}>Cancel</button>`
-        + (state.agentReviewSettingsAvailable ? `<button data-action="agent-review-save-defaults"${d.saving || !d.saveDefaults ? " disabled" : ""}>Save defaults</button>` : "")
-        + `<button class="primary" data-action="agent-review-start"${d.saving ? " disabled" : ""}>${d.saving ? "Please wait..." : "Run review"}</button></div></div></div>`;
+        + (state.agentReviewSettingsAvailable ? `<button${d.settingsOnly ? ' class="primary"' : ""} data-action="agent-review-save-defaults"${d.saving || d.skillsLoading || !(d.saveDefaults || d.saveSkillDefaults) ? " disabled" : ""}>Save defaults</button>` : "")
+        + (d.settingsOnly && state.reviewSkillsAvailable ? `<button data-action="agent-review-apply-skills"${d.saving || d.skillsLoading || !d.skillCatalog ? " disabled" : ""}>Apply for this review</button>` : "")
+        + (d.settingsOnly ? "" : `<button class="primary" data-action="agent-review-start"${d.saving || d.skillsLoading ? " disabled" : ""}>${d.saving ? "Please wait..." : "Run review"}</button>`)
+        + `</div></div></div>`;
 }
 
 function openAgentReview(opener = "agent-review") {
@@ -953,10 +927,12 @@ function openAgentReview(opener = "agent-review") {
         scope: scopeLabel(scopeOf(state.review)), models: (defaults?.models ?? last?.models ?? state.agentReviewSuggestedModels).join(", "),
         focus: defaults?.focus ?? last?.focus ?? "review", intent: defaults?.intent ?? "", saving: false,
         skillNames: state.skillOverrides.get(state.review.reviewId) ?? defaults?.skillNames,
-        saveDefaults: Boolean(defaults), skipDialog: defaults?.skipDialog ?? false, opener, error: state.agentReviewSettingsError,
+        skillCatalog: null, skillsLoading: false, skillsError: "", saveSkillDefaults: false, tab: "general",
+        saveDefaults: Boolean(defaults), skipDialog: defaults?.skipDialog ?? false, opener, settingsOnly: opener === "agent-review-configure", error: state.agentReviewSettingsError,
     };
     renderDialog();
     focusIn('#dialog input[name="review-models"]');
+    if (state.reviewSkillsAvailable) refreshReviewSkills().catch((err) => toast(err.message, true));
 }
 
 function agentReviewOptions(d) {
@@ -972,7 +948,7 @@ async function saveAgentReviewDefaults(d) {
 
 async function startAgentReview(saveOnly = false) {
     const d = state.dialog;
-    if (d?.type !== "agent-review" || d.saving) return;
+    if (d?.type !== "agent-review" || d.saving || (d.settingsOnly && !saveOnly)) return;
     d.saving = true;
     d.error = "";
     renderDialog();
@@ -980,8 +956,13 @@ async function startAgentReview(saveOnly = false) {
         if (!saveOnly && (d.reviewId !== state.review?.reviewId || d.revisionId !== state.review?.currentRevisionId)) {
             throw new Error("The review scope changed or revision is stale. Close this dialog and try again.");
         }
-        if (saveOnly && !d.saveDefaults) throw new Error("Select Save these models, focus, and guidance first.");
+        if (saveOnly && !d.saveDefaults && !d.saveSkillDefaults) throw new Error("Select Save these models, focus, and guidance, or save skill choices, first.");
         if (d.saveDefaults) await saveAgentReviewDefaults(d);
+        if (d.saveSkillDefaults) {
+            if (d.reviewId !== state.review?.reviewId) throw new Error("The review changed. Close this dialog and try again.");
+            await api("POST", "review-skills", { names: d.skillNames ?? [], saveDefaults: true });
+        }
+        if (d.skillCatalog && d.skillNames !== undefined) state.skillOverrides.set(d.reviewId, [...d.skillNames]);
         if (!saveOnly) {
             if (d.reviewId !== state.review?.reviewId || d.revisionId !== state.review?.currentRevisionId) {
                 throw new Error("The review scope changed or revision is stale. Close this dialog and try again.");
@@ -999,6 +980,21 @@ async function startAgentReview(saveOnly = false) {
         if (state.dialog === d) renderDialog();
         await loadState().catch((loadError) => toast(loadError.message, true));
     }
+}
+
+function applyReviewSkills() {
+    const d = state.dialog;
+    if (d?.type !== "agent-review" || d.saving || !d.skillCatalog) return;
+    if (d.reviewId !== state.review?.reviewId) {
+        d.error = "The review changed. Close this dialog and try again.";
+        renderDialog();
+        return;
+    }
+    state.skillOverrides.set(d.reviewId, [...(d.skillNames ?? [])]);
+    state.dialog = null;
+    renderDialog();
+    focusIn('[data-action="agent-review-configure"]');
+    toast("Review skills applied to this review only. Defaults are unchanged and no review was started.");
 }
 
 async function runAgentReview() {
@@ -1040,9 +1036,10 @@ function agentCommentsView() {
     const threads = agentComments();
     const active = threads.filter((thread) => thread.status === "active").length;
     const older = threads.filter((thread) => thread.agentReview.revisionId !== state.review.currentRevisionId).length;
-    return `<h2>Agent comments (${threads.length})</h2>`
-        + `<p class="muted">${active} active, ${threads.length - active} closed or resolved; ${older} from older revisions. Counts include all agent findings in this scope, not replies or manual threads.</p>`
+    return `<h2>Agent reviews</h2>`
         + agentReviewsHtml()
+        + `<h2>Agent comments (<span aria-live="polite">${threads.length}</span>)</h2>`
+        + `<p class="muted">${active} active, ${threads.length - active} closed or resolved; ${older} from older revisions. Counts include all agent findings in this scope, not replies or manual threads.</p>`
         + (threads.length ? threads.map((thread) => threadHtml(thread, { showLocation: true })).join("") : `<div class="empty">No agent comments yet. A review may still be running or may have reported no findings; check its status above.</div>`);
 }
 
@@ -1050,10 +1047,10 @@ function agentReviewsHtml() {
     const runs = state.review?.agentReviews ?? [];
     if (!runs.length) return "";
     const active = (r) => ["sending", "queued", "running"].includes(r.state);
-    return `<h2>Agent reviews</h2><p class="muted">Assessments and verification are reported by the coordinating agent, not independently attested by the canvas.</p>${[...runs].reverse().map((r) => `<div class="card agent-review-run">`
+    return `<h3>Review runs</h3><p class="muted">Assessments and verification are reported by the coordinating agent, not independently attested by the canvas.</p>${[...runs].reverse().map((r) => `<div class="card agent-review-run">`
         + `<strong>${esc(r.focus)}: ${esc(r.state)}</strong> <span class="pill">${agentComments().filter((thread) => thread.agentReview.runId === r.runId).length} agent comments</span> <span class="muted">${esc(r.revisionId)}${r.revisionId !== state.review.currentRevisionId ? " (older diff)" : ""}</span>`
         + (r.intent ? `<p class="review-summary">Goal / spec / guidance: ${esc(r.intent)}</p>` : "")
-        + (r.skills?.length ? `<p class="review-summary">Requested skills (not proof of loading): ${esc(r.skills.map((skill) => skill.name).join(", "))}. See actual use and limits in each result.</p>` : "")
+        + (r.skills?.length ? `<p class="review-summary">Bundled skills supplied: ${esc(r.skills.map((skill) => skill.release ? `${skill.name} (${skill.release})` : skill.name).join(", "))}. See actual use and limits in each result.</p>` : "")
         + (r.error ? `<p class="err">${esc(r.error)}</p>` : "")
         + `<ul>${r.models.map((model) => {
             const result = r.results.find((x) => x.model === model);
@@ -1123,7 +1120,7 @@ function trapTab(e) {
         const radios = [...document.querySelectorAll(`#dialog input[name="${name}"]`)];
         return radios.find((x) => x.checked) ?? radios[0];
     };
-    const stops = ["agent-review", "review-skills"].includes(state.dialog?.type)
+    const stops = state.dialog?.type === "agent-review"
         ? [...document.querySelectorAll("#dialog input:not([disabled]), #dialog select:not([disabled]), #dialog textarea:not([disabled]), #dialog a[href], #dialog button:not([disabled])")]
         : [...new Set([groupStop("learning"), groupStop("delivery"), ...document.querySelectorAll("#dialog button:not([disabled])")].filter(Boolean))];
     if (!stops.length) return;
@@ -1138,12 +1135,12 @@ function trapTab(e) {
     }
 }
 
-async function switchScope(scope, commit) {
-    if (state.switching || (scope === scopeOf(state.review) && (scope !== "commit" || commit === state.review.commit))) return;
+async function switchScope(scope) {
+    if (state.switching || scope === scopeOf(state.review)) return;
     state.switching = true;
     renderTop();
     try {
-        await api("POST", "scope", { scope, ...(commit ? { commit } : {}) });
+        await api("POST", "scope", { scope });
         await loadState();
     } finally {
         state.switching = false;
@@ -1201,7 +1198,6 @@ function setAllDirsCollapsed(collapse) {
 }
 
 function descriptionHtml() {
-    if (isCommit()) return `<div class="card">Immutable commit ${esc(state.review.commit)} compared with ${esc(state.review.git?.baseCommit)}. Comments are local notes, never sent to Copilot. Merge commits use their first parent; root commits use an empty tree.</div>`;
     const d = state.review.description;
     const stale = d && d.revisionId !== state.review.currentRevisionId;
     return `<div class="section-head"><h2>Change overview</h2><span class="spacer"></span>`
@@ -1218,14 +1214,10 @@ function renderSide() {
     const overviewCount = r.threads.filter((t) => t.status === "active" && (t.kind === "overview" || !isPlaced(t))).length;
     const html = [
         `<div class="nav-item${v.type === "overview" ? " active" : ""}" data-action="nav" data-view="overview"><span class="name">Overview</span><span class="count${overviewCount ? "" : " zero"}">${overviewCount}</span></div>`,
-        ...(state.agentReviewAvailable || agentComments().length ? [`<div class="nav-item${v.type === "agent-comments" ? " active" : ""}" data-action="nav" data-view="agent-comments"><span class="name">Agent comments</span><span class="count">${agentComments().length}</span></div>`] : []),
+        ...(state.agentReviewAvailable || agentComments().length ? [`<div class="nav-item${v.type === "agent-comments" ? " active" : ""}" data-action="nav" data-view="agent-comments"><span class="count" title="Agent findings in this scope, across all revisions; excludes replies and manual threads">${agentComments().length}</span><span class="name">Agent reviews</span></div>`] : []),
         `<div class="nav-item${v.type === "lessons" ? " active" : ""}" data-action="nav" data-view="lessons"><span class="name">Lessons learned</span><span class="muted">${r.lessons.length}</span></div>`,
         `<div class="section">Files (${files.length})</div>`,
     ];
-    const commitRows = state.commits.map((entry) => `<button class="nav-item${r.commit === entry.commit ? " active" : ""}" type="button" role="treeitem" aria-selected="${r.commit === entry.commit}" data-action="commit" data-commit="${esc(entry.commit)}" title="${esc(`${entry.commit} · ${entry.author} · ${entry.date}`)}"${state.switching ? " disabled" : ""}><span class="mono">${esc(entry.commit.slice(0, 8))}</span> <span class="name">${esc(entry.subject)}</span></button>`).join("");
-    html.splice(html.length - 1, 0, `<div class="section">Commits (HEAD history)</div><div role="tree" aria-label="Commits">${commitRows}</div>`
-        + (state.commitsError ? `<div class="side-empty" role="alert">${esc(state.commitsError)}</div>` : "")
-        + (state.nextCommitOffset !== null ? `<button data-action="commits-more"${state.loadingCommits || state.switching ? " disabled" : ""}>Older commits</button>` : ""));
     if (files.length) {
         html.push(
             `<div class="tree-controls"><button class="link" data-action="fold-tree" data-fold="1">Collapse all</button><button class="link" data-action="fold-tree" data-fold="0">Expand all</button></div>`,
@@ -1273,7 +1265,7 @@ function composerHtml(key, { label, placeholder, kind, path, side, startLine, en
     ].join(" ");
     const k = esc(key);
     const batching = deliveryMode() !== "immediate";
-    const buttons = isCommit() ? `<button class="primary" data-action="submit" data-key="${k}"${p?.sending ? " disabled" : ""}>Save local note</button>` : batching
+    const buttons = batching
         ? `<button data-action="submit" data-key="${k}" data-draft="0" title="Send this comment to Copilot right away"${p?.sending ? " disabled" : ""}>Send now</button>`
             + `<button class="primary" data-action="submit" data-key="${k}" data-draft="1" title="Hold this comment as a draft until you submit the review"${p?.sending ? " disabled>Saving…" : ">Add to review"}</button>`
         : `<button class="primary" data-action="submit" data-key="${k}" ${p?.sending ? "disabled" : ""}>${p?.sending ? "Sending…" : "Comment"}</button>`;
@@ -1281,7 +1273,7 @@ function composerHtml(key, { label, placeholder, kind, path, side, startLine, en
         + (label ? `<div class="label">${esc(label)}</div>` : "")
         + `<textarea data-composer="${k}" placeholder="${esc(placeholder ?? "Write a comment…")}" ${p?.sending ? "disabled" : ""}>${esc(draft)}</textarea>`
         + (p?.error ? `<div class="err">${esc(p.error)}</div>` : "")
-        + `<div class="bar"><span class="hint">Markdown · Ctrl+Enter to ${isCommit() ? "save local note" : batching ? "add to review" : "send"} · Esc to close</span>`
+        + `<div class="bar"><span class="hint">Markdown · Ctrl+Enter to ${batching ? "add to review" : "send"} · Esc to close</span>`
         + `<button data-action="cancel" data-key="${k}">Cancel</button>`
         + `${buttons}</div>`
         + `</div>`;
@@ -1292,8 +1284,6 @@ function deliveryHtml(m) {
     if (!d) return "";
     const resend = (label) => `<button class="link" data-action="retry" data-message="${esc(m.messageId)}">${label}</button>`;
     switch (d.state) {
-        case "local":
-            return `<span class="delivery">Local note · not sent</span>`;
         case "draft":
             return `<span class="delivery draft" title="Held until you submit the review">Draft · <button class="link" data-action="send-draft" data-message="${esc(m.messageId)}">Send now</button>`
                 + ` · <button class="link" data-action="discard-draft" data-message="${esc(m.messageId)}">Discard</button></span>`;
@@ -1385,7 +1375,6 @@ function threadHtml(t, { showLocation = false } = {}) {
 
 // Explains an empty diff and, for pending changes, offers the way back to the full branch diff.
 function emptyDiffHtml() {
-    if (isCommit() && !state.snapshot?.files.length) return `<div class="card empty-diff">This commit has no file changes against its first parent (or empty tree).</div>`;
     const files = state.snapshot?.files;
     if (!files || files.length) return "";
     if (scopeOf(state.review) === "pending") {
@@ -1411,17 +1400,14 @@ function overviewView() {
             + (lastUser ? deliveryHtml(lastUser) : "")
             + `</div>`;
     };
-    const revs = [...r.revisions].reverse().slice(0, 8).map((x) => `<div class="list-row"><span class="mono">${esc(x.revisionId)}</span><span class="snippet">${esc(ago(x.createdAt))} · ${x.files} files · +${x.additions} −${x.deletions} · HEAD ${esc((x.headCommit ?? "").slice(0, 10))}</span></div>`).join("");
     return emptyDiffHtml()
-        + agentReviewsHtml()
         + descriptionHtml()
         + `<h2>Overall discussion</h2>`
         + (overall.length ? overall.map((t) => threadHtml(t)).join("") : `<div class="empty">No overall comments yet.</div>`)
-        + `<div class="thread">${composerHtml("overview:new", { kind: "overview", label: isCommit() ? "Local commit notes" : "Discuss the change or request description edits", placeholder: isCommit() ? "Write a local note about this commit..." : "Ask to revise the description, discuss the design, or request a change…", alwaysOpen: true })}</div>`
+        + `<div class="thread">${composerHtml("overview:new", { kind: "overview", label: "Discuss the change or request description edits", placeholder: "Ask to revise the description, discuss the design, or request a change…", alwaysOpen: true })}</div>`
         + (unplaced.length ? `<h2>Comments outside the current diff (${unplaced.length})</h2>${unplaced.map((t) => threadHtml(t, { showLocation: true })).join("")}` : "")
         + `<h2>Active threads (${active.length})</h2><div class="card">${active.length ? active.map(listRow).join("") : `<div class="empty">No active threads. Select lines in a file to comment.</div>`}</div>`
-        + (done.length ? `<h2>Closed threads (${done.length})</h2>${done.map((t) => threadHtml(t, { showLocation: true })).join("")}` : "")
-        + `<h2>Revisions</h2><div class="card">${revs || `<div class="empty">No revisions.</div>`}</div>`;
+        + (done.length ? `<h2>Closed threads (${done.length})</h2>${done.map((t) => threadHtml(t, { showLocation: true })).join("")}` : "");
 }
 
 function lessonsEmptyHint() {
@@ -1712,6 +1698,9 @@ async function onClick(e) {
             case "agent-review-save-defaults":
                 await startAgentReview(true);
                 break;
+            case "agent-review-apply-skills":
+                applyReviewSkills();
+                break;
             case "agent-review-start":
                 await startAgentReview();
                 break;
@@ -1849,35 +1838,15 @@ async function onClick(e) {
             case "scope":
                 await switchScope(target.dataset.scope);
                 break;
-            case "commit":
-                await switchScope("commit", target.dataset.commit);
-                break;
-            case "commits-more": {
-                if (state.loadingCommits || state.switching || state.nextCommitOffset === null) break;
-                const repoRoot = state.review?.repoRoot;
-                const tip = state.commits[0]?.commit;
-                const offset = state.nextCommitOffset;
-                state.loadingCommits = true;
-                renderSide();
-                try {
-                    const catalog = await api("GET", `commits?offset=${offset}`);
-                    if (state.review?.repoRoot !== repoRoot || state.commits[0]?.commit !== tip || state.nextCommitOffset !== offset) break;
-                    state.commits.push(...catalog.commits);
-                    state.nextCommitOffset = catalog.nextOffset;
-                } finally {
-                    state.loadingCommits = false;
-                    renderSide();
-                }
-                break;
-            }
-            case "review-skills":
-                await openReviewSkills();
-                break;
-            case "review-skills-save":
-                await saveReviewSkills();
-                break;
             case "review-skills-refresh":
                 await refreshReviewSkills();
+                break;
+            case "review-tab":
+                if (state.dialog?.type === "agent-review" && state.dialog.tab !== target.dataset.tab) {
+                    state.dialog.tab = target.dataset.tab === "skills" ? "skills" : "general";
+                    renderDialog();
+                    focusIn(`#dialog [data-action="review-tab"][data-tab="${state.dialog.tab}"]`);
+                }
                 break;
             case "configure":
                 openConfigure();
@@ -1909,13 +1878,17 @@ async function onClick(e) {
 
 async function onChange(e) {
     const el = e.target;
-    if (el.name === "review-skill-defaults" && state.dialog?.type === "review-skills") {
-        state.dialog.saveDefaults = el.checked;
+    if (el.name === "review-skill-defaults" && state.dialog?.type === "agent-review") {
+        state.dialog.saveSkillDefaults = el.checked;
+        renderDialog();
+        focusIn(`#dialog input[name="${el.name}"]`);
         return;
     }
-    if (el.name === "review-skill" && state.dialog?.type === "review-skills") {
-        if (el.checked) state.dialog.names.add(el.value);
-        else state.dialog.names.delete(el.value);
+    if (el.name === "review-skill" && state.dialog?.type === "agent-review") {
+        const names = new Set(state.dialog.skillNames ?? []);
+        if (el.checked) names.add(el.value);
+        else names.delete(el.value);
+        state.dialog.skillNames = (state.dialog.skillCatalog?.skills.map((skill) => skill.name) ?? [...names]).filter((name) => names.has(name));
         return;
     }
     if ((el.name === "review-save-defaults" || el.name === "review-skip-dialog") && state.dialog?.type === "agent-review") {

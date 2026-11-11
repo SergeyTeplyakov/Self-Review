@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { copyFileSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { copyFileSync, cpSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -40,3 +40,4 @@ for (const file of readdirSync(legacyLibrary)) {
 for (const asset of ["app.js", "index.html", "styles.css"]) {
     copyFileSync(path.join(extensionRoot, "web", asset), path.join(webOutput, asset));
 }
+cpSync(path.join(extensionRoot, "bundled-skills"), path.join(distributionRoot, "bundled-skills"), { recursive: true });

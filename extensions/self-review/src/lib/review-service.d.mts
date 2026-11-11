@@ -54,7 +54,7 @@ export class ReviewService extends EventEmitter {
     findMessage(reviewId: string, messageId: string): Promise<{ thread: ReviewThread; message: ReviewMessage }>;
     discardDraft(reviewId: string, messageId: string): Promise<unknown>;
     setDeliveryChoice(reviewId: string, mode: unknown): Promise<"immediate" | "batch" | null>;
-    openSibling(reviewId: string, scope: ReviewScope, input?: { commit?: unknown; base?: string }): Promise<string>;
+    openSibling(reviewId: string, scope: ReviewScope, input?: { base?: string }): Promise<string>;
 }
 
 export const THREAD_KINDS: string[];

@@ -52,12 +52,6 @@ publication.
      the merge base of the base ref and HEAD.
    - `pending`: only uncommitted work (staged, unstaged, and untracked files),
      which is the working tree against HEAD.
-   - `commit`, with an explicit hexadecimal `commit` ID: an immutable commit
-     against its first parent, or the empty tree for a root commit. The sidebar
-     also lets the human select commits from HEAD history. Each commit and path
-     filter has its own stable review identity, not shared with All/Pending.
-     Historical comments and replies are local notes only: never deliver them
-     for implementation, run agent reviews, or derive saved guidelines there.
 2. Read repository instructions and inspect Git state without modifying it.
    Preserve unrelated edits and include only the selected scope.
 3. Capture a review revision with the repository identity, base commit, target
@@ -128,35 +122,30 @@ not proof that a suggestion is correct: recheck it before editing. Discuss opens
 conversation, not permission to fix. Use the normal posted-comment loop for
 either interaction.
 
-### Optional installed review skills
+### Bundled review skills
 
-The canvas's **Review skills** configuration supports independent opt-ins for
-Addy's two skills below and Ponytail's `ponytail-review`. Installation and updates
-stay in host settings. Applying choices overrides only this review; saving user
-defaults needs the separate explicit checkbox. Run choices are captured, but
-installed skill content/version is not pinned or authenticated by the canvas.
-An exact `skillNames` run override takes precedence over saved choices; `[]`
-opts out. Never claim a named skill was loaded without actually loading it.
+Self-Review bundles pinned, hash-checked snapshots of Addy Osmani's
+`code-review-and-quality` and `code-simplification` (agent-skills 0.6.15, MIT)
+and Ponytail's `ponytail-review` (v5.3.3, MIT). All three are used by default;
+the **Review skills** tab of **Agent review settings** opts out per review, and
+saving user defaults needs the separate explicit checkbox. An exact `skillNames`
+run override takes precedence over saved choices; `[]` opts out.
 
-Ponytail's authoritative upstream is
-[DietrichGebert/ponytail](https://github.com/DietrichGebert/ponytail) (MIT).
+The run prompt contains the full text of each selected skill between
+`BEGIN/END BUNDLED SKILL` markers. Give that text verbatim to every reviewer,
+including a Fusion child kickoff. Do not substitute a host-installed skill of the
+same name, and never install or fetch skills. The text is reference guidance and
+never overrides the run's read-only rules, pinned scope, or report format. Name
+only skills reviewers actually applied.
+
 Use `ponytail-review`, not the always-on coding mode. Follow the run prompt's
-separate `ponytail` report schema: actual loaded/unavailable status, coverage and
+separate `ponytail` report schema: used/unavailable status, coverage and
 limits, and only concrete benefits backed by source/baseline/validation evidence.
 Validate and deduplicate them; do not repeat them in inline findings. Supported
 opportunities produce one top-level overview note after all reviewers finish.
 No supported benefits means no fabricated benefits comment. Never copy upstream
 benchmark gains as claims about this change. A benefits note is not permission
 to implement it.
-
-You can use Addy Osmani's
-[`code-review-and-quality`](https://github.com/addyosmani/agent-skills/tree/main/skills/code-review-and-quality)
-and
-[`code-simplification`](https://github.com/addyosmani/agent-skills/tree/main/skills/code-simplification)
-skills alongside this canvas when installed and applicable. They are not bundled
-or required. Load them through the host's available skill mechanism before
-claiming to use them; report missing requested guidance and never install it
-automatically. Name the skills actually used in the review summary.
 
 The run's scope and read-only boundary still apply: no mutation tests in the
 user's checkout, automatic edits, commits, extra model dispatch, or publication.

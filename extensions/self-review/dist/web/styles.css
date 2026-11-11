@@ -150,6 +150,13 @@ select {
 .review-lane-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
 .feedback-draft-count { color: var(--mr-muted); }
 button.agent-review-launch { padding: 7px 14px; font-weight: 600; }
+.skill-group { display: flex; flex-direction: column; gap: 6px; }
+.review-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--mr-border); margin: 4px 0 12px; }
+.review-tab { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none; padding: 6px 10px; color: var(--mr-muted); }
+.review-tab[aria-selected="true"] { border-bottom-color: var(--mr-accent); color: var(--mr-fg); font-weight: 600; }
+.skill-choice code { font-size: var(--text-code-inline, 12px); }
+.skill-group-name { margin: 0; font-weight: 600; }
+.review-skills-section > button { align-self: flex-start; }
 button:focus-visible { outline: 2px solid var(--color-focus-outline, var(--mr-accent)); outline-offset: 2px; }
 .review-summary { white-space: pre-wrap; overflow-wrap: anywhere; }
 .mono { font-family: var(--mr-mono); }
@@ -232,7 +239,6 @@ a.pill:hover { text-decoration: underline; }
     border-left: 3px solid transparent;
 }
 .nav-item:hover { background: var(--mr-subtle); }
-button.nav-item { width: 100%; text-align: left; border-radius: 0; }
 .nav-item.active { background: var(--mr-accent-muted); border-left-color: var(--mr-accent); }
 .nav-item .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .nav-item .dir { color: var(--mr-muted); }

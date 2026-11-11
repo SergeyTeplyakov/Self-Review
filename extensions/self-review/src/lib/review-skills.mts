@@ -1,28 +1,37 @@
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { ReviewError } from "./review-service.mjs";
 import type { SettingsStore } from "../../types/contracts.js";
 
 export const REVIEW_SKILLS = ["code-review-and-quality", "code-simplification", "ponytail-review"];
-export const SKILLS_UPSTREAM = "https://github.com/addyosmani/agent-skills";
+export const BUNDLED_SKILLS_ROOT = new URL("../bundled-skills/", import.meta.url);
 
-export interface InstalledHostSkill {
+export interface BundledSkillManifestEntry {
     name: string;
-    enabled: boolean;
-    source: string;
-    declaredName?: string;
-    commandName?: string;
-    path?: string;
-    pluginName?: string;
+    role: "review" | "ponytail";
+    title: string;
+    summary: string;
+    path: string;
+    sha256: string;
+    upstream: { repository: string; release: string; releaseCommit: string; path: string; fileCommit: string };
+    license: { spdx: string; files: string[] };
+    modified: boolean;
+    attribution?: string;
 }
 
-export interface ReviewSkillInstallation {
+// What a run records: provenance of the bundled snapshot, never its content.
+export interface RunSkill {
     name: string;
-    enabled: boolean;
-    source: string;
-    role: "ponytail" | "review";
-    path: string | null;
-    pluginName: string | null;
-    version: null;
-    selected: boolean;
+    role: "review" | "ponytail";
+    bundled: true;
+    release: string;
+    releaseCommit: string;
+    fileCommit: string;
+    sha256: string;
+}
+
+export interface RunSkillWithContent extends RunSkill {
+    content: string;
 }
 
 function selectedNames(value: unknown, message: string): string[] {
@@ -33,69 +42,85 @@ function selectedNames(value: unknown, message: string): string[] {
     return value;
 }
 
-// Discovery and activation stay with the host. This service never reads or writes skill files.
+// Older settings stored host installation names such as "plugin:code-simplification".
+function canonical(names: string[]): string[] {
+    return [...new Set(names.map((name) => name.split(":").at(-1) ?? name).filter((name) => REVIEW_SKILLS.includes(name)))];
+}
+
+// The review skills ship with Self-Review as pinned upstream snapshots, so no host skill API is involved.
 export class ReviewSkills {
     private readonly store: SettingsStore;
-    list: () => Promise<{ skills: InstalledHostSkill[] }>;
+    private readonly root: URL;
+    private manifest?: Promise<BundledSkillManifestEntry[]>;
 
-    constructor({ store, list }: {
-        store: SettingsStore;
-        list: () => Promise<{ skills: InstalledHostSkill[] }>;
-    }) {
+    constructor({ store, root = BUNDLED_SKILLS_ROOT }: { store: SettingsStore; root?: URL }) {
         this.store = store;
-        this.list = list;
+        this.root = root;
+    }
+
+    private entries(): Promise<BundledSkillManifestEntry[]> {
+        this.manifest ??= readFile(new URL("manifest.json", this.root), "utf8").then((text) => {
+            const skills = (JSON.parse(text) as { skills: BundledSkillManifestEntry[] }).skills;
+            if (REVIEW_SKILLS.some((name) => !skills.some((skill) => skill.name === name))) {
+                throw new ReviewError("conflict", "The bundled review skill manifest is incomplete.");
+            }
+            return REVIEW_SKILLS.map((name) => skills.find((skill) => skill.name === name)!);
+        });
+        return this.manifest;
+    }
+
+    // Unset defaults mean every bundled skill; a saved list, including [], is an explicit choice.
+    private async defaults(): Promise<{ selected: string[]; saved: boolean }> {
+        const saved = (await this.store.readSettings()).reviewSkills;
+        if (saved === undefined) return { selected: [...REVIEW_SKILLS], saved: false };
+        return { selected: canonical(selectedNames(saved, "Saved review skill choices are invalid.")), saved: true };
+    }
+
+    private validate(input: unknown): string[] {
+        const names = selectedNames(input, "Select at most three distinct review skills.");
+        const unknown = names.find((name) => !REVIEW_SKILLS.includes(name));
+        if (unknown !== undefined) throw new ReviewError("invalid_input", `Unknown review skill ${unknown}. Choose from ${REVIEW_SKILLS.join(", ")}.`);
+        return names;
     }
 
     async read(names?: unknown) {
-        const selected = selectedNames(names ?? (await this.store.readSettings()).reviewSkills ?? [],
-            "Saved review skill choices are invalid.");
-        const { skills } = await this.list();
+        const defaults = await this.defaults();
+        const selected = names === undefined ? defaults.selected : this.validate(names);
+        const entries = await this.entries();
         return {
-            upstream: SKILLS_UPSTREAM, license: "MIT", scope: "Self-Review user preference", selected,
-            skills: REVIEW_SKILLS.map((name) => ({
-                name,
-                upstream: name === "ponytail-review" ? "https://github.com/DietrichGebert/ponytail" : SKILLS_UPSTREAM,
-                installations: skills.filter((skill) => (skill.declaredName ?? skill.commandName ?? skill.name).split(":").at(-1) === name
-                    || skill.name.split(":").at(-1) === name).map((skill): ReviewSkillInstallation => ({
-                    name: skill.name, enabled: skill.enabled === true, source: skill.source,
-                    role: name === "ponytail-review" ? "ponytail" : "review",
-                    path: skill.path ?? null, pluginName: skill.pluginName ?? null,
-                    version: null, selected: selected.includes(skill.name),
-                })),
+            bundled: true, scope: "Self-Review user preference", selected,
+            defaults,
+            skills: entries.map((entry) => ({
+                name: entry.name, role: entry.role, title: entry.title, summary: entry.summary,
+                upstream: entry.upstream, license: entry.license, modified: entry.modified,
+                attribution: entry.attribution ?? null, sha256: entry.sha256,
+                selected: selected.includes(entry.name),
             })),
         };
     }
 
     async update(input: unknown, { saveDefaults = true }: { saveDefaults?: boolean } = {}) {
-        const names = selectedNames(input, "Select at most three distinct installed review skills.");
-        const catalog = await this.read();
-        const available = catalog.skills.flatMap((skill) => skill.installations);
-        if (catalog.skills.some((skill) => skill.installations.filter((entry) => names.includes(entry.name)).length > 1)) {
-            throw new ReviewError("invalid_input", "Select only one installation of each review skill.");
-        }
-        for (const name of names) {
-            if (!available.some((skill) => skill.name === name && skill.enabled)) {
-                throw new ReviewError("conflict", `Skill ${name} is unavailable or disabled in the host. Refresh the catalog.`);
-            }
-        }
+        const names = this.validate(input);
         if (saveDefaults) await this.store.updateSettings((settings) => { settings.reviewSkills = names; });
         return this.read(names);
     }
 
-    async forRun(names?: unknown): Promise<ReviewSkillInstallation[]> {
-        const selected = selectedNames(names ?? (await this.store.readSettings()).reviewSkills ?? [],
-            "Saved review skill choices are invalid.");
-        // An older host without skill discovery must still support reviews when no skills are selected.
-        if (selected.length === 0) return [];
-        const catalog = await this.read(selected);
-        if (catalog.skills.some((skill) => skill.installations.filter((entry) => selected.includes(entry.name)).length > 1)) {
-            throw new ReviewError("invalid_input", "Select only one installation of each review skill.");
+    private async content(entry: BundledSkillManifestEntry): Promise<string> {
+        const text = (await readFile(new URL(entry.path, this.root), "utf8")).replace(/\r\n/g, "\n");
+        if (createHash("sha256").update(text).digest("hex") !== entry.sha256) {
+            throw new ReviewError("conflict", `Bundled review skill ${entry.name} does not match its pinned snapshot. Reinstall Self-Review.`);
         }
-        const available = catalog.skills.flatMap((skill) => skill.installations);
-        return selected.map((name) => {
-            const skill = available.find((entry) => entry.name === name && entry.enabled);
-            if (!skill) throw new ReviewError("conflict", `Selected review skill ${name} is unavailable or disabled. Change the review skill settings before running.`);
-            return skill;
-        });
+        return text;
+    }
+
+    async forRun(names?: unknown): Promise<RunSkillWithContent[]> {
+        const selected = names === undefined ? (await this.defaults()).selected : this.validate(names);
+        const entries = (await this.entries()).filter((entry) => selected.includes(entry.name));
+        return Promise.all(entries.map(async (entry) => ({
+            name: entry.name, role: entry.role, bundled: true as const,
+            release: entry.upstream.release, releaseCommit: entry.upstream.releaseCommit,
+            fileCommit: entry.upstream.fileCommit, sha256: entry.sha256,
+            content: await this.content(entry),
+        })));
     }
 }
