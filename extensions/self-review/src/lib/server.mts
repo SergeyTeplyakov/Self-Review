@@ -407,6 +407,7 @@ export async function startReviewServer({
                 ? await service.ensureReview({ repoPath: current.repoRoot, scope: body.scope, paths: current.paths, exclude: current.exclude }, { cwd: current.repoRoot })
                 : await service.openSibling(body.scope === "commit" ? reviewId : originId ?? reviewId, body.scope, { commit: body.commit });
             if (nextId !== reviewId) {
+                if (current.scope === "commit" && nextId === originId) await service.refresh(nextId);
                 await bindReview(nextId, reviewId);
                 await onReviewChange(nextId);
                 service.changed(nextId, "scope");

@@ -51,9 +51,10 @@ const clicker = (app) => (action, dataset = {}) => {
 test("commit tree selection shows immutable local-note mode and resets previous review state", async () => {
     const posts = [];
     const historical = reviewFixture({ reviewId: "commit-review", scope: "commit", commit: "a".repeat(40) });
+    const commits = [historical.commit, "b".repeat(40)].map((commit) => ({ commit, subject: commit, author: "A", date: "today" }));
     const app = await loadApp({ fetch: async (url, options) => {
         if (options?.method === "POST") { posts.push(JSON.parse(options.body)); return jsonResponse({}); }
-        return jsonResponse(url.includes("snapshot/") ? { revisionId: "r1", files: [] } : { review: historical, commits: [] });
+        return jsonResponse(url.includes("snapshot/") ? { revisionId: "r1", files: [] } : { review: historical, commits });
     } });
     app.state.review = reviewFixture();
     app.run("renderRuler = () => {}");
@@ -68,11 +69,57 @@ test("commit tree selection shows immutable local-note mode and resets previous 
     assert.deepEqual(posts[0], { scope: "commit", commit: historical.commit });
     assert.equal(app.state.content.size, 0);
     assert.equal(app.state.open.size, 0);
+    assert.match(app.node("#side").innerHTML, /data-action="commit"/);
+    assert.doesNotMatch(app.node("#side").innerHTML, /data-action="commit"[^>]* disabled/, "commit buttons must be re-enabled after the scope switch");
     app.run("renderTop()");
     assert.match(app.node("#top").innerHTML, /local notes only/);
     assert.doesNotMatch(app.node("#top").innerHTML, /data-action="agent-review"|data-action="configure"|data-action="submit-review"/);
     assert.match(app.run('composerHtml("overview:new", {kind:"overview"})'), /Save local note/);
     assert.doesNotMatch(app.run("descriptionHtml()"), /discuss-description/);
+});
+
+test("history pagination coalesces repeated clicks and re-enables navigation after a page loads", async () => {
+    let finish;
+    const requests = [];
+    const app = await loadApp({ fetch: (url) => {
+        requests.push(url);
+        return new Promise((resolve) => { finish = (data) => resolve(jsonResponse(data)); });
+    } });
+    app.state.review = reviewFixture({ repoRoot: "C:\\repo-a" });
+    app.state.commits = [{ commit: "a".repeat(40), subject: "tip" }];
+    app.state.nextCommitOffset = 50;
+    const click = clicker(app);
+    const first = click("commits-more");
+    await click("commits-more");
+    assert.equal(requests.length, 1);
+    assert.match(requests[0], /commits\?offset=50/);
+    assert.match(app.node("#side").innerHTML, /data-action="commits-more" disabled/);
+    finish({ commits: [{ commit: "b".repeat(40), subject: "older" }], nextOffset: 100 });
+    await first;
+    assert.deepEqual(app.read("state.commits.map(entry => entry.subject)"), ["tip", "older"]);
+    assert.equal(app.state.nextCommitOffset, 100);
+    assert.doesNotMatch(app.node("#side").innerHTML, /data-action="commits-more" disabled/);
+});
+
+test("history pages are discarded when the repository, history tip, or page offset changes", async () => {
+    for (const changed of ["repository", "tip", "offset"]) {
+        let finish;
+        const app = await loadApp({ fetch: () => new Promise((resolve) => { finish = (data) => resolve(jsonResponse(data)); }) });
+        app.state.review = reviewFixture({ repoRoot: "C:\\repo-a" });
+        app.state.commits = [{ commit: "a".repeat(40), subject: "original" }];
+        app.state.nextCommitOffset = 50;
+        const pending = clicker(app)("commits-more");
+        if (changed === "repository") app.state.review = reviewFixture({ reviewId: "other", repoRoot: "C:\\repo-b" });
+        if (changed === "tip") app.state.commits = [{ commit: "b".repeat(40), subject: "new tip" }];
+        if (changed === "offset") app.state.nextCommitOffset = 100;
+        const before = app.read("state.commits");
+        const offset = app.state.nextCommitOffset;
+        finish({ commits: [{ commit: "c".repeat(40), subject: "stale page" }], nextOffset: null });
+        await pending;
+        assert.deepEqual(app.read("state.commits"), before, changed);
+        assert.equal(app.state.nextCommitOffset, offset, changed);
+        assert.equal(app.state.loadingCommits, false, changed);
+    }
 });
 
 test("review skill configuration reports provenance and saves opt-in without starting reviews", async () => {
@@ -95,6 +142,36 @@ test("review skill configuration reports provenance and saves opt-in without sta
     assert.deepEqual(posts[0][1], { names: ["plugin:code-review-and-quality"], saveDefaults: false });
     assert.deepEqual([...app.state.skillOverrides.get("r")], ["plugin:code-review-and-quality"]);
     assert.equal(app.state.dialog, null);
+});
+
+test("refreshing installed skills preserves unsaved selections through success and discovery failures", async () => {
+    let fail = false;
+    const posts = [];
+    const catalog = { selected: ["ponytail-review"], skills: [
+        { name: "ponytail-review", installations: [{ name: "ponytail-review", enabled: true, source: "custom" }] },
+        { name: "code-review-and-quality", installations: [{ name: "code-review-and-quality", enabled: true, source: "custom" }] },
+    ] };
+    const app = await loadApp({ fetch: async (url, options) => {
+        if (options?.method === "POST") posts.push(JSON.parse(options.body));
+        if (fail) throw new Error("Host discovery failed");
+        return jsonResponse(catalog);
+    } });
+    app.state.review = reviewFixture();
+    const click = clicker(app);
+    await click("review-skills");
+    assert.deepEqual([...app.state.dialog.names], ["ponytail-review"]);
+    await app.run("onChange")({ target: { name: "review-skill", value: "ponytail-review", checked: false } });
+    await app.run("onChange")({ target: { name: "review-skill", value: "code-review-and-quality", checked: true } });
+    await click("review-skills-refresh");
+    assert.deepEqual([...app.state.dialog.names], ["code-review-and-quality"]);
+    fail = true;
+    await click("review-skills-refresh");
+    assert.match(app.node("#dialog").innerHTML, /Host discovery failed/);
+    assert.deepEqual([...app.state.dialog.names], ["code-review-and-quality"]);
+    fail = false;
+    await click("review-skills-refresh");
+    await click("review-skills-save");
+    assert.deepEqual(posts, [{ names: ["code-review-and-quality"], saveDefaults: false }]);
 });
 
 test("skill defaults require explicit opt-in and per-review choices reach one-click runs", async () => {

@@ -37,6 +37,7 @@ const state = {
     commits: [],
     commitsError: "",
     nextCommitOffset: null,
+    loadingCommits: false,
     reviewSkillsAvailable: false,
     skillOverrides: new Map(),
     approving: new Set(),
@@ -880,9 +881,12 @@ async function refreshReviewSkills() {
     d.error = "";
     renderDialog();
     try {
+        const firstLoad = !d.catalog;
         d.catalog = await api("GET", "review-skills");
-        d.names = new Set(d.previous?.skillNames ?? state.skillOverrides.get(d.reviewId)
-            ?? d.catalog.selected ?? d.catalog.skills.flatMap((skill) => skill.installations).filter((entry) => entry.selected).map((entry) => entry.name));
+        if (firstLoad) {
+            d.names = new Set(d.previous?.skillNames ?? state.skillOverrides.get(d.reviewId)
+                ?? d.catalog.selected ?? d.catalog.skills.flatMap((skill) => skill.installations).filter((entry) => entry.selected).map((entry) => entry.name));
+        }
     } catch (err) {
         d.error = err.message;
     } finally {
@@ -1144,6 +1148,7 @@ async function switchScope(scope, commit) {
     } finally {
         state.switching = false;
         renderTop();
+        renderSide();
     }
 }
 
@@ -1220,7 +1225,7 @@ function renderSide() {
     const commitRows = state.commits.map((entry) => `<button class="nav-item${r.commit === entry.commit ? " active" : ""}" type="button" role="treeitem" aria-selected="${r.commit === entry.commit}" data-action="commit" data-commit="${esc(entry.commit)}" title="${esc(`${entry.commit} · ${entry.author} · ${entry.date}`)}"${state.switching ? " disabled" : ""}><span class="mono">${esc(entry.commit.slice(0, 8))}</span> <span class="name">${esc(entry.subject)}</span></button>`).join("");
     html.splice(html.length - 1, 0, `<div class="section">Commits (HEAD history)</div><div role="tree" aria-label="Commits">${commitRows}</div>`
         + (state.commitsError ? `<div class="side-empty" role="alert">${esc(state.commitsError)}</div>` : "")
-        + (state.nextCommitOffset !== null ? `<button data-action="commits-more">Older commits</button>` : ""));
+        + (state.nextCommitOffset !== null ? `<button data-action="commits-more"${state.loadingCommits || state.switching ? " disabled" : ""}>Older commits</button>` : ""));
     if (files.length) {
         html.push(
             `<div class="tree-controls"><button class="link" data-action="fold-tree" data-fold="1">Collapse all</button><button class="link" data-action="fold-tree" data-fold="0">Expand all</button></div>`,
@@ -1848,10 +1853,21 @@ async function onClick(e) {
                 await switchScope("commit", target.dataset.commit);
                 break;
             case "commits-more": {
-                const catalog = await api("GET", `commits?offset=${state.nextCommitOffset}`);
-                state.commits.push(...catalog.commits);
-                state.nextCommitOffset = catalog.nextOffset;
+                if (state.loadingCommits || state.switching || state.nextCommitOffset === null) break;
+                const repoRoot = state.review?.repoRoot;
+                const tip = state.commits[0]?.commit;
+                const offset = state.nextCommitOffset;
+                state.loadingCommits = true;
                 renderSide();
+                try {
+                    const catalog = await api("GET", `commits?offset=${offset}`);
+                    if (state.review?.repoRoot !== repoRoot || state.commits[0]?.commit !== tip || state.nextCommitOffset !== offset) break;
+                    state.commits.push(...catalog.commits);
+                    state.nextCommitOffset = catalog.nextOffset;
+                } finally {
+                    state.loadingCommits = false;
+                    renderSide();
+                }
                 break;
             }
             case "review-skills":

@@ -342,7 +342,7 @@ export class ReviewService extends EventEmitter {
             });
         }
         if (scopeOf(source) === "commit") {
-            return this.ensureReview({ repoPath: source.repoRoot, scope: target, base: requestedBase ?? source.base, paths: source.paths, exclude: source.exclude });
+            return this.ensureReview({ repoPath: source.repoRoot, scope: target, base: requestedBase, paths: source.paths, exclude: source.exclude });
         }
         if (target === scopeOf(source)) return reviewId;
         if (source.siblingReviewId && !requestedBase) {

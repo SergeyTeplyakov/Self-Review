@@ -136,7 +136,7 @@ test("commit scopes pin both sides, exclude pending work, and isolate local note
     await service.refresh(commitId);
     assert.equal((await service.getReview(commitId)).revisions.length, 1);
     assert.equal(await service.openSibling(commitId, "all"), branchId);
-    assert.equal(await service.openSibling(commitId, "pending"), pendingId);
+    assert.equal(await service.openSibling(commitId, "pending", { base: "main" }), pendingId);
     assert.equal((await service.getReview(branchId)).threads.length, 0);
     assert.equal((await service.getReview(pendingId)).threads.length, 0);
     assert.equal(await service.ensureReview({ repoPath: repo, scope: "commit", commit: commit.slice(0, 10), base: "other-base" }), commitId, "canonical SHA identity does not depend on base labels");
@@ -258,6 +258,41 @@ test("each canvas preserves its own return review across provider restarts and d
     assert.equal(await restartedStore.getInstanceReview("legacy"), otherId);
     await restartedStore.setInstanceReview("legacy", otherId, firstId);
     assert.deepEqual(await restartedStore.getInstanceContext("legacy"), { reviewId: otherId, returnReviewId: firstId });
+});
+
+test("native commit reopening infers the current base instead of reusing the commit record's first base", async () => {
+    const { service } = fresh();
+    const commit = (await runGit(repo, ["rev-parse", "HEAD"])).stdout.trim();
+    const commitId = await service.ensureReview({ repoPath: repo, scope: "commit", commit, base: "HEAD" });
+    const allId = await service.ensureReview({ reviewId: commitId, scope: "all" });
+    assert.equal((await service.getReview(allId)).base, "main");
+    assert.ok((await service.getSnapshot(allId)).files.some((file) => file.path === "committed.txt"));
+    const explicitId = await service.ensureReview({ reviewId: commitId, scope: "all", base: "HEAD~1" });
+    assert.equal((await service.getReview(explicitId)).base, "HEAD~1");
+    const pendingId = await service.ensureReview({ reviewId: commitId, scope: "pending" });
+    assert.equal((await service.getReview(pendingId)).base, null);
+});
+
+test("returning from history refreshes the originating working scope before displaying it", async () => {
+    for (const scope of ["all", "pending"]) {
+        const root = path.join(tmp, `restored-${scope}-${++seq}`);
+        await runGit(tmp, ["clone", "-q", "--no-hardlinks", repo, root]);
+        const { service } = fresh();
+        let reviewId = await service.ensureReview({ repoPath: root, scope, base: "HEAD~1" });
+        const originId = reviewId;
+        const commit = (await runGit(root, ["rev-parse", "HEAD"])).stdout.trim();
+        const delivery = new Delivery({ service, send: () => assert.fail("No agent dispatch") });
+        await withServer({ instanceId: `restored-${scope}`, getReviewId: () => reviewId, onReviewChange: (id) => { reviewId = id; }, service, delivery }, async ({ post }) => {
+            assert.equal((await post("/api/scope", { scope: "commit", commit })).status, 200);
+            await writeFile(path.join(root, "while-browsing.txt"), "new working-tree content\n");
+            assert.equal((await post("/api/scope", { scope })).status, 200);
+            assert.equal(reviewId, originId);
+            const review = await service.getReview(reviewId);
+            assert.equal(review.currentRevisionId, "r2");
+            const snapshot = await service.getSnapshot(reviewId);
+            assert.ok(snapshot.files.some((file) => file.path === "while-browsing.txt"), scope);
+        });
+    }
 });
 
 test("HTTP commit switching keeps notes local and rejects writes from the previous scope", async () => {
