@@ -2,6 +2,7 @@
 //
 // Builds a throwaway git repo, seeds a review through the same ReviewService the canvas
 // uses, serves the real web UI, and captures it with Playwright in light and dark themes.
+// The skill catalog is demo metadata, not an installation or a copy of third-party skills.
 //
 //   cd docs/screenshots
 //   npm install
@@ -22,6 +23,8 @@ import { ReviewService } from "../../extensions/self-review/dist/lib/review-serv
 import { Delivery } from "../../extensions/self-review/dist/lib/delivery.mjs";
 import { startReviewServer } from "../../extensions/self-review/dist/lib/server.mjs";
 import { SettingsService } from "../../extensions/self-review/dist/lib/settings.mjs";
+import { AgentReview } from "../../extensions/self-review/dist/lib/agent-review.mjs";
+import { ReviewSkills } from "../../extensions/self-review/dist/lib/review-skills.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WEB_ROOT = path.join(HERE, "..", "..", "extensions", "self-review", "dist", "web");
@@ -617,6 +620,38 @@ async function capture(browser, url, theme, resetLearning) {
     await page.locator('#top [data-action="scope"][data-scope="all"]').click();
     await page.locator('#top [data-scope="all"][aria-pressed="true"]:not([disabled])').waitFor();
 
+    await page.locator('#side [data-action="commit"]').first().click();
+    await page.getByText("Historical snapshot", { exact: false }).waitFor();
+    await nav(page, "file", "src/http/retry.ts");
+    await fitHeight(page, 1050);
+    await shot("commit");
+    await page.locator('#top [data-action="scope"][data-scope="all"]').click();
+    await page.locator('#top [data-scope="all"][aria-pressed="true"]:not([disabled])').waitFor();
+
+    const fitDialog = async () => {
+        await page.setViewportSize({ width: WIDTH, height: 1700 });
+        const height = await page.locator("#dialog .modal").evaluate((modal) => modal.scrollHeight);
+        await page.setViewportSize({ width: WIDTH, height: height + 64 });
+        await page.waitForTimeout(250);
+    };
+    await page.locator('#top [data-action="agent-review-configure"]').click();
+    await page.locator('#dialog select[name="review-focus"]').selectOption("both");
+    await page.locator('#dialog [data-action="review-skills"]').click();
+    await page.locator('#dialog input[name="review-skill"]').first().waitFor();
+    for (const checkbox of await page.locator('#dialog input[name="review-skill"]').all()) await checkbox.check();
+    if (await page.locator('#dialog input[name="review-skill-defaults"]').isChecked()) {
+        throw new Error("Skill defaults must remain an explicit opt-in.");
+    }
+    await fitDialog();
+    await shot("review-skills");
+    await page.locator('#dialog [data-action="review-skills-save"]').click();
+    await page.locator("#dialog").getByText("Selected for this review:", { exact: false }).waitFor();
+    await page.locator("#toast").waitFor({ state: "hidden" });
+    await fitDialog();
+    await shot("agent-review");
+    await page.locator('#dialog [data-action="dialog-cancel"]').click();
+    await page.locator("#dialog .modal").waitFor({ state: "detached" });
+
     // The per-repository settings: switch delivery to Batch before saving.
     await page.setViewportSize({ width: WIDTH, height: 1200 });
     await page.locator('#top [data-action="configure"]').click();
@@ -673,6 +708,16 @@ try {
     const { service, delivery } = seeded;
     let reviewId = seeded.reviewId;
     const settings = new SettingsService({ store: seeded.store });
+    const reviewSkills = new ReviewSkills({ store: seeded.store, list: async () => ({
+        skills: [
+            { name: "demo-agent-skills:code-review-and-quality", pluginName: "demo-agent-skills", source: "plugin", enabled: true },
+            { name: "demo-agent-skills:code-simplification", pluginName: "demo-agent-skills", source: "plugin", enabled: true },
+            { name: "demo-ponytail:ponytail-review", pluginName: "demo-ponytail", source: "plugin", enabled: true },
+        ],
+    }) });
+    const agentReview = new AgentReview({ service, settings, reviewSkills, send: async () => {
+        throw new Error("The screenshot fixture cannot dispatch agent reviews.");
+    } });
     // Every theme starts like a first run: the repository has no learning setting yet.
     const resetLearning = () => rm(seeded.store.settingsFile(), { force: true });
     server = await startReviewServer({
@@ -684,6 +729,8 @@ try {
         service,
         delivery,
         settings,
+        agentReview,
+        reviewSkills,
         webRoot: WEB_ROOT,
     });
     await mkdir(OUT, { recursive: true });
@@ -691,6 +738,7 @@ try {
     for (const theme of THEMES) {
         console.log(`${theme}:`);
         await capture(browser, server.url, theme, resetLearning);
+        if ((await service.getReview(seeded.reviewId)).agentReviews?.length) throw new Error("Screenshots must not start reviews.");
     }
     if (KEEP) {
         console.log(`\nDemo review: ${server.url}\nRepo: ${path.join(tmp, "orders-api")}\nPress Ctrl+C to stop.`);

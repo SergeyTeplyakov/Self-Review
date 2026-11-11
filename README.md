@@ -61,6 +61,14 @@ Review the whole branch against its base, or switch to **Pending changes** to lo
   <img alt="The pending scope: the title ends with (pending changes), Pending changes is selected, and only the two uncommitted files are listed." src="docs/images/pending-light.png">
 </picture>
 
+Select a historical commit in the sidebar to read its immutable diff against its
+first parent. Notes stay local to that commit; agent actions are unavailable.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/commit-dark.png">
+  <img alt="A selected commit in the history tree, with its immutable file diff and a local-notes-only banner." src="docs/images/commit-light.png">
+</picture>
+
 Learning from your feedback is optional and set per repository. The first review in a repository asks once.
 
 <picture>
@@ -92,6 +100,7 @@ Guidelines learned from your comments are collected in one place, with their sta
 ## How it works
 
 - **Scope.** **All changes**, the default, compares your working tree, including staged, unstaged, and untracked files, against the merge base with a base ref (`origin/HEAD`, `main`, or `master` by default), so it covers a whole branch or PR. **Pending changes** compares the working tree with `HEAD`, so it covers only what you haven't committed and needs no comparison base. When switching to All changes, a base is inferred or must be supplied explicitly. Each scope keeps its own threads, and you switch between them in the top bar. Narrow either one to paths or exclude files when you open it.
+- **Commit selection.** Select a commit in the sidebar's **Commits (HEAD history)** tree to show only that commit's files and diff. **Older commits** pages through history, 50 at a time. Comparisons use the first parent (including merge commits), or the empty tree for a genuine root commit. A shallow boundary with unavailable first-parent history reports an error instead of showing the entire tree as added; fetch or deepen that repository yourself before retrying. No checkout, reset, staging, or repository writes occur. File content comes from the immutable commit, never today's working tree. Each full commit ID and path filter has its own stable review ID, independent of branch/base selection; local notes never move into All/Pending threads. Commit comments and replies are local notes only: no delivery, agent review, fixes, or guideline learning. Switch back with **All changes** or **Pending changes**; each canvas remembers its own originating review across provider restarts, while directly opening another repository/commit resets that return context. Original threads and drafts remain in their original reviews.
 - **Comments.** Start a thread on the overview, a file, a change, or a line range on either side of the diff. Selecting a file shows the whole file with changes inline; selecting a folder shows only the diffs under it.
 - **Highlighting.** Code is syntax highlighted locally. Markdown stays as source, with every marker such as `**`, `#`, and `[text](url)` left in place, but headings, emphasis, inline code, links, lists, quotes, tables, and fenced code blocks are styled so prose changes are easy to read.
 - **Diff details.** Final-newline notes identify the affected side, file modes are shown explicitly, and file-to-symlink replacements keep both sides together. Untracked files are fingerprinted from their bytes, including binary and oversized files that cannot be displayed.
@@ -131,7 +140,38 @@ Validate candidate findings against the code and baseline. Keep the review read-
 If the skills are unavailable, say so and use the canvas's built-in review guidance.
 ```
 
-They are optional, not bundled dependencies, and nothing is downloaded or installed automatically. Follow the installation instructions in [Addy's agent-skills repository](https://github.com/addyosmani/agent-skills) for your client, then start a session that can discover them. A report should name only skills that were actually loaded. Using another skill does not authorize mutation tests in your checkout, automatic fixes, extra model calls, commits, or publication.
+**Review skills**, also available from the agentic review settings dialog, independently configures these two Addy skills and [Ponytail's `ponytail-review`](https://github.com/DietrichGebert/ponytail/tree/main/skills/ponytail-review), using the host's native session skill catalog. Choose installed, host-enabled entries for the current review; optionally check **Save these skill choices as user defaults across repositories**. Defaults live under `reviewSkills` in the local settings file. Per-review overrides live in the open page and are captured in each run, not saved globally; `skillNames: []` on `run_agent_review` explicitly opts out, while omission uses saved defaults. Neither applying choices nor saving defaults globally enables skills or runs a review. The dialog shows available/missing/disabled entries, exact invocation names, host source, plugin name and path where provided. Names alone do not authenticate upstream provenance. Both authoritative upstream collections are MIT-licensed; Self-Review does not redistribute their contents.
+
+Open **Review settings** in the **Agentic review** panel, then
+**Installed review skills → Configure installed review skills**. Select each
+Addy or Ponytail entry independently, and click **Apply skill choices** to return
+to the review dialog. These choices affect subsequent explicitly requested reviews,
+not a run already in progress. **Run review** is a separate, credit-consuming action.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/agent-review-dark.png">
+  <img alt="Agentic Review Settings with models, focus, an Installed review skills section naming Addy and Ponytail, and selected skill names." src="docs/images/agent-review-light.png">
+</picture>
+
+The following captures use the real renderer and services with a **demo skill
+catalog**; the screenshot generator does not install skills or run a model.
+Available entries and exact invocation names depend on your host.
+The user-defaults checkbox is deliberately unchecked.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/review-skills-dark.png">
+  <img alt="Independent checkboxes for Addy's review and simplification skills and Ponytail review, with host metadata, unknown version disclosure, and an unchecked save-user-defaults option." src="docs/images/review-skills-light.png">
+</picture>
+
+Addy's selected skills guide normal review findings. Ponytail review is distinct from the session-wide `ponytail` coding mode: its upstream read-only workflow checks correctness, safety/load/tests, and lean alternatives. In Self-Review, selected reviewers report separately whether it was actually loaded and list only validated simplification opportunities with concrete benefits and source/baseline/validation evidence. After all selected reviewers finish, supported opportunities are deduplicated into **one top-level overview note**, not inline comments or approvable fixes. The complete evidence remains in each run's Ponytail details. With no supported benefits, no benefits comment is created; the run explicitly shows absence or unavailable guidance. Proposed savings are not implemented or measured outcomes, and upstream benchmark numbers do not establish benefits for your change.
+
+Installation, update consent, and activation stay in the host's skill/plugin settings. After managing them there, refresh the catalog in Self-Review. Nothing is downloaded, bundled, overwritten, or updated by Self-Review, so local customizations remain untouched. The host does not report installed version/source revision through this API; the dialog explicitly marks it unknown rather than inventing a version. Run records capture selected names and reported provenance, not skill content or a pinned version: the host loads the current installed content at invocation. If selected guidance becomes unavailable/disabled or discovery fails, a run fails explicitly before dispatch; unconfigured reviews still work on older hosts without discovery. A report should name only skills actually loaded. Skills do not authorize mutation tests, automatic fixes, extra model calls, commits, publication, or paid reviews; each run still requires explicit authorization.
+
+If **Installed review skills** is missing from Review Settings, check which
+Self-Review provider is installed. Refreshing a canvas cannot load source changes
+that are only in another checkout. Install/update and reload the intended provider
+through the host's supported extension/plugin controls; simply reloading an
+unchanged older installation will not add these controls.
 
 The built-in review approach draws on [Addy's evidence-based review and simplification workflows](https://github.com/addyosmani/agent-skills), [Matt Pocock's standards/spec separation](https://github.com/mattpocock/skills/tree/main/skills/engineering/code-review), and [poteto's adversarial review perspectives](https://github.com/poteto/noodle/tree/main/.agents/skills/adversarial-review). It works without installing those skills.
 
@@ -217,7 +257,7 @@ The Node and browser projects use separate libraries and ambient types, with sha
 contracts in `extensions/self-review/types/contracts.d.ts`. Strict TypeScript
 currently checks `src/extension.mts`; `src/lib/anchors.mts`,
 `completion-guidance.mts`, `git-process.mts`, `pull-request.mts`, `server.mts`,
-`settings.mts`, `settings-actions.mts`, and `settings-http.mts`; and
+`review-skills.mts`, `settings.mts`, `settings-actions.mts`, and `settings-http.mts`; and
 `src/web/contracts.mts` and `settings-api.mts`. Compile-only negative fixtures
 ensure invalid settings modes, request envelopes, and checkbox values are rejected.
 External HTTP, SDK, and persisted data still receive runtime validation.
@@ -229,9 +269,10 @@ TypeScript boundaries describe these JavaScript modules but do not statically ch
 their implementations. Runtime regression tests exercise the emitted distribution
 and its integration with the legacy modules; this is not full TypeScript coverage.
 
-The screenshots in this README come from a script that builds a demo repository, seeds a review, and captures the canvas in light and dark themes with Playwright, using your installed Edge or Chrome:
+The screenshots in this README come from a script that builds a demo repository, seeds a review and illustrative skill metadata, and captures the real canvas in light and dark themes with Playwright, using your installed Edge or Chrome. It never installs third-party skills or dispatches agent reviews. Build the runtime first:
 
 ```bash
+npm run build
 cd docs/screenshots
 npm install
 node render.mjs

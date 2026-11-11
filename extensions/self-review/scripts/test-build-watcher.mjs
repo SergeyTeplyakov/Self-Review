@@ -35,6 +35,9 @@ function waitFor(predicate, message, timeoutMs = 5000) {
 }
 
 const service = new EventEmitter();
+service.store = {
+    getInstanceContext: async () => ({ reviewId: "build-watch-regression", returnReviewId: null }),
+};
 const delivery = new EventEmitter();
 delivery.busy = null;
 const server = await startReviewServer({

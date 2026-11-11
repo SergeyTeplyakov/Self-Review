@@ -5,7 +5,8 @@ export class Store {
     readSettings(): Promise<SettingsDocument>;
     updateSettings<T>(mutate: (settings: SettingsDocument) => T | Promise<T>): Promise<T>;
     getInstanceReview(instanceId: string): Promise<string | null>;
-    setInstanceReview(instanceId: string, reviewId: string): Promise<void>;
+    getInstanceContext(instanceId: string): Promise<{ reviewId: string; returnReviewId: string | null } | null>;
+    setInstanceReview(instanceId: string, reviewId: string, returnReviewId?: string | null): Promise<void>;
 }
 
 export function migrateLegacyDataRoot(): Promise<boolean>;
