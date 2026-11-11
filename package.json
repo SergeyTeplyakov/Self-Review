@@ -5,6 +5,7 @@
   "scripts": {
     "build": "node extensions/self-review/scripts/build.mjs",
     "typecheck": "tsc -p tsconfig.node.json && tsc -p tsconfig.web.json",
+    "check-skill-updates": "node extensions/self-review/scripts/check-bundled-skill-updates.mjs",
     "test": "npm run build && node --test extensions/self-review/test/*.test.mjs && node extensions/self-review/scripts/test-build-watcher.mjs"
   },
   "devDependencies": {

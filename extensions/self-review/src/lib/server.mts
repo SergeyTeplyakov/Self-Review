@@ -235,7 +235,7 @@ export async function startReviewServer({
                 return send(res, 200, { instanceId, review, session: { busy: delivery.busy }, pullRequest: await readPullRequest(review), agentReviewAvailable: Boolean(agentReview), reviewSkillsAvailable: Boolean(reviewSkills), agentReviewSuggestedModels: SUGGESTED_REVIEWERS, ...await settingsHttp.read(review.repoRoot) });
             }
             if (parts[0] === "review-skills" && parts.length === 1) {
-                if (!reviewSkills) throw new HttpError(501, "unsupported", "Host skill discovery is not available.");
+                if (!reviewSkills) throw new HttpError(501, "unsupported", "Bundled review skills are not available.");
                 return send(res, 200, await reviewSkills.read());
             }
             if (parts[0] === "snapshot" && parts.length === 2) {
@@ -269,7 +269,7 @@ export async function startReviewServer({
         const body = recordBody(await readJsonBody(req));
 
         if (parts[0] === "review-skills" && parts.length === 1) {
-            if (!reviewSkills) throw new HttpError(501, "unsupported", "Host skill discovery is not available.");
+            if (!reviewSkills) throw new HttpError(501, "unsupported", "Bundled review skills are not available.");
             if (typeof body.saveDefaults !== "boolean") throw new HttpError(400, "invalid_input", "Choose whether to save skill defaults.");
             return send(res, 200, await reviewSkills.update(body.names, { saveDefaults: body.saveDefaults }));
         }

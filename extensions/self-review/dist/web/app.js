@@ -843,19 +843,20 @@ function closeConfigure() {
 function reviewSkillsSectionHtml(d) {
     const disabled = d.saving || d.skillsLoading;
     const names = d.skillNames ?? [];
-    const rows = (d.skillCatalog?.skills ?? []).map((skill) => `<div class="skill-group"><p class="skill-group-name">${esc(skill.name)}${skill.name === "ponytail-review" ? " - top-level benefits report" : " - review guidance"}</p>`
-        + (skill.installations.length ? skill.installations.map((entry) => `<label class="choice"><input type="checkbox" name="review-skill" value="${esc(entry.name)}"${names.includes(entry.name) ? " checked" : ""}${disabled || (!entry.enabled && !names.includes(entry.name)) ? " disabled" : ""}><span>${esc(entry.name)}${entry.enabled ? "" : " (disabled in host)"}<span class="choice-hint">Source: ${esc(entry.source)}${entry.pluginName ? ` / ${esc(entry.pluginName)}` : ""}<br>${esc(entry.path ?? "No local path reported")}<br>Version/revision: not reported by host. Upstream provenance not verified.</span></span></label>`).join("")
-            : `<p class="muted">Not installed or not available to this session. Install it from the host's skill or plugin settings, then refresh.</p>`) + `</div>`).join("");
-    const unavailable = d.skillCatalog ? names.filter((name) => !d.skillCatalog.skills.some((skill) => skill.installations.some((entry) => entry.name === name))) : [];
+    const rows = (d.skillCatalog?.skills ?? []).map((skill) => {
+        const source = `${skill.upstream.repository}/blob/${skill.upstream.release}/${skill.upstream.path}`;
+        return `<label class="choice skill-choice"><input type="checkbox" name="review-skill" value="${esc(skill.name)}"${names.includes(skill.name) ? " checked" : ""}${disabled ? " disabled" : ""}>`
+            + `<span><span class="skill-group-name">${esc(skill.title)}</span> <code>${esc(skill.name)}</code>${skill.role === "ponytail" ? " - separate top-level benefits note" : " - review guidance"}`
+            + `<span class="choice-hint">${esc(skill.summary)}<br>Bundled with Self-Review: unmodified snapshot of <a href="${esc(source)}" target="_blank" rel="noopener noreferrer">${esc(skill.upstream.repository.replace("https://github.com/", ""))} ${esc(skill.upstream.release)}</a> (file commit ${esc(skill.upstream.fileCommit.slice(0, 7))}). License: ${esc(skill.license.spdx)}.`
+            + `${skill.attribution ? `<br>${esc(skill.attribution)}` : ""}</span></span></label>`;
+    }).join("");
     return `<fieldset class="choices review-skills-section"><legend>Review skills</legend>`
-        + `<p class="muted">Optional, independent opt-ins. <a href="https://github.com/addyosmani/agent-skills" target="_blank" rel="noopener noreferrer">Addy Osmani's agent-skills</a> guide review findings; <a href="https://github.com/DietrichGebert/ponytail" target="_blank" rel="noopener noreferrer">Ponytail</a> review adds a separate top-level benefits note, never inline comments (MIT). Matching names alone do not verify an installation's origin.</p>`
-        + (d.skillsLoading && !d.skillCatalog ? `<p class="muted" role="status">Loading installed skills...</p>` : "")
+        + `<p class="muted">These skills ship with Self-Review and are on by default. Their full text is given to every reviewer in the run. Uncheck any you do not want; nothing is installed or downloaded.</p>`
+        + (d.skillsLoading && !d.skillCatalog ? `<p class="muted" role="status">Loading bundled skills...</p>` : "")
         + rows
-        + unavailable.map((name) => `<label class="choice"><input type="checkbox" name="review-skill" value="${esc(name)}" checked${disabled ? " disabled" : ""}><span>${esc(name)} - unavailable; uncheck to remove this selection</span></label>`).join("")
-        + (d.skillsError ? `<div class="modal-error" role="alert">${esc(d.skillsError)}</div>` : "")
+        + (d.skillsError ? `<div class="modal-error" role="alert">${esc(d.skillsError)}</div><button data-action="review-skills-refresh"${disabled ? " disabled" : ""}>Retry</button>` : "")
         + (state.agentReviewSettingsAvailable ? `<label class="choice"><input type="checkbox" name="review-skill-defaults"${d.saveSkillDefaults ? " checked" : ""}${disabled || !d.skillCatalog ? " disabled" : ""}><span>Save these skill choices as my defaults across repositories</span></label>` : "")
-        + `<p class="muted">Self-Review does not bundle, download, install, update, or enable skills; manage them in the host's skill/plugin settings, then refresh. Skill content is loaded by the host at invocation, not version-pinned.</p>`
-        + `<button data-action="review-skills-refresh"${disabled ? " disabled" : ""}>${d.skillsLoading ? "Refreshing..." : "Refresh from host"}</button></fieldset>`;
+        + `<p class="muted">Unchecked choices apply to this review until you save them as defaults. Third-party notices and license texts are in the extension's bundled-skills folder.</p></fieldset>`;
 }
 
 async function refreshReviewSkills() {
@@ -870,7 +871,7 @@ async function refreshReviewSkills() {
         if (state.dialog !== d) return;
         d.skillCatalog = catalog;
         if (firstLoad && d.skillNames === undefined) {
-            d.skillNames = catalog.selected ?? catalog.skills.flatMap((skill) => skill.installations).filter((entry) => entry.selected).map((entry) => entry.name);
+            d.skillNames = [...catalog.selected];
         }
     } catch (err) {
         d.skillsError = err.message;
@@ -878,31 +879,42 @@ async function refreshReviewSkills() {
         d.skillsLoading = false;
         if (state.dialog === d) {
             renderDialog();
-            if (!document.activeElement?.closest?.("#dialog")) focusIn('#dialog [data-action="review-skills-refresh"]');
+            if (!document.activeElement?.closest?.("#dialog")) focusIn(d.skillsError ? '#dialog [data-action="review-skills-refresh"]' : '#dialog [data-action="review-tab"][aria-selected="true"]');
         }
     }
+}
+
+function reviewTabsHtml(d) {
+    const tab = (id, label) => `<button role="tab" id="review-tab-${id}" class="review-tab" data-action="review-tab" data-tab="${id}" aria-controls="review-panel-${id}" aria-selected="${d.tab === id}">${label}</button>`;
+    return `<div class="review-tabs" role="tablist" aria-label="Review settings sections">${tab("general", "General")}${tab("skills", "Review skills")}</div>`;
 }
 
 function agentReviewDialogHtml(d) {
     const options = [["review", "Review issues"], ["simplify", "Simplification"], ["both", "Review and simplification"]];
     return `<div class="modal-backdrop" data-action="dialog-backdrop"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby="dialog-desc">`
-        + `<h2 id="dialog-title">Agentic review</h2>`
-        + `<p id="dialog-desc">Review ${esc(d.revisionId)} (${esc(d.scope)}). Each selected model reviews independently and may consume credits. No files are changed until you approve a suggestion or explicitly request a fix.</p>`
+        + (d.settingsOnly
+            ? `<h2 id="dialog-title">Agent review settings</h2><p id="dialog-desc">Configure reviewers, focus, guidance, and review skills. Saving never starts a review; use Run agentic review in the toolbar.</p>`
+            : `<h2 id="dialog-title">Agentic review</h2><p id="dialog-desc">Review ${esc(d.revisionId)} (${esc(d.scope)}). Each selected model reviews independently and may consume credits. No files are changed until you approve a suggestion or explicitly request a fix.</p>`)
+        + reviewTabsHtml(d)
+        + `<div role="tabpanel" id="review-panel-general" aria-labelledby="review-tab-general"${d.tab === "general" ? "" : " hidden"}>`
         + `<label class="review-field">Reviewers (one to four model IDs, comma-separated)<input name="review-models" value="${esc(d.models)}" maxlength="483" autocomplete="off"${d.saving ? " disabled" : ""}></label>`
         + `<p class="muted">Use exact model IDs available in your Copilot session, or copilot-fusion to run Copilot Fusion in a child session that reports back later. An unavailable reviewer is reported as a failure, never silently replaced.</p>`
         + `<label class="review-field"><span id="review-focus-label">Focus</span><select name="review-focus" aria-labelledby="review-focus-label"${d.saving ? " disabled" : ""}>${options.map(([value, label]) => `<option value="${value}"${d.focus === value ? " selected" : ""}>${label}</option>`).join("")}</select></label>`
         + `<label class="review-field">Goal, spec, or review guidance (optional)<textarea name="review-intent" maxlength="4000" rows="3" placeholder="Acceptance criteria, a spec reference, or focused review guidance"${d.saving ? " disabled" : ""}>${esc(d.intent)}</textarea></label>`
         + `<p class="muted">The coordinating agent checks findings against the code, baseline, and relevant callers or tests before reporting them. Missing evidence is reported, not treated as a pass.</p>`
-        + (state.reviewSkillsAvailable ? reviewSkillsSectionHtml(d) : "")
         + (state.agentReviewSettingsAvailable
             ? `<fieldset class="choices"><legend>User defaults for all repositories</legend>`
                 + `<label class="choice"><input type="checkbox" name="review-save-defaults"${d.saveDefaults ? " checked" : ""}${d.saving ? " disabled" : ""}><span>Save these models, focus, and guidance as my defaults</span></label>`
                 + `<label class="choice"><input type="checkbox" name="review-skip-dialog"${d.skipDialog ? " checked" : ""}${d.saving || !d.saveDefaults ? " disabled" : ""}><span>Run with saved defaults without asking again</span></label>`
                 + `<p class="muted">Each click on Run agentic review authorizes a credit-consuming review. Nothing runs on save or when opening a canvas. Fixes still need approval. Saved guidance applies across repositories; avoid repository-specific instructions.</p></fieldset>` : "")
+        + `</div><div role="tabpanel" id="review-panel-skills" aria-labelledby="review-tab-skills"${d.tab === "skills" ? "" : " hidden"}>`
+        + (state.reviewSkillsAvailable ? reviewSkillsSectionHtml(d) : `<p class="muted" role="status">Bundled review skills are unavailable in this build. Reviews run with the built-in guidance.</p>`)
+        + `</div>`
         + (d.error ? `<div class="modal-error" role="alert">${esc(d.error)}</div>` : "")
         + `<div class="modal-actions"><button data-action="dialog-cancel"${d.saving ? " disabled" : ""}>Cancel</button>`
-        + (state.agentReviewSettingsAvailable ? `<button data-action="agent-review-save-defaults"${d.saving || d.skillsLoading || !(d.saveDefaults || d.saveSkillDefaults) ? " disabled" : ""}>Save defaults</button>` : "")
-        + `<button class="primary" data-action="agent-review-start"${d.saving || d.skillsLoading ? " disabled" : ""}>${d.saving ? "Please wait..." : "Run review"}</button></div></div></div>`;
+        + (state.agentReviewSettingsAvailable ? `<button${d.settingsOnly ? ' class="primary"' : ""} data-action="agent-review-save-defaults"${d.saving || d.skillsLoading || !(d.saveDefaults || d.saveSkillDefaults) ? " disabled" : ""}>Save defaults</button>` : "")
+        + (d.settingsOnly ? "" : `<button class="primary" data-action="agent-review-start"${d.saving || d.skillsLoading ? " disabled" : ""}>${d.saving ? "Please wait..." : "Run review"}</button>`)
+        + `</div></div></div>`;
 }
 
 function openAgentReview(opener = "agent-review") {
@@ -914,8 +926,8 @@ function openAgentReview(opener = "agent-review") {
         scope: scopeLabel(scopeOf(state.review)), models: (defaults?.models ?? last?.models ?? state.agentReviewSuggestedModels).join(", "),
         focus: defaults?.focus ?? last?.focus ?? "review", intent: defaults?.intent ?? "", saving: false,
         skillNames: state.skillOverrides.get(state.review.reviewId) ?? defaults?.skillNames,
-        skillCatalog: null, skillsLoading: false, skillsError: "", saveSkillDefaults: false,
-        saveDefaults: Boolean(defaults), skipDialog: defaults?.skipDialog ?? false, opener, error: state.agentReviewSettingsError,
+        skillCatalog: null, skillsLoading: false, skillsError: "", saveSkillDefaults: false, tab: "general",
+        saveDefaults: Boolean(defaults), skipDialog: defaults?.skipDialog ?? false, opener, settingsOnly: opener === "agent-review-configure", error: state.agentReviewSettingsError,
     };
     renderDialog();
     focusIn('#dialog input[name="review-models"]');
@@ -935,7 +947,7 @@ async function saveAgentReviewDefaults(d) {
 
 async function startAgentReview(saveOnly = false) {
     const d = state.dialog;
-    if (d?.type !== "agent-review" || d.saving) return;
+    if (d?.type !== "agent-review" || d.saving || (d.settingsOnly && !saveOnly)) return;
     d.saving = true;
     d.error = "";
     renderDialog();
@@ -1022,7 +1034,7 @@ function agentReviewsHtml() {
     return `<h3>Review runs</h3><p class="muted">Assessments and verification are reported by the coordinating agent, not independently attested by the canvas.</p>${[...runs].reverse().map((r) => `<div class="card agent-review-run">`
         + `<strong>${esc(r.focus)}: ${esc(r.state)}</strong> <span class="pill">${agentComments().filter((thread) => thread.agentReview.runId === r.runId).length} agent comments</span> <span class="muted">${esc(r.revisionId)}${r.revisionId !== state.review.currentRevisionId ? " (older diff)" : ""}</span>`
         + (r.intent ? `<p class="review-summary">Goal / spec / guidance: ${esc(r.intent)}</p>` : "")
-        + (r.skills?.length ? `<p class="review-summary">Requested skills (not proof of loading): ${esc(r.skills.map((skill) => skill.name).join(", "))}. See actual use and limits in each result.</p>` : "")
+        + (r.skills?.length ? `<p class="review-summary">Bundled skills supplied: ${esc(r.skills.map((skill) => skill.release ? `${skill.name} (${skill.release})` : skill.name).join(", "))}. See actual use and limits in each result.</p>` : "")
         + (r.error ? `<p class="err">${esc(r.error)}</p>` : "")
         + `<ul>${r.models.map((model) => {
             const result = r.results.find((x) => x.model === model);
@@ -1372,7 +1384,6 @@ function overviewView() {
             + (lastUser ? deliveryHtml(lastUser) : "")
             + `</div>`;
     };
-    const revs = [...r.revisions].reverse().slice(0, 8).map((x) => `<div class="list-row"><span class="mono">${esc(x.revisionId)}</span><span class="snippet">${esc(ago(x.createdAt))} · ${x.files} files · +${x.additions} −${x.deletions} · HEAD ${esc((x.headCommit ?? "").slice(0, 10))}</span></div>`).join("");
     return emptyDiffHtml()
         + descriptionHtml()
         + `<h2>Overall discussion</h2>`
@@ -1380,8 +1391,7 @@ function overviewView() {
         + `<div class="thread">${composerHtml("overview:new", { kind: "overview", label: "Discuss the change or request description edits", placeholder: "Ask to revise the description, discuss the design, or request a change…", alwaysOpen: true })}</div>`
         + (unplaced.length ? `<h2>Comments outside the current diff (${unplaced.length})</h2>${unplaced.map((t) => threadHtml(t, { showLocation: true })).join("")}` : "")
         + `<h2>Active threads (${active.length})</h2><div class="card">${active.length ? active.map(listRow).join("") : `<div class="empty">No active threads. Select lines in a file to comment.</div>`}</div>`
-        + (done.length ? `<h2>Closed threads (${done.length})</h2>${done.map((t) => threadHtml(t, { showLocation: true })).join("")}` : "")
-        + `<h2>Revisions</h2><div class="card">${revs || `<div class="empty">No revisions.</div>`}</div>`;
+        + (done.length ? `<h2>Closed threads (${done.length})</h2>${done.map((t) => threadHtml(t, { showLocation: true })).join("")}` : "");
 }
 
 function lessonsEmptyHint() {
@@ -1812,6 +1822,13 @@ async function onClick(e) {
             case "review-skills-refresh":
                 await refreshReviewSkills();
                 break;
+            case "review-tab":
+                if (state.dialog?.type === "agent-review" && state.dialog.tab !== target.dataset.tab) {
+                    state.dialog.tab = target.dataset.tab === "skills" ? "skills" : "general";
+                    renderDialog();
+                    focusIn(`#dialog [data-action="review-tab"][data-tab="${state.dialog.tab}"]`);
+                }
+                break;
             case "configure":
                 openConfigure();
                 break;
@@ -1852,11 +1869,7 @@ async function onChange(e) {
         const names = new Set(state.dialog.skillNames ?? []);
         if (el.checked) names.add(el.value);
         else names.delete(el.value);
-        state.dialog.skillNames = [...names];
-        if (!el.checked && !el.closest?.(".skill-group")) {
-            renderDialog();
-            focusIn('#dialog [data-action="review-skills-refresh"]');
-        }
+        state.dialog.skillNames = (state.dialog.skillCatalog?.skills.map((skill) => skill.name) ?? [...names]).filter((name) => names.has(name));
         return;
     }
     if ((el.name === "review-save-defaults" || el.name === "review-skip-dialog") && state.dialog?.type === "agent-review") {

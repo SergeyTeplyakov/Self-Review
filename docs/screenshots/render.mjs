@@ -2,7 +2,6 @@
 //
 // Builds a throwaway git repo, seeds a review through the same ReviewService the canvas
 // uses, serves the real web UI, and captures it with Playwright in light and dark themes.
-// The skill catalog is demo metadata, not an installation or a copy of third-party skills.
 //
 //   cd docs/screenshots
 //   npm install
@@ -628,13 +627,16 @@ async function capture(browser, url, theme, resetLearning) {
     };
     await page.locator('#top [data-action="agent-review-configure"]').click();
     await page.locator('#dialog select[name="review-focus"]').selectOption("both");
-    await page.locator('#dialog input[name="review-skill"]').first().waitFor();
-    for (const checkbox of await page.locator('#dialog input[name="review-skill"]').all()) await checkbox.check();
+    await page.locator('#dialog input[name="review-skill"]').first().waitFor({ state: "attached" });
+    if (await page.locator('#dialog [data-action="agent-review-start"]').count()) throw new Error("Settings must not start a review.");
+    await fitDialog();
+    await shot("agent-review");
+    await page.locator('#dialog [data-action="review-tab"][data-tab="skills"]').click();
+    await fitDialog();
+    if (await page.locator('#dialog input[name="review-skill"]:not(:checked)').count()) throw new Error("Bundled skills are on by default.");
     if (await page.locator('#dialog input[name="review-skill-defaults"]').isChecked()) {
         throw new Error("Skill defaults must remain an explicit opt-in.");
     }
-    await fitDialog();
-    await shot("agent-review");
     const skills = await page.locator("#dialog .review-skills-section").boundingBox();
     await shot("review-skills", { x: Math.max(0, skills.x - 16), y: Math.max(0, skills.y - 16), width: Math.ceil(skills.width + 32), height: Math.ceil(skills.height + 32) });
     await page.locator('#dialog [data-action="dialog-cancel"]').click();
@@ -696,13 +698,7 @@ try {
     const { service, delivery } = seeded;
     let reviewId = seeded.reviewId;
     const settings = new SettingsService({ store: seeded.store });
-    const reviewSkills = new ReviewSkills({ store: seeded.store, list: async () => ({
-        skills: [
-            { name: "demo-agent-skills:code-review-and-quality", pluginName: "demo-agent-skills", source: "plugin", enabled: true },
-            { name: "demo-agent-skills:code-simplification", pluginName: "demo-agent-skills", source: "plugin", enabled: true },
-            { name: "demo-ponytail:ponytail-review", pluginName: "demo-ponytail", source: "plugin", enabled: true },
-        ],
-    }) });
+    const reviewSkills = new ReviewSkills({ store: seeded.store });
     const agentReview = new AgentReview({ service, settings, reviewSkills, send: async () => {
         throw new Error("The screenshot fixture cannot dispatch agent reviews.");
     } });

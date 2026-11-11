@@ -47,11 +47,7 @@ const delivery = new Delivery({
     learning: async (repoRoot) => (await settings.get(repoRoot)).learning,
     sessionId: () => session?.sessionId,
 });
-const reviewSkills = new ReviewSkills({ store, list: async () => {
-        if (!session?.rpc?.skills?.list)
-            throw new ReviewError("unsupported", "This host does not expose session skill discovery. Manage skills in host settings.");
-        return session.rpc.skills.list();
-    } });
+const reviewSkills = new ReviewSkills({ store });
 const agentReview = new AgentReview({ service, settings, reviewSkills, send, sessionId: () => session?.sessionId, log });
 // Comments a stopped provider claimed but never sent become failed so the reviewer can resend them.
 function errorMessage(error) {
@@ -173,7 +169,8 @@ async function openReview(ctx) {
                                 throw originError;
                         }
                     }
-                    reviewId ??= await service.ensureReview({ repoPath: retired.repoRoot, scope: input.scope }, { cwd });
+                    // Keep the retired review's pathspecs so the fallback never widens what the panel shows.
+                    reviewId ??= await service.ensureReview({ repoPath: retired.repoRoot, paths: retired.paths, exclude: retired.exclude, scope: input.scope }, { cwd });
                     log(`self-review: ${error.message} This panel now shows ${reviewId}.`, "warning");
                 }
             }
@@ -231,7 +228,7 @@ const actions = [
                 models: { type: "array", minItems: 1, maxItems: 4, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 120 } },
                 focus: { type: "string", enum: REVIEW_FOCUSES },
                 intent: { type: "string", maxLength: 4000, description: "Optional goal, acceptance criteria, spec references, or review guidance; not permission to edit." },
-                skillNames: { type: "array", maxItems: 3, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 240 }, description: "Per-run override of exact installed skill names. Empty array explicitly opts out; omission uses saved skill defaults." },
+                skillNames: { type: "array", maxItems: 3, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 240 }, description: "Per-run override of bundled review skills (code-review-and-quality, code-simplification, ponytail-review). Empty array explicitly opts out; omission uses saved skill defaults, which are all three until changed." },
                 useDefaults: { const: true, description: "Use the user's saved models, focus, and guidance instead of supplying them." },
             },
             required: ["revisionId"],

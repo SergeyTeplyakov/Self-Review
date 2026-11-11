@@ -1,0 +1,73 @@
+{
+    "note": "Unmodified snapshots of upstream SKILL.md files from the tagged releases below. Hashes are SHA-256 of the file text with LF line endings.",
+    "skills": [
+        {
+            "name": "code-review-and-quality",
+            "role": "review",
+            "title": "Code review and quality",
+            "summary": "Addy Osmani's multi-axis review: correctness, readability, architecture, security, and performance.",
+            "path": "code-review-and-quality/SKILL.md",
+            "sha256": "2db1e850379f255fd3091ef278cde24cd6c7d2ba23e360cc52ea522c40d4396e",
+            "upstream": {
+                "repository": "https://github.com/addyosmani/agent-skills",
+                "release": "0.6.15",
+                "releaseCommit": "8bfcc1f9916f2eea55494d8c1fa7f4bde867dd9e",
+                "path": "skills/code-review-and-quality/SKILL.md",
+                "fileCommit": "28f435ea69a78531ec00779c7f3b78c64ce95896"
+            },
+            "license": {
+                "spdx": "MIT",
+                "files": [
+                    "licenses/agent-skills-LICENSE.txt"
+                ]
+            },
+            "modified": false
+        },
+        {
+            "name": "code-simplification",
+            "role": "review",
+            "title": "Code simplification",
+            "summary": "Addy Osmani's behavior-preserving simplification guidance.",
+            "path": "code-simplification/SKILL.md",
+            "sha256": "e13b433345e6bf425c3625442ac1b3507b371c18d7ea3e3db822da7a7f742a29",
+            "upstream": {
+                "repository": "https://github.com/addyosmani/agent-skills",
+                "release": "0.6.15",
+                "releaseCommit": "8bfcc1f9916f2eea55494d8c1fa7f4bde867dd9e",
+                "path": "skills/code-simplification/SKILL.md",
+                "fileCommit": "f1f6fbf3981076da73455bf3b754f5864208a93d"
+            },
+            "license": {
+                "spdx": "MIT",
+                "files": [
+                    "licenses/agent-skills-LICENSE.txt",
+                    "licenses/claude-plugins-official-LICENSE.txt"
+                ]
+            },
+            "modified": false,
+            "attribution": "The upstream file states it is inspired by and adapted from Anthropic's Claude Code Simplifier plugin (https://github.com/anthropics/claude-plugins-official, Apache-2.0; referenced file at commit ceb9b72b4c4c20ad39efce780edd0aabe80ebce3). The Apache-2.0 text is included conservatively."
+        },
+        {
+            "name": "ponytail-review",
+            "role": "ponytail",
+            "title": "Ponytail review",
+            "summary": "Ponytail's read-only review: correctness, safety, load, tests, and lean alternatives.",
+            "path": "ponytail-review/SKILL.md",
+            "sha256": "33fe4ebe22a460924e5d4a261e223df22e409cc94ab76182bee9fb91a3ef022e",
+            "upstream": {
+                "repository": "https://github.com/DietrichGebert/ponytail",
+                "release": "v5.3.3",
+                "releaseCommit": "7801d061243d7b753bad0e0b3c057cd250b11755",
+                "path": "skills/ponytail-review/SKILL.md",
+                "fileCommit": "2a1fe842d078cf66ec7f3e6096a8ca4279c2cad7"
+            },
+            "license": {
+                "spdx": "MIT",
+                "files": [
+                    "licenses/ponytail-LICENSE.txt"
+                ]
+            },
+            "modified": false
+        }
+    ]
+}

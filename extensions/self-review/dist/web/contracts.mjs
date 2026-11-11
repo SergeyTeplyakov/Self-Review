@@ -38,7 +38,7 @@ export function reviewOptions(input) {
     if (input.skillNames !== undefined && (!Array.isArray(input.skillNames) || input.skillNames.length > 3
         || !input.skillNames.every((name) => typeof name === "string" && Boolean(name.trim()) && name.length <= 240)
         || new Set(input.skillNames).size !== input.skillNames.length)) {
-        throw new ReviewError("invalid_input", "skillNames must contain up to three distinct installed skill names.");
+        throw new ReviewError("invalid_input", "skillNames must contain up to three distinct bundled review skill names.");
     }
     return { models: [...models], focus: input.focus, intent: typeof input.intent === "string" ? input.intent.trim() : "",
         ...(input.skillNames !== undefined ? { skillNames: [...input.skillNames] } : {}) };
