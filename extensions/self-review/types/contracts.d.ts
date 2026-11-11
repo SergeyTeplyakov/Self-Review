@@ -2,13 +2,14 @@
 export type LearningMode = "off" | "suggest" | "auto";
 export type DeliveryMode = "immediate" | "batch" | "ask";
 export type DeliveryChoice = Exclude<DeliveryMode, "ask"> | null;
-export type ReviewScope = "all" | "pending";
+export type ReviewScope = "all" | "pending" | "commit";
 export type ReviewFocus = "review" | "simplify" | "both";
 
 export interface AgentReviewOptions {
     models: string[];
     focus: ReviewFocus;
     intent: string;
+    skillNames?: string[];
 }
 
 export interface AgentReviewDefaults extends AgentReviewOptions {

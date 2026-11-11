@@ -13,10 +13,55 @@ import * as git from "../dist/lib/git.mjs";
 import { startReviewServer } from "../dist/lib/server.mjs";
 import { buildCommentPrompt } from "../dist/lib/prompt.mjs";
 import { SettingsService } from "../dist/lib/settings.mjs";
+import { ReviewSkills } from "../dist/lib/review-skills.mjs";
 
 const models = ["gpt-review-test", "mai-review-test"];
 const input = { models, focus: "both", revisionId: "r1" };
 const summary = "Read the pinned diff and both versions of notes.md. Source inspection only; no tests run and no external skills used.";
+
+test("installed review skills are opt-in, persisted separately, and captured in explicit runs without installing anything", async (t) => {
+    const f = await fixture(t);
+    const installed = [
+        { name: "agent-skills:code-review-and-quality", source: "plugin", pluginName: "agent-skills", enabled: true, path: "review/SKILL.md" },
+        { name: "code-simplification", source: "personal-copilot", enabled: true },
+        { name: "shipping-and-launch", source: "plugin", enabled: true },
+    ];
+    const skills = new ReviewSkills({ store: f.store, list: async () => ({ skills: installed }) });
+    assert.deepEqual(await skills.forRun(), []);
+    assert.equal((await skills.read()).skills.length, 3);
+    await skills.update([installed[0].name]);
+    assert.equal(f.sent.length, 0, "selection never dispatches a review");
+    const reopened = new ReviewSkills({ store: new Store(f.root), list: skills.list });
+    assert.deepEqual((await reopened.forRun()).map((entry) => entry.name), [installed[0].name]);
+    f.agent.reviewSkills = reopened;
+    const run = await f.agent.start("review", input, "canvas-one");
+    assert.equal(run.skills[0].source, "plugin");
+    assert.equal(run.skills[0].version, null, "unknown version is not fabricated");
+    assert.match(f.sent[0].prompt, /agent-skills:code-review-and-quality/);
+    assert.match(f.sent[0].prompt, /Load a skill before claiming/);
+    await skills.update([]);
+    assert.equal((await f.service.getReview("review")).agentReviews[0].skills[0].name, installed[0].name, "new preferences cannot change a queued run");
+});
+
+test("unavailable skills and discovery failures never silently dispatch or overwrite saved choices", async (t) => {
+    const f = await fixture(t);
+    let enabled = true;
+    const skills = new ReviewSkills({ store: f.store, list: async () => ({ skills: [{ name: "code-simplification", source: "custom", enabled }] }) });
+    await skills.update(["code-simplification"]);
+    for (const names of [["shipping-and-launch"], ["code-simplification", "code-simplification"], "code-simplification"]) {
+        await assert.rejects(skills.update(names));
+        assert.deepEqual((await f.store.readSettings()).reviewSkills, ["code-simplification"]);
+    }
+    f.agent.reviewSkills = skills;
+    enabled = false;
+    await assert.rejects(f.agent.start("review", input, "c"), /unavailable or disabled/);
+    skills.list = async () => { throw new Error("host discovery failed"); };
+    await assert.rejects(f.agent.start("review", input, "c"), /host discovery failed/);
+    assert.equal(f.sent.length, 0);
+    await f.store.updateSettings((settings) => { settings.reviewSkills = []; });
+    await f.agent.start("review", input, "c");
+    assert.equal(f.sent.length, 1, "an older host without discovery supports unconfigured reviews");
+});
 const finding = {
     kind: "line", category: "issue", path: "notes.md", side: "new", startLine: 1,
     body: "The changed statement contradicts the preceding requirement. Keep the original constraint.",
@@ -75,6 +120,67 @@ test("user review defaults persist across providers without changing repository 
     assert.deepEqual((await f.store.readSettings()).repos.first, { learning: "suggest", delivery: "batch" });
 });
 
+test("per-review skill overrides do not change defaults and Ponytail creates one evidence-backed overview", async (t) => {
+    const f = await fixture(t);
+    const skills = new ReviewSkills({ store: f.store, list: async () => ({ skills: [
+        { name: "code-simplification", source: "custom", enabled: true },
+        { name: "ponytail:ponytail-review", source: "plugin", enabled: true },
+    ] }) });
+    await skills.update(["code-simplification"]);
+    f.agent.reviewSkills = skills;
+    const names = ["ponytail:ponytail-review"];
+    await skills.update(names, { saveDefaults: false });
+    assert.deepEqual((await f.store.readSettings()).reviewSkills, ["code-simplification"]);
+    const run = await f.agent.start("review", { ...input, skillNames: names }, "c");
+    assert.equal(run.skills[0].role, "ponytail");
+    assert.match(f.sent[0].prompt, /not the always-on ponytail coding mode/);
+    assert.match(f.sent[0].prompt, /not as inline findings/);
+    const ponytail = { status: "used", summary: "Loaded ponytail:ponytail-review; inspected both sides. No tests run.", benefits: [
+        { proposal: "Reuse the existing formatter.", benefit: "Avoid maintaining two equivalent formatting paths.", evidence: finding.evidence },
+    ] };
+    const report = { runId: run.runId, model: models[0], findings: [], summary };
+    await assert.rejects(f.agent.report("review", report), /Requested Ponytail needs/);
+    await assert.rejects(f.agent.report("review", { ...report, ponytail: { ...ponytail, status: "unavailable" } }), /unavailable must have none/);
+    await f.agent.report("review", { ...report, ponytail });
+    assert.equal((await f.service.getReview("review")).threads.length, 0, "wait for all reviewers before the consolidated note");
+    await f.agent.report("review", { ...report, model: models[1], ponytail });
+    const review = await f.service.getReview("review");
+    assert.equal(review.threads.length, 1, "duplicate opportunities combine into one top-level note");
+    const thread = review.threads[0];
+    assert.equal(thread.kind, "overview");
+    assert.equal(thread.location, null);
+    assert.equal(thread.agentReview, undefined, "a benefits report cannot be approved as a fix");
+    assert.equal(thread.ponytailReport.runId, run.runId);
+    assert.match(thread.messages[0].body, /Avoid maintaining two equivalent/);
+    assert.match(thread.messages[0].body, /gpt-review-test, mai-review-test/);
+    await assert.rejects(f.agent.approve("review", thread.threadId, "r1"), /Only agent review findings/);
+    await f.agent.report("review", { ...report, model: models[1], ponytail });
+    assert.equal((await f.service.getReview("review")).threads.length, 1, "report retries do not duplicate the note");
+});
+
+test("Ponytail absence and failure are visible without fabricating a top-level benefits comment", async (t) => {
+    const f = await fixture(t);
+    f.agent.reviewSkills = new ReviewSkills({ store: f.store, list: async () => ({ skills: [{ name: "ponytail-review", enabled: true, source: "custom" }] }) });
+    const run = await f.agent.start("review", { ...input, skillNames: ["ponytail-review"] }, "c");
+    const report = { runId: run.runId, findings: [], summary };
+    await f.agent.report("review", { ...report, model: models[0], ponytail: { status: "used", summary: "Loaded the skill; no supported benefits.", benefits: [] } });
+    await f.agent.report("review", { ...report, model: models[1], ponytail: { status: "unavailable", summary: "Skill loading failed in this reviewer.", benefits: [] } });
+    const review = await f.service.getReview("review");
+    assert.equal(review.threads.length, 0);
+    assert.equal(review.agentReviews[0].results[0].ponytail.status, "used");
+    assert.equal(review.agentReviews[0].results[1].ponytail.status, "unavailable");
+});
+
+test("empty skill override opts out despite saved defaults", async (t) => {
+    const f = await fixture(t);
+    const skills = new ReviewSkills({ store: f.store, list: () => assert.fail("Explicit opt-out does not need discovery") });
+    await f.store.updateSettings((settings) => { settings.reviewSkills = ["ponytail-review"]; });
+    f.agent.reviewSkills = skills;
+    const run = await f.agent.start("review", { ...input, skillNames: [] }, "c");
+    assert.deepEqual(run.skills, []);
+    assert.deepEqual((await f.store.readSettings()).reviewSkills, ["ponytail-review"]);
+    await assert.rejects(f.agent.report("review", { runId: run.runId, model: models[0], findings: [], summary, ponytail: { status: "used", summary, benefits: [] } }), /not selected/);
+});
 test("saved-default runs use the same validated, revision-pinned pipeline and never ask for models again", async (t) => {
     const f = await fixture(t);
     const settings = new SettingsService({ store: f.store });
@@ -95,6 +201,27 @@ test("saved-default runs use the same validated, revision-pinned pipeline and ne
     assert.deepEqual((await f.service.getReview("review")).agentReviews[0].models, models, "changing preferences cannot alter a queued run");
     await assert.rejects(f.agent.start("review", request, "c"), /already has an active/);
     assert.equal(f.sent.length, 1);
+});
+
+test("maximum Ponytail evidence stays available without overflowing the single overview note", async (t) => {
+    const f = await fixture(t);
+    f.agent.reviewSkills = new ReviewSkills({ store: f.store, list: async () => ({ skills: [{ name: "ponytail-review", enabled: true, source: "custom" }] }) });
+    const reviewers = ["a", "b", "c", "d"];
+    const run = await f.agent.start("review", { ...input, models: reviewers, skillNames: ["ponytail-review"] }, "c");
+    for (const model of reviewers) {
+        await f.agent.report("review", {
+            runId: run.runId, model, findings: [], summary,
+            ponytail: { status: "used", summary: "S".repeat(4000), benefits: Array.from({ length: 5 }, (_, i) => ({
+                proposal: `${model}${i}${"P".repeat(1998)}`, benefit: "B".repeat(2000),
+                evidence: { source: "s".repeat(2000), baseline: "b".repeat(2000), validation: "v".repeat(2000) },
+            })) },
+        });
+    }
+    const review = await f.service.getReview("review");
+    assert.equal(review.threads.length, 1);
+    assert.ok(review.threads[0].messages[0].body.length <= 20000);
+    assert.match(review.threads[0].messages[0].body, /full text in run report/);
+    assert.equal(review.agentReviews[0].results[0].ponytail.benefits[0].evidence.validation.length, 2000, "saved evidence remains complete");
 });
 
 test("unreadable saved defaults fail explicitly without dispatch or fallback", async (t) => {
@@ -123,7 +250,7 @@ test("multi-model review queues only after an explicit start and excludes manual
     assert.match(prompt.prompt, /Do not fix any findings/);
     assert.match(prompt.prompt, /owning conversation must check each claim against the pinned change AND base/);
     assert.match(prompt.prompt, /relevant reachable callers, guards, tests, and requirements/);
-    assert.match(prompt.prompt, /code-review-and-quality and code-simplification/);
+    assert.match(prompt.prompt, /An empty selection means no Self-Review skill opt-in/);
     assert.match(prompt.prompt, /never auto-install/);
     assert.match(prompt.prompt, /no mutation tests in the user's checkout/);
     assert.match(prompt.prompt, /Project conventions|project conventions override/);

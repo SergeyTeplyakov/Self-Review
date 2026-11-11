@@ -35,13 +35,20 @@ export function reviewOptions(input) {
     if (input.intent !== undefined && (typeof input.intent !== "string" || input.intent.length > 4000)) {
         throw new ReviewError("invalid_input", "intent must be text (up to 4000 characters).");
     }
-    return { models: [...models], focus: input.focus, intent: typeof input.intent === "string" ? input.intent.trim() : "" };
+    if (input.skillNames !== undefined && (!Array.isArray(input.skillNames) || input.skillNames.length > 3
+        || !input.skillNames.every((name) => typeof name === "string" && Boolean(name.trim()) && name.length <= 240)
+        || new Set(input.skillNames).size !== input.skillNames.length)) {
+        throw new ReviewError("invalid_input", "skillNames must contain up to three distinct installed skill names.");
+    }
+    return { models: [...models], focus: input.focus, intent: typeof input.intent === "string" ? input.intent.trim() : "",
+        ...(input.skillNames !== undefined ? { skillNames: [...input.skillNames] } : {}) };
 }
 export function agentReviewDefaults(defaults) {
     if (!isRecord(defaults) || typeof defaults.skipDialog !== "boolean") {
         throw new ReviewError("invalid_input", "Agent review defaults require models, focus, and a boolean skipDialog.");
     }
-    return { ...reviewOptions(defaults), skipDialog: defaults.skipDialog };
+    const { skillNames: _skillNames, ...options } = reviewOptions(defaults);
+    return { ...options, skipDialog: defaults.skipDialog };
 }
 export function settingsPatch(value) {
     if (!isRecord(value) || (value.learning === undefined && value.delivery === undefined && value.dismissed === undefined)) {

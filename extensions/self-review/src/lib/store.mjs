@@ -240,16 +240,28 @@ export class Store {
     }
 
     async getInstanceReview(instanceId) {
-        const map = (await readJson(path.join(this.root, "instances.json"))) ?? {};
-        return map[instanceId] ?? null;
+        return (await this.getInstanceContext(instanceId))?.reviewId ?? null;
     }
 
-    async setInstanceReview(instanceId, reviewId) {
+    async getInstanceContext(instanceId) {
+        const map = (await readJson(path.join(this.root, "instances.json"))) ?? {};
+        const entry = map[instanceId];
+        if (entry == null) return null;
+        if (typeof entry === "string") return { reviewId: assertReviewId(entry), returnReviewId: null };
+        return {
+            reviewId: assertReviewId(entry.reviewId),
+            returnReviewId: entry.returnReviewId == null ? null : assertReviewId(entry.returnReviewId),
+        };
+    }
+
+    async setInstanceReview(instanceId, reviewId, returnReviewId = null) {
+        assertReviewId(reviewId);
+        if (returnReviewId !== null) assertReviewId(returnReviewId);
         await this.lock("instances", async () => {
             const file = path.join(this.root, "instances.json");
             const map = (await readJson(file)) ?? {};
-            if (map[instanceId] === reviewId) return;
-            map[instanceId] = reviewId;
+            if (returnReviewId === null && map[instanceId] === reviewId) return;
+            map[instanceId] = returnReviewId === null ? reviewId : { reviewId, returnReviewId };
             await writeJsonAtomic(file, map);
         });
     }

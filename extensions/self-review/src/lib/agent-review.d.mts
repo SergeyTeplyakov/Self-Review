@@ -1,6 +1,7 @@
 import type { SettingsService } from "./settings.mjs";
 import type { ReviewService } from "./review-service.mjs";
 import type { Log } from "../../types/contracts.js";
+import type { ReviewSkills } from "./review-skills.mjs";
 
 type CopilotSession = Awaited<ReturnType<typeof import("@github/copilot-sdk/extension").joinSession>>;
 type SendOptions = Parameters<CopilotSession["send"]>[0];
@@ -9,6 +10,7 @@ export class AgentReview {
     constructor(options: {
         service: ReviewService;
         settings: SettingsService;
+        reviewSkills?: ReviewSkills;
         send: (options: SendOptions) => Promise<string>;
         sessionId: () => string | undefined;
         log: Log;

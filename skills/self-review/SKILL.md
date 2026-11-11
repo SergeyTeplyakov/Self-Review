@@ -52,6 +52,12 @@ publication.
      the merge base of the base ref and HEAD.
    - `pending`: only uncommitted work (staged, unstaged, and untracked files),
      which is the working tree against HEAD.
+   - `commit`, with an explicit hexadecimal `commit` ID: an immutable commit
+     against its first parent, or the empty tree for a root commit. The sidebar
+     also lets the human select commits from HEAD history. Each commit and path
+     filter has its own stable review identity, not shared with All/Pending.
+     Historical comments and replies are local notes only: never deliver them
+     for implementation, run agent reviews, or derive saved guidelines there.
 2. Read repository instructions and inspect Git state without modifying it.
    Preserve unrelated edits and include only the selected scope.
 3. Capture a review revision with the repository identity, base commit, target
@@ -122,7 +128,26 @@ not proof that a suggestion is correct: recheck it before editing. Discuss opens
 conversation, not permission to fix. Use the normal posted-comment loop for
 either interaction.
 
-### Optional Addy Osmani skills
+### Optional installed review skills
+
+The canvas's **Review skills** configuration supports independent opt-ins for
+Addy's two skills below and Ponytail's `ponytail-review`. Installation and updates
+stay in host settings. Applying choices overrides only this review; saving user
+defaults needs the separate explicit checkbox. Run choices are captured, but
+installed skill content/version is not pinned or authenticated by the canvas.
+An exact `skillNames` run override takes precedence over saved choices; `[]`
+opts out. Never claim a named skill was loaded without actually loading it.
+
+Ponytail's authoritative upstream is
+[DietrichGebert/ponytail](https://github.com/DietrichGebert/ponytail) (MIT).
+Use `ponytail-review`, not the always-on coding mode. Follow the run prompt's
+separate `ponytail` report schema: actual loaded/unavailable status, coverage and
+limits, and only concrete benefits backed by source/baseline/validation evidence.
+Validate and deduplicate them; do not repeat them in inline findings. Supported
+opportunities produce one top-level overview note after all reviewers finish.
+No supported benefits means no fabricated benefits comment. Never copy upstream
+benchmark gains as claims about this change. A benefits note is not permission
+to implement it.
 
 You can use Addy Osmani's
 [`code-review-and-quality`](https://github.com/addyosmani/agent-skills/tree/main/skills/code-review-and-quality)

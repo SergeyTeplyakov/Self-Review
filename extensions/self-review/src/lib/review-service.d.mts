@@ -1,8 +1,9 @@
 import { EventEmitter } from "node:events";
-import type { Log } from "../../types/contracts.js";
+import type { Log, ReviewScope } from "../../types/contracts.js";
 import type { Store } from "./store.mjs";
 
 export class ReviewError extends Error {
+    constructor(code: string, message: string);
     code: string;
 }
 
@@ -27,7 +28,7 @@ export interface Review {
     repoRoot: string;
     branch: string | null;
     title: string;
-    scope: "all" | "pending";
+    scope: ReviewScope;
     currentRevisionId: string | null;
     threads: ReviewThread[];
     deliveryMode?: string | null;
@@ -36,6 +37,7 @@ export interface Review {
 
 export class ReviewService extends EventEmitter {
     constructor(options: { store: Store; log?: Log });
+    store: Store;
     ensureReview(input: unknown, options: { cwd: string }): Promise<string>;
     getReview(reviewId: string): Promise<Review>;
     getSnapshot(reviewId: string, snapshotId: string): Promise<unknown>;
@@ -52,11 +54,11 @@ export class ReviewService extends EventEmitter {
     findMessage(reviewId: string, messageId: string): Promise<{ thread: ReviewThread; message: ReviewMessage }>;
     discardDraft(reviewId: string, messageId: string): Promise<unknown>;
     setDeliveryChoice(reviewId: string, mode: unknown): Promise<"immediate" | "batch" | null>;
-    openSibling(reviewId: string, scope: unknown): Promise<string>;
+    openSibling(reviewId: string, scope: ReviewScope, input?: { commit?: unknown }): Promise<string>;
 }
 
 export const THREAD_KINDS: string[];
 export const THREAD_STATUSES: string[];
 export const OUTCOMES: string[];
 export const LESSON_STATUSES: string[];
-export const SCOPES: ("all" | "pending")[];
+export const SCOPES: ReviewScope[];

@@ -48,6 +48,111 @@ const clicker = (app) => (action, dataset = {}) => {
     return app.run("onClick")({ target });
 };
 
+test("commit tree selection shows immutable local-note mode and resets previous review state", async () => {
+    const posts = [];
+    const historical = reviewFixture({ reviewId: "commit-review", scope: "commit", commit: "a".repeat(40) });
+    const app = await loadApp({ fetch: async (url, options) => {
+        if (options?.method === "POST") { posts.push(JSON.parse(options.body)); return jsonResponse({}); }
+        return jsonResponse(url.includes("snapshot/") ? { revisionId: "r1", files: [] } : { review: historical, commits: [] });
+    } });
+    app.state.review = reviewFixture();
+    app.run("renderRuler = () => {}");
+    app.state.commits = [{ commit: historical.commit, subject: "<unsafe>", author: "A", date: "today" }];
+    app.run("renderSide()");
+    assert.match(app.node("#side").innerHTML, /role="tree" aria-label="Commits"/);
+    assert.match(app.node("#side").innerHTML, /&lt;unsafe&gt;/);
+    assert.doesNotMatch(app.node("#side").innerHTML, /<unsafe>/);
+    app.state.open.add("file:old");
+    app.state.content.set("r1:old", { stale: true });
+    await clicker(app)("commit", { commit: historical.commit });
+    assert.deepEqual(posts[0], { scope: "commit", commit: historical.commit });
+    assert.equal(app.state.content.size, 0);
+    assert.equal(app.state.open.size, 0);
+    app.run("renderTop()");
+    assert.match(app.node("#top").innerHTML, /local notes only/);
+    assert.doesNotMatch(app.node("#top").innerHTML, /data-action="agent-review"|data-action="configure"|data-action="submit-review"/);
+    assert.match(app.run('composerHtml("overview:new", {kind:"overview"})'), /Save local note/);
+    assert.doesNotMatch(app.run("descriptionHtml()"), /discuss-description/);
+});
+
+test("review skill configuration reports provenance and saves opt-in without starting reviews", async () => {
+    const posts = [];
+    const catalog = { skills: [{ name: "code-review-and-quality", installations: [{ name: "plugin:code-review-and-quality", source: "plugin", pluginName: "agent-skills", enabled: true, selected: false }] }, { name: "code-simplification", installations: [] }] };
+    const app = await loadApp({ fetch: async (url, options) => {
+        if (options?.method === "POST") posts.push([url, JSON.parse(options.body)]);
+        return jsonResponse(catalog);
+    } });
+    app.state.review = reviewFixture();
+    await clicker(app)("review-skills");
+    assert.match(app.node("#dialog").innerHTML, /not reported by host/);
+    assert.match(app.node("#dialog").innerHTML, /Not installed or not available/);
+    assert.match(app.node("#dialog").innerHTML, /does not bundle, download, update, overwrite/);
+    assert.equal(posts.length, 0);
+    await app.run("onChange")({ target: { name: "review-skill", value: "plugin:code-review-and-quality", checked: true } });
+    await clicker(app)("review-skills-save");
+    assert.equal(posts.length, 1);
+    assert.match(posts[0][0], /review-skills/);
+    assert.deepEqual(posts[0][1], { names: ["plugin:code-review-and-quality"], saveDefaults: false });
+    assert.deepEqual([...app.state.skillOverrides.get("r")], ["plugin:code-review-and-quality"]);
+    assert.equal(app.state.dialog, null);
+});
+
+test("skill defaults require explicit opt-in and per-review choices reach one-click runs", async () => {
+    const posts = [];
+    const review = reviewFixture();
+    const defaults = { models: ["model-a"], focus: "review", intent: "", skipDialog: true };
+    const catalog = { selected: [], skills: [{ name: "ponytail-review", installations: [{ name: "ponytail-review", enabled: true, source: "custom" }] }] };
+    const app = await loadApp({ fetch: async (url, options) => {
+        if (options?.method === "POST") { posts.push([url, JSON.parse(options.body)]); return jsonResponse(catalog); }
+        if (url.includes("review-skills")) return jsonResponse(catalog);
+        return jsonResponse(url.includes("snapshot/") ? { revisionId: "r1", files: [] } : { review, agentReviewAvailable: true, agentReviewSettings: defaults });
+    } });
+    app.state.review = review;
+    app.run("renderRuler = () => {}");
+    app.state.agentReviewAvailable = true;
+    const click = clicker(app);
+    await click("review-skills");
+    assert.equal(app.state.dialog.saveDefaults, false);
+    await app.run("onChange")({ target: { name: "review-skill", value: "ponytail-review", checked: true } });
+    await app.run("onChange")({ target: { name: "review-skill-defaults", checked: true } });
+    await click("review-skills-save");
+    assert.equal(posts[0][1].saveDefaults, true);
+    app.state.agentReviewSettings = defaults;
+    await click("agent-review");
+    assert.deepEqual(posts[1][1].skillNames, ["ponytail-review"]);
+    assert.equal(posts[1][1].useDefaults, true);
+});
+
+test("Review settings visibly configures Addy and Ponytail without losing unsaved reviewer choices", async () => {
+    const posts = [];
+    const catalog = { selected: [], skills: [
+        { name: "code-review-and-quality", installations: [{ name: "code-review-and-quality", enabled: true, source: "custom" }] },
+        { name: "code-simplification", installations: [{ name: "code-simplification", enabled: true, source: "custom" }] },
+        { name: "ponytail-review", installations: [{ name: "ponytail-review", enabled: true, source: "custom" }] },
+    ] };
+    const app = await loadApp({ fetch: async (url, options) => {
+        if (options?.method === "POST") posts.push([url, JSON.parse(options.body)]);
+        return jsonResponse(catalog);
+    } });
+    app.state.review = reviewFixture();
+    app.state.agentReviewAvailable = true;
+    app.state.reviewSkillsAvailable = true;
+    const click = clicker(app);
+    await click("agent-review-configure");
+    assert.match(app.node("#dialog").innerHTML, /<legend>Installed review skills<\/legend>/);
+    assert.match(app.node("#dialog").innerHTML, /Addy Osmani.*Ponytail/);
+    await app.run("onInput")({ target: { name: "review-models", value: "my-reviewer" } });
+    await click("review-skills");
+    assert.equal(app.state.dialog.names.size, 0);
+    await app.run("onChange")({ target: { name: "review-skill", value: "ponytail-review", checked: true } });
+    await click("review-skills-save");
+    assert.equal(app.state.dialog.type, "agent-review");
+    assert.equal(app.state.dialog.models, "my-reviewer");
+    assert.match(app.node("#dialog").innerHTML, /Selected for this review: ponytail-review/);
+    assert.deepEqual(posts.map(([, body]) => body), [{ names: ["ponytail-review"], saveDefaults: false }]);
+    assert.deepEqual([...app.run("agentReviewOptions(state.dialog)").skillNames], ["ponytail-review"]);
+});
+
 test("the page provides every container the scope and learning controls render into", async () => {
     const html = await readFile(new URL("../dist/web/index.html", import.meta.url), "utf8");
     for (const id of ["top", "banner", "layout", "side", "main", "ruler", "dialog", "toast"]) assert.match(html, new RegExp(`id="${id}"`), id);
