@@ -620,14 +620,6 @@ async function capture(browser, url, theme, resetLearning) {
     await page.locator('#top [data-action="scope"][data-scope="all"]').click();
     await page.locator('#top [data-scope="all"][aria-pressed="true"]:not([disabled])').waitFor();
 
-    await page.locator('#side [data-action="commit"]').first().click();
-    await page.getByText("Historical snapshot", { exact: false }).waitFor();
-    await nav(page, "file", "src/http/retry.ts");
-    await fitHeight(page, 1050);
-    await shot("commit");
-    await page.locator('#top [data-action="scope"][data-scope="all"]').click();
-    await page.locator('#top [data-scope="all"][aria-pressed="true"]:not([disabled])').waitFor();
-
     const fitDialog = async () => {
         await page.setViewportSize({ width: WIDTH, height: 1700 });
         const height = await page.locator("#dialog .modal").evaluate((modal) => modal.scrollHeight);

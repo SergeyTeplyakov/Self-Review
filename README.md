@@ -61,14 +61,6 @@ Review the whole branch against its base, or switch to **Pending changes** to lo
   <img alt="The pending scope: the title ends with (pending changes), Pending changes is selected, and only the two uncommitted files are listed." src="docs/images/pending-light.png">
 </picture>
 
-Select a historical commit in the sidebar to read its immutable diff against its
-first parent. Notes stay local to that commit; agent actions are unavailable.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/commit-dark.png">
-  <img alt="A selected commit in the history tree, with its immutable file diff and a local-notes-only banner." src="docs/images/commit-light.png">
-</picture>
-
 Learning from your feedback is optional and set per repository. The first review in a repository asks once.
 
 <picture>
@@ -99,8 +91,7 @@ Guidelines learned from your comments are collected in one place, with their sta
 
 ## How it works
 
-- **Scope.** **All changes**, the default, compares your working tree, including staged, unstaged, and untracked files, against the merge base with a base ref (`origin/HEAD`, `main`, or `master` by default), so it covers a whole branch or PR. **Pending changes** compares the working tree with `HEAD`, so it covers only what you haven't committed and needs no comparison base. When switching to All changes, a base is inferred or must be supplied explicitly. Each scope keeps its own threads, and you switch between them in the top bar. Narrow either one to paths or exclude files when you open it.
-- **Commit selection.** Select a commit in the sidebar's **Commits (HEAD history)** tree to show only that commit's files and diff. **Older commits** pages through history, 50 at a time. Comparisons use the first parent (including merge commits), or the empty tree for a genuine root commit. A shallow boundary with unavailable first-parent history reports an error instead of showing the entire tree as added; fetch or deepen that repository yourself before retrying. No checkout, reset, staging, or repository writes occur. File content comes from the immutable commit, never today's working tree. Each full commit ID and path filter has its own stable review ID, independent of branch/base selection; local notes never move into All/Pending threads. Commit comments and replies are local notes only: no delivery, agent review, fixes, or guideline learning. Switch back with **All changes** or **Pending changes**; each canvas remembers its own originating review across provider restarts, while directly opening another repository/commit resets that return context. Original threads and drafts remain in their original reviews.
+- **Scope.** **All changes**, the default, compares your working tree, including staged, unstaged, and untracked files, against the merge base with a base ref (`origin/HEAD`, `main`, or `master` by default), so it covers a whole branch or PR. **Pending changes** compares the working tree with `HEAD`, so it covers only what you haven't committed and needs no comparison base. When switching to All changes, a base is inferred or must be supplied explicitly. Each scope keeps its own threads, and you switch between them in the top bar. Narrow either one to paths or exclude files when you open it. Historical single-commit reviews are no longer supported: reviews saved by earlier versions stay on disk with their notes untouched, but cannot be opened, refreshed, or commented on; a canvas that last showed one reopens on the review it was opened from, or on the repository's All changes review, and logs a warning.
 - **Comments.** Start a thread on the overview, a file, a change, or a line range on either side of the diff. Selecting a file shows the whole file with changes inline; selecting a folder shows only the diffs under it.
 - **Highlighting.** Code is syntax highlighted locally. Markdown stays as source, with every marker such as `**`, `#`, and `[text](url)` left in place, but headings, emphasis, inline code, links, lists, quotes, tables, and fenced code blocks are styled so prose changes are easy to read.
 - **Diff details.** Final-newline notes identify the affected side, file modes are shown explicitly, and file-to-symlink replacements keep both sides together. Untracked files are fingerprinted from their bytes, including binary and oversized files that cannot be displayed.

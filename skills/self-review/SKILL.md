@@ -52,12 +52,6 @@ publication.
      the merge base of the base ref and HEAD.
    - `pending`: only uncommitted work (staged, unstaged, and untracked files),
      which is the working tree against HEAD.
-   - `commit`, with an explicit hexadecimal `commit` ID: an immutable commit
-     against its first parent, or the empty tree for a root commit. The sidebar
-     also lets the human select commits from HEAD history. Each commit and path
-     filter has its own stable review identity, not shared with All/Pending.
-     Historical comments and replies are local notes only: never deliver them
-     for implementation, run agent reviews, or derive saved guidelines there.
 2. Read repository instructions and inspect Git state without modifying it.
    Preserve unrelated edits and include only the selected scope.
 3. Capture a review revision with the repository identity, base commit, target

@@ -1,6 +1,6 @@
 // Coordinates opt-in reviews through the owning conversation, using its subagents, Fusion child sessions, and permissions.
 import { createHash, randomUUID } from "node:crypto";
-import { ReviewError } from "./review-service.mjs";
+import { ReviewError, isRetiredCommitReview, retiredCommitError } from "./review-service.mjs";
 import { selectedLines } from "./diff.mjs";
 import { reviewOptions, REVIEW_FOCUSES, FUSION_REVIEWER, SUGGESTED_REVIEWERS } from "../web/contracts.mjs";
 export { reviewOptions, REVIEW_FOCUSES, FUSION_REVIEWER, SUGGESTED_REVIEWERS } from "../web/contracts.mjs";
@@ -122,7 +122,8 @@ export class AgentReview {
     }
 
     async start(reviewId, input, instanceId) {
-        if ((await this.service.getReview(reviewId)).scope === "commit") throw conflict("Historical commits support local notes only; agent reviews and fixes are disabled.");
+        const review = await this.service.getReview(reviewId);
+        if (isRetiredCommitReview(review)) throw retiredCommitError(review);
         if (typeof input.revisionId !== "string") throw invalid("revisionId is required.");
         let selected = input;
         if (input.useDefaults !== undefined) {

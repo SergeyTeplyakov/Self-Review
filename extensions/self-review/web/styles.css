@@ -232,7 +232,6 @@ a.pill:hover { text-decoration: underline; }
     border-left: 3px solid transparent;
 }
 .nav-item:hover { background: var(--mr-subtle); }
-button.nav-item { width: 100%; text-align: left; border-radius: 0; }
 .nav-item.active { background: var(--mr-accent-muted); border-left-color: var(--mr-accent); }
 .nav-item .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .nav-item .dir { color: var(--mr-muted); }

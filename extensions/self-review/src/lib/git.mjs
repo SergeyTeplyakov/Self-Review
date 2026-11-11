@@ -10,43 +10,6 @@ import { parseUnifiedDiff, synthesizeAddedFile } from "./diff.mjs";
 
 const MAX_UNTRACKED_BYTES = 2 * 1024 * 1024;
 
-export async function resolveCommit(repoRoot, commit) {
-    if (typeof commit !== "string" || !/^[0-9a-f]{7,64}$/i.test(commit)) throw new Error("Select a commit by its hexadecimal object ID.");
-    return (await runGit(repoRoot, ["rev-parse", "--verify", `${commit}^{commit}`])).stdout.trim();
-}
-
-export async function listCommits(repoRoot, offset = 0) {
-    if (!Number.isSafeInteger(offset) || offset < 0) throw new Error("Commit offset must be a non-negative integer.");
-    const result = await runGit(repoRoot, ["log", "--max-count=51", `--skip=${offset}`, "--format=%H%x00%s%x00%an%x00%aI", "HEAD", "--"]);
-    const commits = result.stdout.trimEnd().split("\n").filter(Boolean).map((line) => {
-        const [commit, subject, author, date] = line.split("\0");
-        return { commit, subject, author, date };
-    });
-    return { commits: commits.slice(0, 50), nextOffset: commits.length > 50 ? offset + 50 : null };
-}
-
-async function captureCommit({ repoRoot, commit, base, paths, exclude, contextLines }) {
-    const head = await resolveCommit(repoRoot, commit);
-    // Traversal commands hide a shallow boundary's parents; the object headers do not.
-    const headers = (await runGit(repoRoot, ["cat-file", "-p", head])).stdout.split("\n\n", 1)[0];
-    const parents = [...headers.matchAll(/^parent ([0-9a-f]+)$/gm)].map((match) => match[1]);
-    if (parents.length && !(await runGit(repoRoot, ["cat-file", "-e", `${parents[0]}^{commit}`], { allowFail: true })).ok) {
-        throw new Error(`First-parent history is unavailable for commit ${head}. Fetch or deepen the repository before reviewing this commit.`);
-    }
-    const format = (await runGit(repoRoot, ["rev-parse", "--show-object-format"])).stdout.trim();
-    const baseCommit = parents[0] ?? createHash(format).update("tree 0\0").digest("hex");
-    const options = ["--no-color", "--no-ext-diff", "--no-textconv", "--find-renames", "--src-prefix=a/", "--dst-prefix=b/", `-U${contextLines}`];
-    const diff = await runGit(repoRoot, parents.length
-        ? ["diff", ...options, baseCommit, head, "--", ...buildPathspec(paths, exclude)]
-        : ["diff-tree", "--root", "--no-commit-id", "-r", "-p", ...options, head, "--", ...buildPathspec(paths, exclude)]);
-    return {
-        base, baseCommit, headCommit: head, branch: (await runGit(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])).stdout.trim(),
-        upstream: null, uncommittedFiles: [], scope: "commit",
-        fingerprint: createHash("sha256").update(head).update("\0").update(baseCommit).update("\0").update(diff.stdout).digest("hex"),
-        files: parseUnifiedDiff(diff.stdout).sort((a, b) => a.path.localeCompare(b.path)),
-    };
-}
-
 export async function resolveRepoRoot(repoPath) {
     const { stdout } = await runGit(repoPath, ["rev-parse", "--show-toplevel"]);
     return path.resolve(stdout.trim());
@@ -135,8 +98,7 @@ async function readRepoFile(repoRoot, relPath, maxBytes = Infinity) {
 
 // scope "all" diffs the working tree against the merge-base with `base` (the whole branch or PR);
 // scope "pending" diffs it against HEAD, so committed work is left out.
-export async function captureSnapshot({ repoRoot, base, paths, exclude, includeUntracked = true, contextLines = 5, scope = "all", commit }) {
-    if (scope === "commit") return captureCommit({ repoRoot, commit, base, paths, exclude, contextLines });
+export async function captureSnapshot({ repoRoot, base, paths, exclude, includeUntracked = true, contextLines = 5, scope = "all" }) {
     const head = (await runGit(repoRoot, ["rev-parse", "HEAD"])).stdout.trim();
     const branch = (await runGit(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])).stdout.trim();
     let baseCommit = head;
