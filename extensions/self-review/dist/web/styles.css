@@ -150,6 +150,9 @@ select {
 .review-lane-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
 .feedback-draft-count { color: var(--mr-muted); }
 button.agent-review-launch { padding: 7px 14px; font-weight: 600; }
+.skill-group { display: flex; flex-direction: column; gap: 6px; }
+.skill-group-name { margin: 0; font-weight: 600; }
+.review-skills-section > button { align-self: flex-start; }
 button:focus-visible { outline: 2px solid var(--color-focus-outline, var(--mr-accent)); outline-offset: 2px; }
 .review-summary { white-space: pre-wrap; overflow-wrap: anywhere; }
 .mono { font-family: var(--mr-mono); }

@@ -628,19 +628,15 @@ async function capture(browser, url, theme, resetLearning) {
     };
     await page.locator('#top [data-action="agent-review-configure"]').click();
     await page.locator('#dialog select[name="review-focus"]').selectOption("both");
-    await page.locator('#dialog [data-action="review-skills"]').click();
     await page.locator('#dialog input[name="review-skill"]').first().waitFor();
     for (const checkbox of await page.locator('#dialog input[name="review-skill"]').all()) await checkbox.check();
     if (await page.locator('#dialog input[name="review-skill-defaults"]').isChecked()) {
         throw new Error("Skill defaults must remain an explicit opt-in.");
     }
     await fitDialog();
-    await shot("review-skills");
-    await page.locator('#dialog [data-action="review-skills-save"]').click();
-    await page.locator("#dialog").getByText("Selected for this review:", { exact: false }).waitFor();
-    await page.locator("#toast").waitFor({ state: "hidden" });
-    await fitDialog();
     await shot("agent-review");
+    const skills = await page.locator("#dialog .review-skills-section").boundingBox();
+    await shot("review-skills", { x: Math.max(0, skills.x - 16), y: Math.max(0, skills.y - 16), width: Math.ceil(skills.width + 32), height: Math.ceil(skills.height + 32) });
     await page.locator('#dialog [data-action="dialog-cancel"]').click();
     await page.locator("#dialog .modal").waitFor({ state: "detached" });
 

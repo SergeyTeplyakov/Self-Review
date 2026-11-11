@@ -124,7 +124,7 @@ either interaction.
 
 ### Optional installed review skills
 
-The canvas's **Review skills** configuration supports independent opt-ins for
+The **Review skills** section of the canvas's **Review settings** supports independent opt-ins for
 Addy's two skills below and Ponytail's `ponytail-review`. Installation and updates
 stay in host settings. Applying choices overrides only this review; saving user
 defaults needs the separate explicit checkbox. Run choices are captured, but

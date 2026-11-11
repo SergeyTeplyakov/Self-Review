@@ -48,112 +48,115 @@ const clicker = (app) => (action, dataset = {}) => {
     return app.run("onClick")({ target });
 };
 
-test("review skill configuration reports provenance and saves opt-in without starting reviews", async () => {
+const settle = () => new Promise((resolve) => setImmediate(resolve));
+const skillsApp = async (catalog, { fail = () => false, defaults } = {}) => {
     const posts = [];
-    const catalog = { skills: [{ name: "code-review-and-quality", installations: [{ name: "plugin:code-review-and-quality", source: "plugin", pluginName: "agent-skills", enabled: true, selected: false }] }, { name: "code-simplification", installations: [] }] };
     const app = await loadApp({ fetch: async (url, options) => {
-        if (options?.method === "POST") posts.push([url, JSON.parse(options.body)]);
+        if (options?.method === "POST") { posts.push([url, JSON.parse(options.body)]); return jsonResponse(url.includes("review-skills") ? catalog : JSON.parse(options.body).defaults ?? {}); }
+        if (fail()) throw new Error("Host discovery failed");
         return jsonResponse(catalog);
     } });
+    app.run("loadState = async () => {}");
     app.state.review = reviewFixture();
-    await clicker(app)("review-skills");
-    assert.match(app.node("#dialog").innerHTML, /not reported by host/);
-    assert.match(app.node("#dialog").innerHTML, /Not installed or not available/);
-    assert.match(app.node("#dialog").innerHTML, /does not bundle, download, update, overwrite/);
-    assert.equal(posts.length, 0);
-    await app.run("onChange")({ target: { name: "review-skill", value: "plugin:code-review-and-quality", checked: true } });
-    await clicker(app)("review-skills-save");
-    assert.equal(posts.length, 1);
-    assert.match(posts[0][0], /review-skills/);
-    assert.deepEqual(posts[0][1], { names: ["plugin:code-review-and-quality"], saveDefaults: false });
-    assert.deepEqual([...app.state.skillOverrides.get("r")], ["plugin:code-review-and-quality"]);
-    assert.equal(app.state.dialog, null);
+    app.state.agentReviewAvailable = true;
+    app.state.agentReviewSettingsAvailable = true;
+    app.state.reviewSkillsAvailable = true;
+    if (defaults) app.state.agentReviewSettings = defaults;
+    return { app, posts, click: clicker(app) };
+};
+
+test("review skills live inside Review settings, not as a separate toolbar button or dialog", async () => {
+    const catalog = { selected: [], skills: [
+        { name: "code-review-and-quality", installations: [{ name: "plugin:code-review-and-quality", source: "plugin", pluginName: "agent-skills", enabled: true }] },
+        { name: "code-simplification", installations: [] },
+        { name: "ponytail-review", installations: [{ name: "ponytail-review", enabled: true, source: "custom" }] },
+    ] };
+    const { app, posts, click } = await skillsApp(catalog);
+    app.state.settings = settingsFixture();
+    app.run("renderTop()");
+    const top = app.node("#top").innerHTML;
+    assert.doesNotMatch(top, /review-skills|Review skills/);
+    assert.match(top, /data-action="agent-review-configure"[^>]*>Review settings/);
+    await click("agent-review-configure");
+    assert.match(app.node("#dialog").innerHTML, /Loading installed skills/);
+    await settle();
+    const html = app.node("#dialog").innerHTML;
+    assert.equal(app.state.dialog.type, "agent-review");
+    assert.match(html, /<legend>Review skills<\/legend>/);
+    assert.match(html, /not reported by host/);
+    assert.match(html, /Not installed or not available/);
+    assert.match(html, /does not bundle, download, install, update, or enable skills/);
+    assert.match(html, /data-action="review-skills-refresh"/);
+    assert.doesNotMatch(html, /review-skills-save|Configure installed review skills/);
+    assert.deepEqual(app.read("state.dialog.skillNames"), []);
+    assert.equal(posts.length, 0, "opening settings never saves or starts work");
 });
 
-test("refreshing installed skills preserves unsaved selections through success and discovery failures", async () => {
+test("refreshing installed skills preserves unsaved reviewer and skill choices through success and discovery failures", async () => {
     let fail = false;
-    const posts = [];
     const catalog = { selected: ["ponytail-review"], skills: [
         { name: "ponytail-review", installations: [{ name: "ponytail-review", enabled: true, source: "custom" }] },
         { name: "code-review-and-quality", installations: [{ name: "code-review-and-quality", enabled: true, source: "custom" }] },
     ] };
-    const app = await loadApp({ fetch: async (url, options) => {
-        if (options?.method === "POST") posts.push(JSON.parse(options.body));
-        if (fail) throw new Error("Host discovery failed");
-        return jsonResponse(catalog);
-    } });
-    app.state.review = reviewFixture();
-    const click = clicker(app);
-    await click("review-skills");
-    assert.deepEqual([...app.state.dialog.names], ["ponytail-review"]);
+    const { app, posts, click } = await skillsApp(catalog, { fail: () => fail });
+    await click("agent-review-configure");
+    await settle();
+    assert.deepEqual(app.read("state.dialog.skillNames"), ["ponytail-review"], "saved skill defaults preselect");
+    await app.run("onInput")({ target: { name: "review-models", value: "my-reviewer" } });
     await app.run("onChange")({ target: { name: "review-skill", value: "ponytail-review", checked: false } });
     await app.run("onChange")({ target: { name: "review-skill", value: "code-review-and-quality", checked: true } });
     await click("review-skills-refresh");
-    assert.deepEqual([...app.state.dialog.names], ["code-review-and-quality"]);
+    assert.deepEqual(app.read("state.dialog.skillNames"), ["code-review-and-quality"]);
     fail = true;
     await click("review-skills-refresh");
     assert.match(app.node("#dialog").innerHTML, /Host discovery failed/);
-    assert.deepEqual([...app.state.dialog.names], ["code-review-and-quality"]);
+    assert.deepEqual(app.read("state.dialog.skillNames"), ["code-review-and-quality"]);
+    assert.equal(app.state.dialog.models, "my-reviewer");
     fail = false;
     await click("review-skills-refresh");
-    await click("review-skills-save");
-    assert.deepEqual(posts, [{ names: ["code-review-and-quality"], saveDefaults: false }]);
+    assert.doesNotMatch(app.node("#dialog").innerHTML, /Host discovery failed/);
+    assert.equal(posts.length, 0);
+    assert.deepEqual([...app.run("agentReviewOptions(state.dialog)").skillNames], ["code-review-and-quality"]);
 });
 
-test("skill defaults require explicit opt-in and per-review choices reach one-click runs", async () => {
-    const posts = [];
-    const review = reviewFixture();
+test("skill defaults require explicit opt-in; Save defaults never starts a review and choices reach one-click runs", async () => {
     const defaults = { models: ["model-a"], focus: "review", intent: "", skipDialog: true };
     const catalog = { selected: [], skills: [{ name: "ponytail-review", installations: [{ name: "ponytail-review", enabled: true, source: "custom" }] }] };
-    const app = await loadApp({ fetch: async (url, options) => {
-        if (options?.method === "POST") { posts.push([url, JSON.parse(options.body)]); return jsonResponse(catalog); }
-        if (url.includes("review-skills")) return jsonResponse(catalog);
-        return jsonResponse(url.includes("snapshot/") ? { revisionId: "r1", files: [] } : { review, agentReviewAvailable: true, agentReviewSettings: defaults });
-    } });
-    app.state.review = review;
-    app.run("renderRuler = () => {}");
-    app.state.agentReviewAvailable = true;
-    const click = clicker(app);
-    await click("review-skills");
-    assert.equal(app.state.dialog.saveDefaults, false);
+    const { app, posts, click } = await skillsApp(catalog, { defaults });
+    await click("agent-review-configure");
+    await settle();
+    assert.equal(app.state.dialog.saveSkillDefaults, false);
     await app.run("onChange")({ target: { name: "review-skill", value: "ponytail-review", checked: true } });
+    await app.run("onChange")({ target: { name: "review-save-defaults", checked: false } });
+    assert.match(app.node("#dialog").innerHTML, /data-action="agent-review-save-defaults" disabled/, "nothing to save without an opt-in");
     await app.run("onChange")({ target: { name: "review-skill-defaults", checked: true } });
-    await click("review-skills-save");
-    assert.equal(posts[0][1].saveDefaults, true);
-    app.state.agentReviewSettings = defaults;
+    assert.doesNotMatch(app.node("#dialog").innerHTML, /data-action="agent-review-save-defaults" disabled/);
+    await click("agent-review-save-defaults");
+    assert.deepEqual(posts, [["/api/review-skills", { names: ["ponytail-review"], saveDefaults: true }]]);
+    assert.equal(app.state.dialog, null);
+    assert.match(app.node("#toast").textContent, /No review was started/);
+    assert.deepEqual([...app.state.skillOverrides.get("r")], ["ponytail-review"]);
     await click("agent-review");
+    assert.equal(posts[1][0], "/api/agent-reviews");
     assert.deepEqual(posts[1][1].skillNames, ["ponytail-review"]);
     assert.equal(posts[1][1].useDefaults, true);
 });
 
-test("Review settings visibly configures Addy and Ponytail without losing unsaved reviewer choices", async () => {
-    const posts = [];
+test("Run review sends this review's skill choices without saving skill defaults", async () => {
     const catalog = { selected: [], skills: [
         { name: "code-review-and-quality", installations: [{ name: "code-review-and-quality", enabled: true, source: "custom" }] },
-        { name: "code-simplification", installations: [{ name: "code-simplification", enabled: true, source: "custom" }] },
         { name: "ponytail-review", installations: [{ name: "ponytail-review", enabled: true, source: "custom" }] },
     ] };
-    const app = await loadApp({ fetch: async (url, options) => {
-        if (options?.method === "POST") posts.push([url, JSON.parse(options.body)]);
-        return jsonResponse(catalog);
-    } });
-    app.state.review = reviewFixture();
-    app.state.agentReviewAvailable = true;
-    app.state.reviewSkillsAvailable = true;
-    const click = clicker(app);
+    const { app, posts, click } = await skillsApp(catalog);
     await click("agent-review-configure");
-    assert.match(app.node("#dialog").innerHTML, /<legend>Installed review skills<\/legend>/);
-    assert.match(app.node("#dialog").innerHTML, /Addy Osmani.*Ponytail/);
+    await settle();
     await app.run("onInput")({ target: { name: "review-models", value: "my-reviewer" } });
-    await click("review-skills");
-    assert.equal(app.state.dialog.names.size, 0);
     await app.run("onChange")({ target: { name: "review-skill", value: "ponytail-review", checked: true } });
-    await click("review-skills-save");
-    assert.equal(app.state.dialog.type, "agent-review");
-    assert.equal(app.state.dialog.models, "my-reviewer");
-    assert.match(app.node("#dialog").innerHTML, /Selected for this review: ponytail-review/);
-    assert.deepEqual(posts.map(([, body]) => body), [{ names: ["ponytail-review"], saveDefaults: false }]);
-    assert.deepEqual([...app.run("agentReviewOptions(state.dialog)").skillNames], ["ponytail-review"]);
+    await click("agent-review-start");
+    assert.deepEqual(posts.map(([url]) => url), ["/api/agent-reviews"]);
+    assert.deepEqual(posts[0][1].skillNames, ["ponytail-review"]);
+    assert.deepEqual(posts[0][1].models, ["my-reviewer"]);
+    assert.deepEqual([...app.state.skillOverrides.get("r")], ["ponytail-review"]);
 });
 
 test("the page provides every container the scope and learning controls render into", async () => {
@@ -180,8 +183,7 @@ test("agent review is opt-in and its dialog collects models, focus, and guidance
     assert.match(app.node("#dialog").innerHTML, /No files are changed until you approve/);
     assert.match(app.node("#dialog").innerHTML, /role="dialog".*aria-modal="true"/);
     assert.match(app.node("#dialog").innerHTML, /Goal, spec, or review guidance \(optional\)/);
-    assert.match(app.node("#dialog").innerHTML, /github\.com\/addyosmani\/agent-skills/);
-    assert.match(app.node("#dialog").innerHTML, /nothing is installed automatically/);
+    assert.doesNotMatch(app.node("#dialog").innerHTML, /<legend>Review skills/, "hosts without skill discovery get no skills section");
     assert.match(app.node("#dialog").innerHTML, /Missing evidence is reported, not treated as a pass/);
     app.run("onInput")({ target: { name: "review-models", value: "model-a, model-b" } });
     app.run("onInput")({ target: { name: "review-intent", value: "Check the documented retry boundary." } });
@@ -243,14 +245,16 @@ test("the prominent review action and agent-comment counts include findings, not
     assert.ok(html.indexOf('aria-label="Change context"') < html.indexOf("Agentic review"));
     assert.match(html, /aria-label="Change context".*Copilot idle.*Refresh/);
     assert.match(html, /class="primary agent-review-launch"[^>]*>Run agentic review/);
-    assert.match(html, /Agent comments \(<span aria-live="polite">2<\/span>\)/);
+    assert.doesNotMatch(html, /Agent comments|agent-comment-count|data-view="agent-comments"/);
+    assert.match(html, /Run agentic review.*Review settings/);
     assert.match(html, /aria-labelledby="manual-review-title".*Delivery: Immediate.*Learning: Off.*Manual review settings/);
-    assert.match(app.node("#side").innerHTML, /Agent comments<\/span><span class="count">2/);
+    assert.match(app.node("#side").innerHTML, /data-view="overview".*<span class="count"[^>]*>2<\/span><span class="name">Agent reviews<\/span>/);
+    assert.doesNotMatch(app.run("overviewView()"), /agent-review-run|Review runs/, "agent reviews live in their own view, not on Overview");
     assert.match(app.run("agentCommentsView()"), /1 active, 1 closed or resolved; 1 from older revisions/);
     assert.doesNotMatch(app.run("agentCommentsView()"), /Reply to human feedback/);
     await clicker(app)("nav", { view: "agent-comments" });
     assert.equal(app.state.view.type, "agent-comments");
-    assert.match(app.node("#main").innerHTML, /Agent comments \(2\)/);
+    assert.match(app.node("#main").innerHTML, /<h2>Agent reviews<\/h2>.*Agent comments \(<span aria-live="polite">2<\/span>\)/);
     app.state.review = reviewFixture({ agentReviews: [{ state: "running" }] });
     app.run("renderTop()");
     assert.match(app.node("#top").innerHTML, /data-action="agent-review"[^>]*disabled>Agentic review running/);

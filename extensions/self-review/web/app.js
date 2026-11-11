@@ -717,25 +717,20 @@ function renderTop() {
     else if (state.busy === false) parts.push(`<span class="pill"><span class="dot muted"></span>Copilot idle${awaiting ? ` · ${awaiting} pending` : ""}</span>`);
     parts.push(`<span class="spacer"></span><button data-action="refresh" title="Re-read the working tree">Refresh</button></div></section>`);
 
-    const findings = agentComments().length;
     const drafts = draftMessages().length;
     const workflows = [];
-    if (state.agentReviewAvailable || findings || state.reviewSkillsAvailable) {
+    if (state.agentReviewAvailable) {
+        const running = r.agentReviews?.some((run) => ["sending", "queued", "running"].includes(run.state));
+        const defaults = state.agentReviewSettings;
+        const hint = defaults?.skipDialog
+            ? `Run with saved defaults: ${defaults.models.join(", ")} (${defaults.focus}). May consume credits.`
+            : "Configure and run a read-only agentic review. May consume credits.";
         workflows.push(`<section class="review-lane agent-review-lane" aria-labelledby="agentic-review-title">`
             + `<div class="review-lane-heading"><h2 id="agentic-review-title">Agentic review</h2><p class="muted">Independent, read-only model review. May consume credits.</p></div>`
-            + `<div class="review-lane-actions">`);
-        if (state.agentReviewAvailable) {
-            const running = r.agentReviews?.some((run) => ["sending", "queued", "running"].includes(run.state));
-            const defaults = state.agentReviewSettings;
-            const hint = defaults?.skipDialog
-                ? `Run with saved defaults: ${defaults.models.join(", ")} (${defaults.focus}). May consume credits.`
-                : "Configure and run a read-only agentic review. May consume credits.";
-            workflows.push(`<button class="primary agent-review-launch" data-action="agent-review" title="${esc(hint)}"${running || state.startingReview ? " disabled" : ""}>${running ? "Agentic review running" : state.startingReview ? "Queuing review..." : "Run agentic review"}</button>`);
-        }
-        workflows.push(`<button class="agent-comment-count" data-action="nav" data-view="agent-comments" title="Agent findings in this scope, across all revisions; excludes replies and manual threads">Agent comments (<span aria-live="polite">${findings}</span>)</button>`);
-        if (state.agentReviewAvailable) workflows.push(`<button data-action="agent-review-configure" title="Configure agentic review and user-wide defaults">Review settings</button>`);
-        if (state.reviewSkillsAvailable) workflows.push(`<button data-action="review-skills">Review skills</button>`);
-        workflows.push(`</div></section>`);
+            + `<div class="review-lane-actions">`
+            + `<button class="primary agent-review-launch" data-action="agent-review" title="${esc(hint)}"${running || state.startingReview ? " disabled" : ""}>${running ? "Agentic review running" : state.startingReview ? "Queuing review..." : "Run agentic review"}</button>`
+            + `<button data-action="agent-review-configure" title="Configure reviewers, focus, guidance, review skills, and user-wide defaults">Review settings</button>`
+            + `</div></section>`);
     }
     workflows.push(`<section class="review-lane feedback-lane" aria-labelledby="manual-review-title">`
         + `<div class="review-lane-heading"><h2 id="manual-review-title">Manual Review</h2><p class="muted">Your comments guide the coding agent; these settings control how they are sent and learned from.</p></div>`
@@ -797,7 +792,6 @@ function dialogHtml() {
     const d = state.dialog;
     if (!d) return "";
     if (d.type === "agent-review") return agentReviewDialogHtml(d);
-    if (d.type === "review-skills") return reviewSkillsDialogHtml(d);
     return `<div class="modal-backdrop" data-action="dialog-backdrop"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby="dialog-desc">`
         + `<h2 id="dialog-title">Review settings</h2>`
         + `<p id="dialog-desc" class="muted">Settings for ${esc(state.settings?.repoName ?? "this repository")}. They are stored on this machine only and never committed.</p>`
@@ -815,10 +809,19 @@ function focusIn(selector) {
 
 // The dialog is rendered on its own so re-renders of the page never disturb its focus or radio state.
 function renderDialog() {
+    const active = document.activeElement?.closest?.("#dialog") ? document.activeElement : null;
+    const key = active?.name ? `[name="${active.name}"]${active.type === "checkbox" ? `[value="${CSS.escape(active.value)}"]` : ""}`
+        : active?.dataset?.action ? `[data-action="${active.dataset.action}"]` : null;
+    const selection = active && "selectionStart" in active ? [active.selectionStart, active.selectionEnd] : null;
     $("#dialog").innerHTML = dialogHtml();
     for (const id of ["#top", "#banner", "#layout"]) {
         const el = $(id);
         if (el) el.inert = Boolean(state.dialog);
+    }
+    const restored = key ? document.querySelector(`#dialog ${key}`) : null;
+    if (restored && !restored.disabled) {
+        restored.focus();
+        if (selection && selection[0] !== null) try { restored.setSelectionRange(...selection); } catch { /* not a text field */ }
     }
 }
 
@@ -831,73 +834,52 @@ function openConfigure() {
 
 function closeConfigure() {
     if (!state.dialog || state.dialog.saving) return;
-    const opener = state.dialog.type === "review-skills" ? "review-skills" : state.dialog.type === "agent-review" ? state.dialog.opener ?? "agent-review" : "configure";
-    state.dialog = state.dialog.previous ?? null;
+    const opener = state.dialog.type === "agent-review" ? state.dialog.opener ?? "agent-review" : "configure";
+    state.dialog = null;
     renderDialog();
     focusIn(`[data-action="${opener}"]`);
 }
 
-function reviewSkillsDialogHtml(d) {
-    const rows = (d.catalog?.skills ?? []).map((skill) => `<fieldset class="choices"><legend>${esc(skill.name)}${skill.name === "ponytail-review" ? " - top-level benefits report" : " - review guidance"}</legend>`
-        + (skill.installations.length ? skill.installations.map((entry) => `<label class="choice"><input type="checkbox" name="review-skill" value="${esc(entry.name)}"${d.names.has(entry.name) ? " checked" : ""}${d.saving || (!entry.enabled && !d.names.has(entry.name)) ? " disabled" : ""}><span>${esc(entry.name)}${entry.enabled ? "" : " (disabled in host)"}<span class="choice-hint">Source: ${esc(entry.source)}${entry.pluginName ? ` / ${esc(entry.pluginName)}` : ""}<br>${esc(entry.path ?? "No local path reported")}<br>Version/revision: not reported by host. Upstream provenance not verified.</span></span></label>`).join("")
-            : `<p class="muted">Not installed or not available to this session.</p>`) + `</fieldset>`).join("");
-    return `<div class="modal-backdrop" data-action="dialog-backdrop"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby="dialog-desc">`
-        + `<h2 id="dialog-title">Installed review skills</h2><p id="dialog-desc">Choose independent opt-ins for this review. Nothing is selected by default. Saving user defaults is a separate choice.</p>`
-        + `<p>Upstream: <a href="https://github.com/addyosmani/agent-skills" target="_blank" rel="noopener noreferrer">Addy Osmani's agent-skills</a> and <a href="https://github.com/DietrichGebert/ponytail" target="_blank" rel="noopener noreferrer">Ponytail</a> (MIT). Matching names alone do not verify an installation's origin.</p>`
-        + `<p class="muted">Addy's selected skills guide review findings. Ponytail review contributes a separate top-level note with concrete simplification opportunities and their benefits, never inline comments. No supported benefits means no benefits comment; the run records absence or unavailable guidance. This uses ponytail-review, not the always-on ponytail coding mode.</p>`
-        + `<p class="muted">Install, update, and enable skills in the host's skill/plugin settings, then refresh here. Self-Review does not bundle, download, update, overwrite, or globally enable skills; local customizations remain untouched. Skill choices are captured per run, but content is loaded by the host at invocation, not version-pinned. Saving this preference never starts a paid review or authorizes fixes.</p>`
-        + rows + [...d.names].filter((name) => !d.catalog?.skills.some((skill) => skill.installations.some((entry) => entry.name === name))).map((name) => `<label class="choice"><input type="checkbox" name="review-skill" value="${esc(name)}" checked${d.saving ? " disabled" : ""}><span>${esc(name)} - unavailable; uncheck to remove this selection</span></label>`).join("")
-        + `<label class="choice"><input type="checkbox" name="review-skill-defaults"${d.saveDefaults ? " checked" : ""}${d.saving ? " disabled" : ""}><span>Save these skill choices as user defaults across repositories</span></label>`
-        + (d.error ? `<div class="modal-error" role="alert">${esc(d.error)}</div>` : "")
-        + `<div class="modal-actions"><button data-action="dialog-cancel"${d.saving ? " disabled" : ""}>Cancel</button><button data-action="review-skills-refresh"${d.saving ? " disabled" : ""}>Refresh from host</button><button class="primary" data-action="review-skills-save"${d.saving || !d.catalog ? " disabled" : ""}>Apply skill choices</button></div></div></div>`;
-}
-
-async function openReviewSkills() {
-    if (state.dialog?.type === "review-skills") return;
-    state.dialog = { type: "review-skills", reviewId: state.review?.reviewId, previous: state.dialog, names: new Set(), catalog: null, error: "", saving: false, saveDefaults: false };
-    renderDialog();
-    await refreshReviewSkills();
+function reviewSkillsSectionHtml(d) {
+    const disabled = d.saving || d.skillsLoading;
+    const names = d.skillNames ?? [];
+    const rows = (d.skillCatalog?.skills ?? []).map((skill) => `<div class="skill-group"><p class="skill-group-name">${esc(skill.name)}${skill.name === "ponytail-review" ? " - top-level benefits report" : " - review guidance"}</p>`
+        + (skill.installations.length ? skill.installations.map((entry) => `<label class="choice"><input type="checkbox" name="review-skill" value="${esc(entry.name)}"${names.includes(entry.name) ? " checked" : ""}${disabled || (!entry.enabled && !names.includes(entry.name)) ? " disabled" : ""}><span>${esc(entry.name)}${entry.enabled ? "" : " (disabled in host)"}<span class="choice-hint">Source: ${esc(entry.source)}${entry.pluginName ? ` / ${esc(entry.pluginName)}` : ""}<br>${esc(entry.path ?? "No local path reported")}<br>Version/revision: not reported by host. Upstream provenance not verified.</span></span></label>`).join("")
+            : `<p class="muted">Not installed or not available to this session. Install it from the host's skill or plugin settings, then refresh.</p>`) + `</div>`).join("");
+    const unavailable = d.skillCatalog ? names.filter((name) => !d.skillCatalog.skills.some((skill) => skill.installations.some((entry) => entry.name === name))) : [];
+    return `<fieldset class="choices review-skills-section"><legend>Review skills</legend>`
+        + `<p class="muted">Optional, independent opt-ins. <a href="https://github.com/addyosmani/agent-skills" target="_blank" rel="noopener noreferrer">Addy Osmani's agent-skills</a> guide review findings; <a href="https://github.com/DietrichGebert/ponytail" target="_blank" rel="noopener noreferrer">Ponytail</a> review adds a separate top-level benefits note, never inline comments (MIT). Matching names alone do not verify an installation's origin.</p>`
+        + (d.skillsLoading && !d.skillCatalog ? `<p class="muted" role="status">Loading installed skills...</p>` : "")
+        + rows
+        + unavailable.map((name) => `<label class="choice"><input type="checkbox" name="review-skill" value="${esc(name)}" checked${disabled ? " disabled" : ""}><span>${esc(name)} - unavailable; uncheck to remove this selection</span></label>`).join("")
+        + (d.skillsError ? `<div class="modal-error" role="alert">${esc(d.skillsError)}</div>` : "")
+        + (state.agentReviewSettingsAvailable ? `<label class="choice"><input type="checkbox" name="review-skill-defaults"${d.saveSkillDefaults ? " checked" : ""}${disabled || !d.skillCatalog ? " disabled" : ""}><span>Save these skill choices as my defaults across repositories</span></label>` : "")
+        + `<p class="muted">Self-Review does not bundle, download, install, update, or enable skills; manage them in the host's skill/plugin settings, then refresh. Skill content is loaded by the host at invocation, not version-pinned.</p>`
+        + `<button data-action="review-skills-refresh"${disabled ? " disabled" : ""}>${d.skillsLoading ? "Refreshing..." : "Refresh from host"}</button></fieldset>`;
 }
 
 async function refreshReviewSkills() {
     const d = state.dialog;
-    if (d?.type !== "review-skills" || d.saving) return;
-    d.saving = true;
-    d.error = "";
+    if (d?.type !== "agent-review" || d.saving || d.skillsLoading) return;
+    d.skillsLoading = true;
+    d.skillsError = "";
     renderDialog();
     try {
-        const firstLoad = !d.catalog;
-        d.catalog = await api("GET", "review-skills");
-        if (firstLoad) {
-            d.names = new Set(d.previous?.skillNames ?? state.skillOverrides.get(d.reviewId)
-                ?? d.catalog.selected ?? d.catalog.skills.flatMap((skill) => skill.installations).filter((entry) => entry.selected).map((entry) => entry.name));
+        const firstLoad = !d.skillCatalog;
+        const catalog = await api("GET", "review-skills");
+        if (state.dialog !== d) return;
+        d.skillCatalog = catalog;
+        if (firstLoad && d.skillNames === undefined) {
+            d.skillNames = catalog.selected ?? catalog.skills.flatMap((skill) => skill.installations).filter((entry) => entry.selected).map((entry) => entry.name);
         }
     } catch (err) {
-        d.error = err.message;
+        d.skillsError = err.message;
     } finally {
-        d.saving = false;
-        if (state.dialog === d) renderDialog();
-    }
-}
-
-async function saveReviewSkills() {
-    const d = state.dialog;
-    if (d?.type !== "review-skills" || d.saving || !d.catalog) return;
-    d.saving = true;
-    d.error = "";
-    renderDialog();
-    try {
-        if (d.reviewId !== state.review?.reviewId) throw new Error("The review changed. Close this dialog and try again.");
-        await api("POST", "review-skills", { names: [...d.names], saveDefaults: d.saveDefaults });
-        state.skillOverrides.set(d.reviewId, [...d.names]);
-        if (d.previous?.type === "agent-review") d.previous.skillNames = [...d.names];
-        d.saving = false;
-        closeConfigure();
-        toast(d.saveDefaults ? "Skill defaults saved. No review was started." : "Skill choices apply to this review only. No review was started.");
-    } catch (err) {
-        d.error = err.message;
-        d.saving = false;
-        renderDialog();
+        d.skillsLoading = false;
+        if (state.dialog === d) {
+            renderDialog();
+            if (!document.activeElement?.closest?.("#dialog")) focusIn('#dialog [data-action="review-skills-refresh"]');
+        }
     }
 }
 
@@ -911,13 +893,7 @@ function agentReviewDialogHtml(d) {
         + `<label class="review-field"><span id="review-focus-label">Focus</span><select name="review-focus" aria-labelledby="review-focus-label"${d.saving ? " disabled" : ""}>${options.map(([value, label]) => `<option value="${value}"${d.focus === value ? " selected" : ""}>${label}</option>`).join("")}</select></label>`
         + `<label class="review-field">Goal, spec, or review guidance (optional)<textarea name="review-intent" maxlength="4000" rows="3" placeholder="Acceptance criteria, a spec reference, or focused review guidance"${d.saving ? " disabled" : ""}>${esc(d.intent)}</textarea></label>`
         + `<p class="muted">The coordinating agent checks findings against the code, baseline, and relevant callers or tests before reporting them. Missing evidence is reported, not treated as a pass.</p>`
-        + `<p class="muted">You can request Addy Osmani's <a href="https://github.com/addyosmani/agent-skills" target="_blank" rel="noopener noreferrer">review and code-simplification skills</a> in the guidance above if installed. They are optional; nothing is installed automatically.</p>`
-        + (state.reviewSkillsAvailable ? `<fieldset class="choices"><legend>Installed review skills</legend>`
-            + `<p>Addy Osmani: review quality and code simplification. Ponytail: a separate evidence-based, top-level benefits note.</p>`
-            + `<p class="muted">${d.skillNames === undefined ? "Uses saved skill defaults unless you override them for this review."
-                : d.skillNames.length ? `Selected for this review: ${d.skillNames.map(esc).join(", ")}`
-                    : "No review skills selected for this review."}</p>`
-            + `<button data-action="review-skills"${d.saving ? " disabled" : ""}>Configure installed review skills</button></fieldset>` : "")
+        + (state.reviewSkillsAvailable ? reviewSkillsSectionHtml(d) : "")
         + (state.agentReviewSettingsAvailable
             ? `<fieldset class="choices"><legend>User defaults for all repositories</legend>`
                 + `<label class="choice"><input type="checkbox" name="review-save-defaults"${d.saveDefaults ? " checked" : ""}${d.saving ? " disabled" : ""}><span>Save these models, focus, and guidance as my defaults</span></label>`
@@ -925,8 +901,8 @@ function agentReviewDialogHtml(d) {
                 + `<p class="muted">Each click on Run agentic review authorizes a credit-consuming review. Nothing runs on save or when opening a canvas. Fixes still need approval. Saved guidance applies across repositories; avoid repository-specific instructions.</p></fieldset>` : "")
         + (d.error ? `<div class="modal-error" role="alert">${esc(d.error)}</div>` : "")
         + `<div class="modal-actions"><button data-action="dialog-cancel"${d.saving ? " disabled" : ""}>Cancel</button>`
-        + (state.agentReviewSettingsAvailable ? `<button data-action="agent-review-save-defaults"${d.saving || !d.saveDefaults ? " disabled" : ""}>Save defaults</button>` : "")
-        + `<button class="primary" data-action="agent-review-start"${d.saving ? " disabled" : ""}>${d.saving ? "Please wait..." : "Run review"}</button></div></div></div>`;
+        + (state.agentReviewSettingsAvailable ? `<button data-action="agent-review-save-defaults"${d.saving || d.skillsLoading || !(d.saveDefaults || d.saveSkillDefaults) ? " disabled" : ""}>Save defaults</button>` : "")
+        + `<button class="primary" data-action="agent-review-start"${d.saving || d.skillsLoading ? " disabled" : ""}>${d.saving ? "Please wait..." : "Run review"}</button></div></div></div>`;
 }
 
 function openAgentReview(opener = "agent-review") {
@@ -938,10 +914,12 @@ function openAgentReview(opener = "agent-review") {
         scope: scopeLabel(scopeOf(state.review)), models: (defaults?.models ?? last?.models ?? state.agentReviewSuggestedModels).join(", "),
         focus: defaults?.focus ?? last?.focus ?? "review", intent: defaults?.intent ?? "", saving: false,
         skillNames: state.skillOverrides.get(state.review.reviewId) ?? defaults?.skillNames,
+        skillCatalog: null, skillsLoading: false, skillsError: "", saveSkillDefaults: false,
         saveDefaults: Boolean(defaults), skipDialog: defaults?.skipDialog ?? false, opener, error: state.agentReviewSettingsError,
     };
     renderDialog();
     focusIn('#dialog input[name="review-models"]');
+    if (state.reviewSkillsAvailable) refreshReviewSkills().catch((err) => toast(err.message, true));
 }
 
 function agentReviewOptions(d) {
@@ -965,8 +943,13 @@ async function startAgentReview(saveOnly = false) {
         if (!saveOnly && (d.reviewId !== state.review?.reviewId || d.revisionId !== state.review?.currentRevisionId)) {
             throw new Error("The review scope changed or revision is stale. Close this dialog and try again.");
         }
-        if (saveOnly && !d.saveDefaults) throw new Error("Select Save these models, focus, and guidance first.");
+        if (saveOnly && !d.saveDefaults && !d.saveSkillDefaults) throw new Error("Select Save these models, focus, and guidance, or save skill choices, first.");
         if (d.saveDefaults) await saveAgentReviewDefaults(d);
+        if (d.saveSkillDefaults) {
+            if (d.reviewId !== state.review?.reviewId) throw new Error("The review changed. Close this dialog and try again.");
+            await api("POST", "review-skills", { names: d.skillNames ?? [], saveDefaults: true });
+        }
+        if (d.skillCatalog && d.skillNames !== undefined) state.skillOverrides.set(d.reviewId, [...d.skillNames]);
         if (!saveOnly) {
             if (d.reviewId !== state.review?.reviewId || d.revisionId !== state.review?.currentRevisionId) {
                 throw new Error("The review scope changed or revision is stale. Close this dialog and try again.");
@@ -1025,9 +1008,10 @@ function agentCommentsView() {
     const threads = agentComments();
     const active = threads.filter((thread) => thread.status === "active").length;
     const older = threads.filter((thread) => thread.agentReview.revisionId !== state.review.currentRevisionId).length;
-    return `<h2>Agent comments (${threads.length})</h2>`
-        + `<p class="muted">${active} active, ${threads.length - active} closed or resolved; ${older} from older revisions. Counts include all agent findings in this scope, not replies or manual threads.</p>`
+    return `<h2>Agent reviews</h2>`
         + agentReviewsHtml()
+        + `<h2>Agent comments (<span aria-live="polite">${threads.length}</span>)</h2>`
+        + `<p class="muted">${active} active, ${threads.length - active} closed or resolved; ${older} from older revisions. Counts include all agent findings in this scope, not replies or manual threads.</p>`
         + (threads.length ? threads.map((thread) => threadHtml(thread, { showLocation: true })).join("") : `<div class="empty">No agent comments yet. A review may still be running or may have reported no findings; check its status above.</div>`);
 }
 
@@ -1035,7 +1019,7 @@ function agentReviewsHtml() {
     const runs = state.review?.agentReviews ?? [];
     if (!runs.length) return "";
     const active = (r) => ["sending", "queued", "running"].includes(r.state);
-    return `<h2>Agent reviews</h2><p class="muted">Assessments and verification are reported by the coordinating agent, not independently attested by the canvas.</p>${[...runs].reverse().map((r) => `<div class="card agent-review-run">`
+    return `<h3>Review runs</h3><p class="muted">Assessments and verification are reported by the coordinating agent, not independently attested by the canvas.</p>${[...runs].reverse().map((r) => `<div class="card agent-review-run">`
         + `<strong>${esc(r.focus)}: ${esc(r.state)}</strong> <span class="pill">${agentComments().filter((thread) => thread.agentReview.runId === r.runId).length} agent comments</span> <span class="muted">${esc(r.revisionId)}${r.revisionId !== state.review.currentRevisionId ? " (older diff)" : ""}</span>`
         + (r.intent ? `<p class="review-summary">Goal / spec / guidance: ${esc(r.intent)}</p>` : "")
         + (r.skills?.length ? `<p class="review-summary">Requested skills (not proof of loading): ${esc(r.skills.map((skill) => skill.name).join(", "))}. See actual use and limits in each result.</p>` : "")
@@ -1108,7 +1092,7 @@ function trapTab(e) {
         const radios = [...document.querySelectorAll(`#dialog input[name="${name}"]`)];
         return radios.find((x) => x.checked) ?? radios[0];
     };
-    const stops = ["agent-review", "review-skills"].includes(state.dialog?.type)
+    const stops = state.dialog?.type === "agent-review"
         ? [...document.querySelectorAll("#dialog input:not([disabled]), #dialog select:not([disabled]), #dialog textarea:not([disabled]), #dialog a[href], #dialog button:not([disabled])")]
         : [...new Set([groupStop("learning"), groupStop("delivery"), ...document.querySelectorAll("#dialog button:not([disabled])")].filter(Boolean))];
     if (!stops.length) return;
@@ -1202,7 +1186,7 @@ function renderSide() {
     const overviewCount = r.threads.filter((t) => t.status === "active" && (t.kind === "overview" || !isPlaced(t))).length;
     const html = [
         `<div class="nav-item${v.type === "overview" ? " active" : ""}" data-action="nav" data-view="overview"><span class="name">Overview</span><span class="count${overviewCount ? "" : " zero"}">${overviewCount}</span></div>`,
-        ...(state.agentReviewAvailable || agentComments().length ? [`<div class="nav-item${v.type === "agent-comments" ? " active" : ""}" data-action="nav" data-view="agent-comments"><span class="name">Agent comments</span><span class="count">${agentComments().length}</span></div>`] : []),
+        ...(state.agentReviewAvailable || agentComments().length ? [`<div class="nav-item${v.type === "agent-comments" ? " active" : ""}" data-action="nav" data-view="agent-comments"><span class="count" title="Agent findings in this scope, across all revisions; excludes replies and manual threads">${agentComments().length}</span><span class="name">Agent reviews</span></div>`] : []),
         `<div class="nav-item${v.type === "lessons" ? " active" : ""}" data-action="nav" data-view="lessons"><span class="name">Lessons learned</span><span class="muted">${r.lessons.length}</span></div>`,
         `<div class="section">Files (${files.length})</div>`,
     ];
@@ -1390,7 +1374,6 @@ function overviewView() {
     };
     const revs = [...r.revisions].reverse().slice(0, 8).map((x) => `<div class="list-row"><span class="mono">${esc(x.revisionId)}</span><span class="snippet">${esc(ago(x.createdAt))} · ${x.files} files · +${x.additions} −${x.deletions} · HEAD ${esc((x.headCommit ?? "").slice(0, 10))}</span></div>`).join("");
     return emptyDiffHtml()
-        + agentReviewsHtml()
         + descriptionHtml()
         + `<h2>Overall discussion</h2>`
         + (overall.length ? overall.map((t) => threadHtml(t)).join("") : `<div class="empty">No overall comments yet.</div>`)
@@ -1826,12 +1809,6 @@ async function onClick(e) {
             case "scope":
                 await switchScope(target.dataset.scope);
                 break;
-            case "review-skills":
-                await openReviewSkills();
-                break;
-            case "review-skills-save":
-                await saveReviewSkills();
-                break;
             case "review-skills-refresh":
                 await refreshReviewSkills();
                 break;
@@ -1865,13 +1842,21 @@ async function onClick(e) {
 
 async function onChange(e) {
     const el = e.target;
-    if (el.name === "review-skill-defaults" && state.dialog?.type === "review-skills") {
-        state.dialog.saveDefaults = el.checked;
+    if (el.name === "review-skill-defaults" && state.dialog?.type === "agent-review") {
+        state.dialog.saveSkillDefaults = el.checked;
+        renderDialog();
+        focusIn(`#dialog input[name="${el.name}"]`);
         return;
     }
-    if (el.name === "review-skill" && state.dialog?.type === "review-skills") {
-        if (el.checked) state.dialog.names.add(el.value);
-        else state.dialog.names.delete(el.value);
+    if (el.name === "review-skill" && state.dialog?.type === "agent-review") {
+        const names = new Set(state.dialog.skillNames ?? []);
+        if (el.checked) names.add(el.value);
+        else names.delete(el.value);
+        state.dialog.skillNames = [...names];
+        if (!el.checked && !el.closest?.(".skill-group")) {
+            renderDialog();
+            focusIn('#dialog [data-action="review-skills-refresh"]');
+        }
         return;
     }
     if ((el.name === "review-save-defaults" || el.name === "review-skip-dialog") && state.dialog?.type === "agent-review") {
