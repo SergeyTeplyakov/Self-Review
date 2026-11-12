@@ -4,11 +4,13 @@ import { mkdir, mkdtemp, rm, readFile, readdir, writeFile } from "node:fs/promis
 import vm from "node:vm";
 import os from "node:os";
 import path from "node:path";
-import { parseUnifiedDiff, synthesizeAddedFile, hunkAnchorRange, selectedLines, hunkExcerpt } from "../dist/lib/diff.mjs";
-import { relocate } from "../dist/lib/anchors.mjs";
-import { buildCommentPrompt, marker } from "../dist/lib/prompt.mjs";
-import { Store, migrateLegacyDataRoot } from "../dist/lib/store.mjs";
+import {
+    Store, buildCommentPrompt, hunkAnchorRange, hunkExcerpt, marker, migrateLegacyDataRoot,
+    parseUnifiedDiff, relocate, selectedLines, synthesizeAddedFile,
+} from "./modules.mjs";
 import { loadApp } from "./load-app.mjs";
+import type { CommentPromptInput } from "../src/lib/prompt.mjs";
+import type { Lesson, Review, ReviewMessage, ReviewThread } from "../src/lib/review-service.mjs";
 
 const DIFF = [
     "diff --git a/src/a.cs b/src/a.cs",
@@ -48,6 +50,36 @@ const DIFF = [
     "",
 ].join("\n");
 
+function required<T>(value: T | null | undefined): T {
+    assert.ok(value);
+    return value;
+}
+
+function reviewFixture(overrides: Partial<Review> = {}): Review {
+    return {
+        schema: 1, reviewId: "rev-1", repoRoot: "C:\\repo", branch: "main", title: "main",
+        base: "master", paths: [], exclude: [], includeUntracked: false, contextLines: 3,
+        scope: "all", currentRevisionId: "r1", revisions: [], threads: [], lessons: [], git: null,
+        createdAt: "2026-01-01T00:00:00.000Z", ...overrides,
+    };
+}
+
+function messageFixture(overrides: Partial<ReviewMessage> = {}): ReviewMessage {
+    return { messageId: "m-current", author: "user", body: "Review this.", createdAt: "2026-01-01T00:00:00.000Z", ...overrides };
+}
+
+function threadFixture(overrides: Partial<ReviewThread> = {}): ReviewThread {
+    return {
+        threadId: "t-1", kind: "line", status: "active", author: "user", createdAt: "2026-01-01T00:00:00.000Z",
+        anchor: null, location: null, messages: [], ...overrides,
+    };
+}
+
+type PromptOptions = Omit<CommentPromptInput, "excerpt" | "selected"> & Partial<Pick<CommentPromptInput, "excerpt" | "selected">>;
+function buildPrompt(input: PromptOptions) {
+    return buildCommentPrompt({ excerpt: null, selected: null, ...input });
+}
+
 test("parseUnifiedDiff handles dash/plus content, renames, no-newline, deletes, quoted paths", () => {
     const files = parseUnifiedDiff(DIFF);
     assert.equal(files.length, 4);
@@ -83,7 +115,7 @@ test("hunk helpers select lines per side", () => {
     assert.deepEqual(selectedLines(a, "new", 2, 3), ["++ not a header, an added line starting with pluses", "line3"]);
     assert.deepEqual(selectedLines(a, "old", 2, 2), ["-- not a header, a deleted line starting with dashes"]);
     const ex = hunkExcerpt(a, "new", 2, 2);
-    assert.match(ex.text, /^@@ -1,4 \+1,4 @@ class A\n/);
+    assert.match(required(ex).text, /^@@ -1,4 \+1,4 @@ class A\n/);
     assert.equal(hunkExcerpt(a, "new", 50, 60), null);
 });
 
@@ -107,17 +139,14 @@ test("relocate follows moved code, prefers nearest match, and marks removed code
 });
 
 test("prompt carries marker, location, fenced code and reply instructions", () => {
-    const review = { reviewId: "rev-1", repoRoot: "C:\\repo", branch: "b", base: "master", headCommit: "abcdef1234567", baseCommit: "1234567abcdef", currentRevisionId: "r2" };
-    const message = { messageId: "m-11111111-2222-3333-4444-555555555555", author: "user", body: "Use a named argument here" };
-    const thread = {
-        threadId: "t-1",
-        kind: "line",
-        status: "active",
+    const review = reviewFixture({ branch: "b", headCommit: "abcdef1234567", baseCommit: "1234567abcdef", currentRevisionId: "r2" });
+    const message = messageFixture({ messageId: "m-11111111-2222-3333-4444-555555555555", body: "Use a named argument here" });
+    const thread = threadFixture({
         anchor: { revisionId: "r1", path: "src/a.cs", side: "new", startLine: 3, endLine: 3 },
         location: { revisionId: "r2", path: "src/a.cs", side: "new", startLine: 5, endLine: 5, state: "current" },
         messages: [message],
-    };
-    const { prompt, displayPrompt } = buildCommentPrompt({ review, thread, message, instanceId: "inst-1", excerpt: { text: "@@ -1 +1 @@\n+x" }, selected: ["Foo(```, null);"] });
+    });
+    const { prompt, displayPrompt } = buildPrompt({ review, thread, message, instanceId: "inst-1", excerpt: { text: "@@ -1 +1 @@\n+x" }, selected: ["Foo(```, null);"] });
     assert.ok(prompt.startsWith(`[self-review ${marker("rev-1", message.messageId)}]`));
     assert.match(prompt, /src\/a\.cs L5/);
     assert.match(prompt, /originally: src\/a\.cs L3 in r1/);
@@ -128,17 +157,17 @@ test("prompt carries marker, location, fenced code and reply instructions", () =
 });
 
 test("every comment kind and follow-up carries the guideline-learning contract in auto mode", () => {
-    const review = { reviewId: "rev-1", repoRoot: "C:\\repo", base: "master", currentRevisionId: "r1" };
-    const prior = { messageId: "m-prior", author: "agent", body: "Earlier answer", outcome: "answered" };
-    const message = { messageId: "m-current", author: "user", body: "Use init and required properties." };
+    const review = reviewFixture();
+    const prior = messageFixture({ messageId: "m-prior", author: "agent", body: "Earlier answer", outcome: "answered" });
+    const message = messageFixture({ body: "Use init and required properties." });
     for (const kind of ["overview", "file", "change", "line"]) {
         for (const isReply of [false, true]) {
-            const thread = {
-                threadId: "t-1", kind, status: "active",
-                location: { revisionId: "r1", path: "src/a.cs", side: "new", startLine: 3, endLine: 3 },
+            const thread = threadFixture({
+                kind,
+                location: { revisionId: "r1", path: "src/a.cs", side: "new", startLine: 3, endLine: 3, state: "current" },
                 messages: isReply ? [prior, message] : [message],
-            };
-            const { prompt } = buildCommentPrompt({ review, thread, message, instanceId: "inst-1", learning: "auto" });
+            });
+            const { prompt } = buildPrompt({ review, thread, message, instanceId: "inst-1", learning: "auto" });
             assert.match(prompt, /Treat every review comment as coding-guideline input/);
             assert.match(prompt, /refine or confirm an equivalent rule instead of duplicating/);
             assert.match(prompt, /Do not silently skip a comment because the fix is local/);
@@ -153,20 +182,19 @@ test("every comment kind and follow-up carries the guideline-learning contract i
     }
 });
 
-function learningFixture(lessons = []) {
-    const review = { reviewId: "rev-1", repoRoot: "C:\\repo", base: "master", currentRevisionId: "r1", lessons };
-    const message = { messageId: "m-current", author: "user", body: "Use required properties." };
-    const thread = {
-        threadId: "t-1", kind: "line", status: "active",
-        location: { revisionId: "r1", path: "src/a.cs", side: "new", startLine: 3, endLine: 3 },
+function learningFixture(lessons: Lesson[] = []): Omit<CommentPromptInput, "excerpt" | "selected"> {
+    const review = reviewFixture({ lessons });
+    const message = messageFixture({ body: "Use required properties." });
+    const thread = threadFixture({
+        location: { revisionId: "r1", path: "src/a.cs", side: "new", startLine: 3, endLine: 3, state: "current" },
         messages: [message],
-    };
+    });
     return { review, thread, message, instanceId: "inst-1" };
 }
 
 test("guideline learning is off unless a mode is chosen, and only off-mode text applies", () => {
     for (const learning of [undefined, "off", "bogus"]) {
-        const { prompt } = buildCommentPrompt({ ...learningFixture(), learning });
+        const { prompt } = buildPrompt({ ...learningFixture(), learning });
         assert.match(prompt, /Guideline learning is off for this repository/);
         assert.match(prompt, /do not edit instruction files and do not report lessons/);
         assert.doesNotMatch(prompt, /Treat every review comment as coding-guideline input/);
@@ -177,7 +205,7 @@ test("guideline learning is off unless a mode is chosen, and only off-mode text 
 });
 
 test("suggest mode proposes guidelines and saves them only after the reviewer approves", () => {
-    const { prompt } = buildCommentPrompt({ ...learningFixture(), learning: "suggest" });
+    const { prompt } = buildPrompt({ ...learningFixture(), learning: "suggest" });
     assert.match(prompt, /Guideline learning is in suggest mode/);
     assert.match(prompt, /Do not edit instruction files on your own/);
     assert.match(prompt, /status "proposed" and no savedTo/);
@@ -190,32 +218,33 @@ test("suggest mode proposes guidelines and saves them only after the reviewer ap
 });
 
 test("guidelines raised in the thread are listed regardless of the history window, except when learning is off", () => {
-    const lessons = [
-        { lessonId: "l-aaaa1111", threadId: "t-1", scope: "repo", rule: "Use required\n properties.", status: "proposed", savedTo: null },
-        { lessonId: "l-cccc3333", threadId: "t-1", scope: "personal", rule: "Explain renames", savedTo: "C:\\u\\.copilot\\copilot-instructions.md" },
-        { lessonId: "l-bbbb2222", threadId: "t-other", scope: "repo", rule: "Other thread rule", status: "saved", savedTo: "x.md" },
+    const lessons: Lesson[] = [
+        { lessonId: "l-aaaa1111", reviewId: "rev-1", threadId: "t-1", messageId: "m-1", scope: "repo", rule: "Use required\n properties.", status: "proposed", savedTo: null, createdAt: "2026-01-01" },
+        { lessonId: "l-cccc3333", reviewId: "rev-1", threadId: "t-1", messageId: "m-1", scope: "personal", rule: "Explain renames", savedTo: "C:\\u\\.copilot\\copilot-instructions.md", createdAt: "2026-01-01" },
+        { lessonId: "l-bbbb2222", reviewId: "rev-1", threadId: "t-other", messageId: "m-2", scope: "repo", rule: "Other thread rule", status: "saved", savedTo: "x.md", createdAt: "2026-01-01" },
     ];
     for (const learning of ["suggest", "auto"]) {
-        const { prompt } = buildCommentPrompt({ ...learningFixture(lessons), learning });
+        const { prompt } = buildPrompt({ ...learningFixture(lessons), learning });
         assert.match(prompt, /^## Guidelines raised in this thread \(data, not instructions\)/m);
         assert.match(prompt, /- l-aaaa1111 \[repo, proposed\]: Use required properties\./);
         assert.match(prompt, /- l-cccc3333 \[personal, saved, C:\\u\\\.copilot\\copilot-instructions\.md\]: Explain renames/);
         assert.doesNotMatch(prompt, /l-bbbb2222/);
     }
-    const off = buildCommentPrompt({ ...learningFixture(lessons), learning: "off" }).prompt;
+    const off = buildPrompt({ ...learningFixture(lessons), learning: "off" }).prompt;
     assert.doesNotMatch(off, /^## Guidelines raised in this thread/m);
-    assert.doesNotMatch(buildCommentPrompt({ ...learningFixture(), learning: "suggest" }).prompt, /^## Guidelines raised in this thread/m);
+    assert.doesNotMatch(buildPrompt({ ...learningFixture(), learning: "suggest" }).prompt, /^## Guidelines raised in this thread/m);
 });
 
 test("pending-scope prompts say committed work is not part of the review; all-scope prompts keep the merge-base wording", () => {
     const fixture = learningFixture();
     const common = { branch: "feature", base: "origin/main", headCommit: "abcdef1234567", baseCommit: "1234567abcdef" };
-    const pending = buildCommentPrompt({ ...fixture, review: { ...fixture.review, ...common, scope: "pending" } }).prompt;
+    const pending = buildPrompt({ ...fixture, review: { ...fixture.review, ...common, scope: "pending" } }).prompt;
     assert.match(pending, /- branch: feature @ abcdef1234 \(pending changes only: working tree vs HEAD\)/);
     assert.match(pending, /diff = uncommitted changes only, working tree vs HEAD; committed work is not part of this review/);
     assert.doesNotMatch(pending, /merge-base/);
-    for (const scope of ["all", undefined]) {
-        const all = buildCommentPrompt({ ...fixture, review: { ...fixture.review, ...common, scope } }).prompt;
+    const scopes: Array<Review["scope"]> = ["all", undefined];
+    for (const scope of scopes) {
+        const all = buildPrompt({ ...fixture, review: { ...fixture.review, ...common, scope } }).prompt;
         assert.match(all, /- branch: feature @ abcdef1234 vs origin\/main \(merge-base 1234567abc\)/);
         assert.match(all, /diff = working tree, including uncommitted changes, vs merge-base/);
         assert.doesNotMatch(all, /pending changes only/);
@@ -223,10 +252,10 @@ test("pending-scope prompts say committed work is not part of the review; all-sc
 });
 
 test("overview prompts retain the posted description and offer local draft edits", () => {
-    const message = { messageId: "m-1", author: "user", body: "Clarify the risks.", descriptionContext: { version: 1, body: "Original draft" } };
-    const review = { reviewId: "r", description: { version: 2, body: "Updated draft" } };
-    const thread = { threadId: "t", kind: "overview", messages: [message] };
-    const { prompt } = buildCommentPrompt({ review, thread, message, instanceId: "i" });
+    const message = messageFixture({ messageId: "m-1", body: "Clarify the risks.", descriptionContext: { version: 1, revisionId: "r1", body: "Original draft", updatedAt: "2026-01-01" } });
+    const review = reviewFixture({ reviewId: "r", description: { version: 2, revisionId: "r1", body: "Updated draft", updatedAt: "2026-01-02" } });
+    const thread = threadFixture({ threadId: "t", kind: "overview", messages: [message] });
+    const { prompt } = buildPrompt({ review, thread, message, instanceId: "i" });
     assert.match(prompt, /Description when this comment was posted \(v1\):/);
     assert.match(prompt, /Original draft/);
     assert.match(prompt, /Current description \(v2\):/);
@@ -334,7 +363,7 @@ test("navigating to a nested file reveals its ancestors in the sidebar", async (
     const main = { scrollTop: 1 };
     const context = vm.createContext({
         URLSearchParams, location: { search: "" },
-        document: { addEventListener() {}, querySelector: (selector) => selector === "#main" ? main : {} },
+        document: { addEventListener() {}, querySelector: (selector: string) => selector === "#main" ? main : {} },
         localStorage: { getItem: () => null, setItem() {} }, sessionStorage: { setItem() {} }, setInterval() {},
     });
     await loadApp(context);
@@ -391,7 +420,7 @@ test("overview ruler merges adjacent changed rows and scales to scroll height", 
     const marks = JSON.parse(vm.runInContext(`JSON.stringify(rulerMarks([
         { kind: "add", top: 100, height: 20 }, { kind: "add", top: 120, height: 20 },
         { kind: "del", top: 140, height: 20 }, { kind: "add", top: 500, height: 20 },
-    ], 1000))`, context));
+    ], 1000))`, context)) as Array<{ kind: string; top: number; topPct: number; heightPct: number }>;
     assert.deepEqual(marks.map((m) => [m.kind, m.top, Math.round(m.topPct), Math.round(m.heightPct)]), [
         ["add", 100, 10, 4], ["del", 140, 14, 2], ["add", 500, 50, 2],
     ]);
@@ -401,9 +430,12 @@ test("store serializes concurrent updates and persists instance mapping", async 
     const dir = await mkdtemp(path.join(os.tmpdir(), "mr-store-"));
     try {
         const store = new Store(dir);
-        await store.updateReview("r-1", () => ({ review: { reviewId: "r-1", n: 0 } }));
-        await Promise.all(Array.from({ length: 20 }, () => store.updateReview("r-1", (r) => ({ review: { ...r, n: r.n + 1 } }))));
-        assert.equal((await store.readReview("r-1")).n, 20);
+        await store.updateReview("r-1", () => ({ review: reviewFixture({ reviewId: "r-1", contextLines: 0 }) }));
+        await Promise.all(Array.from({ length: 20 }, () => store.updateReview("r-1", (r) => {
+            const current = required(r);
+            return { review: { ...current, contextLines: current.contextLines + 1 } };
+        })));
+        assert.equal(required(await store.readReview("r-1")).contextLines, 20);
         assert.equal(await store.updateReview("r-1", () => ({ write: false, value: 7 })), 7);
         await store.setInstanceReview("inst", "r-1");
         assert.equal(await new Store(dir).getInstanceReview("inst"), "r-1");
@@ -420,7 +452,7 @@ test("legacy Manual Review Canvas data is copied once without locks or temp file
         const root = path.join(dir, "self-review");
         assert.equal(await migrateLegacyDataRoot(root, legacy), false, "nothing to copy");
         const old = new Store(legacy);
-        await old.updateReview("r-1", () => ({ review: { reviewId: "r-1", n: 1 } }));
+        await old.updateReview("r-1", () => ({ review: reviewFixture({ reviewId: "r-1", contextLines: 1 }) }));
         await old.setInstanceReview("inst", "r-1");
         await mkdir(path.join(legacy, "locks"), { recursive: true });
         await writeFile(path.join(legacy, "locks", "stale.lock"), "");
@@ -428,16 +460,16 @@ test("legacy Manual Review Canvas data is copied once without locks or temp file
 
         assert.equal(await migrateLegacyDataRoot(root, legacy), true);
         const migrated = new Store(root);
-        assert.equal((await migrated.readReview("r-1")).n, 1);
+        assert.equal(required(await migrated.readReview("r-1")).contextLines, 1);
         assert.equal(await migrated.getInstanceReview("inst"), "r-1");
         assert.ok(!(await readdir(root)).includes("locks"));
         assert.ok(!(await readdir(path.join(root, "reviews"))).some((name) => name.endsWith(".tmp")));
-        assert.equal((await old.readReview("r-1")).n, 1, "legacy data stays intact");
+        assert.equal(required(await old.readReview("r-1")).contextLines, 1, "legacy data stays intact");
         assert.ok(!(await readdir(dir)).some((name) => name.endsWith(".tmp")));
 
-        await migrated.updateReview("r-1", (r) => ({ review: { ...r, n: 2 } }));
+        await migrated.updateReview("r-1", (r) => ({ review: { ...required(r), contextLines: 2 } }));
         assert.equal(await migrateLegacyDataRoot(root, legacy), false, "an existing root is never overwritten");
-        assert.equal((await migrated.readReview("r-1")).n, 2);
+        assert.equal(required(await migrated.readReview("r-1")).contextLines, 2);
     } finally {
         await rm(dir, { recursive: true, force: true });
     }
@@ -450,7 +482,7 @@ test("syntax highlighting escapes source, preserves text, and recognizes code an
         localStorage: { getItem: () => null }, setInterval() {},
     });
     await loadApp(context);
-    const highlight = (text, language) => vm.runInContext(`highlightLine(${JSON.stringify(text)}, ${JSON.stringify(language)})`, context);
+    const highlight = (text: string, language: string | null) => vm.runInContext(`highlightLine(${JSON.stringify(text)}, ${JSON.stringify(language)})`, context);
     const code = highlight('public required string Name { get; init; } = "<script>&"; // note', "code");
     assert.match(code, /syn-keyword">public/);
     assert.match(code, /syn-keyword">required/);
@@ -473,7 +505,8 @@ test("syntax highlighting escapes source, preserves text, and recognizes code an
         ['key: "x" # comment', "yaml"],
     ]) {
         const plain = highlight(source, language).replace(/<\/?span\b[^>]*>/g, "");
-        assert.equal(plain, source.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]));
+        const entities: Record<string, string> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+        assert.equal(plain, source.replace(/[&<>"']/g, (c: string) => required(entities[c])));
     }
     assert.equal(vm.runInContext('syntaxLanguage("Settings.xml")', context), "xml");
     assert.equal(vm.runInContext('syntaxLanguage("workflow.YAML")', context), "yaml");
@@ -522,8 +555,9 @@ test("markdown highlighting keeps every marker visible and styles inline content
     });
     await loadApp(context);
     vm.runInContext("var mdState = {}", context);
-    const highlight = (text) => vm.runInContext(`highlightLine(${JSON.stringify(text)}, "markdown", mdState)`, context);
-    const escape = (text) => text.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+    const highlight = (text: string) => vm.runInContext(`highlightLine(${JSON.stringify(text)}, "markdown", mdState)`, context);
+    const entities: Record<string, string> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+    const escape = (text: string) => text.replace(/[&<>"']/g, (c: string) => required(entities[c]));
     const heading = highlight("## Setup `npm` **now** ##");
     assert.match(heading, /^<span class="md-mark">##<\/span><span class="md-heading"> Setup <span class="md-code"><span class="md-mark">`<\/span>npm<span class="md-mark">`<\/span><\/span>/);
     assert.match(heading, /md-strong"><span class="md-mark">\*\*<\/span>now<span class="md-mark">\*\*<\/span>/);
@@ -600,8 +634,8 @@ test("syntax and line-number colors retain WCAG AA contrast on light and dark di
     assert.match(css, /body\[data-theme-tone="light"\]\s*\{/);
     assert.match(css, /:root:not\(\[data-theme-tone="light"\]\)\s*\{/);
     assert.match(css, /:root\[data-theme-tone="dark"\],\s*body\[data-theme-tone="dark"\]\s*\{/);
-    const luminance = (hex) => {
-        const rgb = hex.match(/[\da-f]{2}/gi).map((part) => {
+    const luminance = (hex: string) => {
+        const rgb = required(hex.match(/[\da-f]{2}/gi)).map((part: string) => {
             const value = parseInt(part, 16) / 255;
             return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
         });
@@ -610,7 +644,7 @@ test("syntax and line-number colors retain WCAG AA contrast on light and dark di
     const themes = css.split("@media (prefers-color-scheme: dark)");
     const overlays = [...css.matchAll(/--mr-md-[\w-]+-bg:\s*rgba\(127,\s*127,\s*127,\s*([\d.]+)\);/g)].map((m) => Number(m[1]));
     assert.equal(overlays.length, 2, "markdown code and fence tints must stay neutral overlays");
-    const blend = (hex, alpha) => `#${hex.match(/[\da-f]{2}/gi).map((part) => Math.round(parseInt(part, 16) * (1 - alpha) + 127 * alpha).toString(16).padStart(2, "0")).join("")}`;
+    const blend = (hex: string, alpha: number) => `#${required(hex.match(/[\da-f]{2}/gi)).map((part: string) => Math.round(parseInt(part, 16) * (1 - alpha) + 127 * alpha).toString(16).padStart(2, "0")).join("")}`;
     for (const [index, section] of themes.entries()) {
         const colors = Object.fromEntries([...section.matchAll(/--mr-([\w-]+):\s*(#[\da-f]{6});/gi)].map((m) => [m[1], m[2]]));
         // Markdown tints only appear inside code cells, never over the line-number gutters.

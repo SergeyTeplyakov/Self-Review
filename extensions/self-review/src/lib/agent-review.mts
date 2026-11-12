@@ -2,36 +2,142 @@
 import { createHash, randomUUID } from "node:crypto";
 import { ReviewError, isRetiredCommitReview, retiredCommitError } from "./review-service.mjs";
 import { selectedLines } from "./diff.mjs";
-import { reviewOptions, REVIEW_FOCUSES, FUSION_REVIEWER, SUGGESTED_REVIEWERS } from "../web/contracts.mjs";
+import { reviewOptions, REVIEW_FOCUSES, FUSION_REVIEWER, SUGGESTED_REVIEWERS, isRecord } from "../web/contracts.mjs";
 export { reviewOptions, REVIEW_FOCUSES, FUSION_REVIEWER, SUGGESTED_REVIEWERS } from "../web/contracts.mjs";
+import type { ReviewService, Review, ReviewThread, ReviewMessage } from "./review-service.mjs";
+import type { Store } from "./store.mjs";
+import type { SettingsService } from "./settings.mjs";
+import type { ReviewSkills, RunSkill, RunSkillWithContent } from "./review-skills.mjs";
+import type { AgentReviewOptions, AgentReviewDefaults, Log } from "../../types/contracts.js";
+import type { DiffSide } from "./diff.mjs";
+import type { SendOptions } from "./delivery.mjs";
+
+export interface FindingEvidence { source: string; baseline: string; validation: string }
+export interface FindingMetadata {
+    runId: string;
+    model: string;
+    category: string;
+    revisionId: string;
+    assessment: string;
+    severity: string;
+    evidence: FindingEvidence;
+    approvalMessageId?: string;
+}
+export interface FindingInput {
+    kind: string;
+    path?: string;
+    side?: DiffSide;
+    startLine?: number;
+    endLine?: number;
+    category: string;
+    severity: string;
+    assessment: string;
+    body: string;
+    evidence: unknown;
+}
+export interface PonytailBenefit {
+    proposal: string;
+    benefit: string;
+    evidence: FindingEvidence;
+}
+export interface PonytailResult {
+    status: string;
+    summary: string;
+    benefits: PonytailBenefit[];
+}
+export interface AgentReviewResult {
+    model: string;
+    digest: string;
+    state: "failed" | "completed";
+    error?: string;
+    summary?: string;
+    ponytail?: PonytailResult;
+    threadIds: string[];
+    finishedAt: string;
+}
+export interface AgentReviewRun extends AgentReviewOptions {
+    runId: string;
+    skills?: RunSkill[];
+    revisionId: string;
+    owner: string;
+    state: "sending" | "queued" | "running" | "failed" | "partial" | "completed" | "closed";
+    createdAt: string;
+    results: AgentReviewResult[];
+    claimPid: number;
+    finishedAt?: string;
+    error?: string;
+    transportId?: string;
+    ponytailThreadId?: string;
+}
+export interface StartReviewInput {
+    revisionId?: unknown;
+    useDefaults?: unknown;
+    models?: unknown;
+    focus?: unknown;
+    intent?: unknown;
+    skillNames?: unknown;
+}
+export interface AgentReviewInput {
+    runId?: unknown;
+    path?: unknown;
+    hunkIndex?: unknown;
+    side?: unknown;
+    startLine?: unknown;
+}
+export type AgentFileContent = (
+    { available: true; lines: string[]; absent?: boolean } |
+    { available: false; reason: string; stale?: boolean }
+) & {
+    revisionId?: string;
+    path?: string;
+    startLine?: number;
+    lineCount?: number;
+    nextStartLine?: number | null;
+};
+export interface AgentReviewReport {
+    runId?: unknown;
+    model?: unknown;
+    findings?: unknown;
+    summary?: unknown;
+    error?: unknown;
+    ponytail?: unknown;
+}
+const errorMessage = (error: unknown) => String(
+    error && typeof error === "object" && "message" in error ? error.message ?? error : error,
+);
 
 export const ACTIVE_RUN_STATES = ["sending", "queued", "running"];
 export const FINDING_ASSESSMENTS = ["confirmed", "pre-existing", "rejected", "unverified"];
 export const FINDING_SEVERITIES = ["critical", "required", "optional", "nit", "fyi"];
-export const EVIDENCE_FIELDS = ["source", "baseline", "validation"];
+export const EVIDENCE_FIELDS: (keyof FindingEvidence)[] = ["source", "baseline", "validation"];
 // Fusion is an Auto routing tier, not a subagent model ID, so it is dispatched through a child session.
 const now = () => new Date().toISOString();
-const invalid = (message) => new ReviewError("invalid_input", message);
-const conflict = (message) => new ReviewError("conflict", message);
-const runIn = (review, runId) => {
+const invalid = (message: string) => new ReviewError("invalid_input", message);
+const conflict = (message: string) => new ReviewError("conflict", message);
+const runIn = (review: Review | null, runId: unknown) => {
     const run = review?.agentReviews?.find((r) => r.runId === runId);
     if (!run) throw new ReviewError("not_found", `Agent review ${runId} not found.`);
     return run;
 };
 
-function requiredText(value, name, maxLength) {
+function requiredText(value: unknown, name: string, maxLength: number) {
     if (typeof value !== "string" || !value.trim() || value.length > maxLength) {
         throw invalid(`${name} must be non-empty text (up to ${maxLength} characters).`);
     }
     return value.trim();
 }
 
-function evidenceOf(value) {
+function evidenceOf(value: unknown): FindingEvidence {
     if (!value || typeof value !== "object" || Array.isArray(value)) throw invalid("Finding evidence is required.");
-    return Object.fromEntries(EVIDENCE_FIELDS.map((key) => [key, requiredText(value[key], `evidence.${key}`, 2000)]));
+    const fields = value as Record<string, unknown>;
+    return {
+        source: requiredText(fields.source, "evidence.source", 2000),
+        baseline: requiredText(fields.baseline, "evidence.baseline", 2000),
+        validation: requiredText(fields.validation, "evidence.validation", 2000),
+    };
 }
 
-export function buildAgentReviewPrompt(review, run, instanceId, skillContent = []) {
+export function buildAgentReviewPrompt(review: Review, run: AgentReviewRun, instanceId: string, skillContent: RunSkillWithContent[] = []): SendOptions {
     const address = JSON.stringify({ instanceId, reviewId: review.reviewId, runId: run.runId });
     const fusion = run.models.includes(FUSION_REVIEWER);
     const subagentModels = run.models.filter((model) => model !== FUSION_REVIEWER);
@@ -115,7 +221,18 @@ export function buildAgentReviewPrompt(review, run, instanceId, skillContent = [
 }
 
 export class AgentReview {
-    constructor({ service, send, sessionId, settings, reviewSkills, log = () => {} }) {
+    readonly service: ReviewService;
+    readonly store: Store;
+    readonly send: (options: SendOptions) => Promise<string>;
+    readonly sessionId: () => string | undefined;
+    readonly settings: SettingsService;
+    readonly reviewSkills?: ReviewSkills;
+    readonly log: Log;
+
+    constructor({ service, send, sessionId, settings, reviewSkills, log = () => {} }: {
+        service: ReviewService; send: (options: SendOptions) => Promise<string>; sessionId: () => string | undefined;
+        settings: SettingsService; reviewSkills?: ReviewSkills; log?: Log;
+    }) {
         this.service = service;
         this.store = service.store;
         this.send = send;
@@ -131,13 +248,14 @@ export class AgentReview {
         return owner;
     }
 
-    async start(reviewId, input, instanceId) {
+    async start(reviewId: string, input: StartReviewInput, instanceId: string) {
         const review = await this.service.getReview(reviewId);
         if (isRetiredCommitReview(review)) throw retiredCommitError(review);
         if (typeof input.revisionId !== "string") throw invalid("revisionId is required.");
-        let selected = input;
+        const revisionId = input.revisionId;
+        let selected: StartReviewInput | AgentReviewDefaults | null = input;
         if (input.useDefaults !== undefined) {
-            if (input.useDefaults !== true || ["models", "focus", "intent"].some((key) => input[key] !== undefined)) {
+            if (input.useDefaults !== true || [input.models, input.focus, input.intent].some((value) => value !== undefined)) {
                 throw invalid("Use saved defaults or explicit models, focus, and intent, not both.");
             }
             selected = await this.settings?.getAgentReview();
@@ -153,12 +271,12 @@ export class AgentReview {
         await this.service.refresh(reviewId);
         const run = await this.store.updateReview(reviewId, async (review) => {
             if (!review) throw new ReviewError("not_found", "Review not found.");
-            if (review.currentRevisionId !== input.revisionId) throw conflict("The diff changed. Refresh and check it before starting a review.");
+            if (review.currentRevisionId !== revisionId) throw conflict("The diff changed. Refresh and check it before starting a review.");
             if (review.agentReviews?.some((r) => ACTIVE_RUN_STATES.includes(r.state))) throw conflict("This review already has an active agent review.");
-            const snapshot = await this.service.getSnapshot(reviewId, input.revisionId);
+            const snapshot = await this.service.getSnapshot(reviewId, revisionId);
             if (!snapshot.files.length) throw invalid("There are no changes to review.");
-            const run = {
-                runId: `ar-${randomUUID()}`, ...options, skills, revisionId: input.revisionId,
+            const run: AgentReviewRun = {
+                runId: `ar-${randomUUID()}`, ...options, skills, revisionId,
                 owner, state: "sending", createdAt: now(), results: [], claimPid: this.service.pid,
             };
             (review.agentReviews ??= []).push(run);
@@ -181,12 +299,12 @@ export class AgentReview {
                 const current = runIn(review, run.runId);
                 if (ACTIVE_RUN_STATES.includes(current.state)) {
                     current.state = "failed";
-                    current.error = String(err?.message ?? err);
+                    current.error = errorMessage(err);
                     current.finishedAt = now();
                 }
                 return { review };
             });
-            this.log(`self-review: could not send agent review ${run.runId}: ${err?.message ?? err}`, "warning");
+            this.log(`self-review: could not send agent review ${run.runId}: ${errorMessage(err)}`, "warning");
             throw err;
         } finally {
             this.service.changed(reviewId, "agent-review");
@@ -194,35 +312,41 @@ export class AgentReview {
         return runIn(await this.service.getReview(reviewId), run.runId);
     }
 
-    async input(reviewId, { runId, path: filePath, hunkIndex, side, startLine }) {
+    async input(reviewId: string, { runId, path: filePath, hunkIndex, side, startLine }: AgentReviewInput) {
         const owner = this.owner();
         const review = await this.service.getReview(reviewId);
         const run = runIn(review, runId);
         if (run.owner !== owner) throw conflict("This review belongs to another conversation.");
         if ((hunkIndex !== undefined || side !== undefined || startLine !== undefined) && filePath === undefined) throw invalid("path is required for file input.");
         if (startLine !== undefined && side === undefined) throw invalid("side is required for full-file content.");
-        if (side !== undefined && (!["old", "new"].includes(side) || hunkIndex !== undefined)) throw invalid("Choose either a hunkIndex or side old/new.");
+        if (side !== undefined && ((side !== "old" && side !== "new") || hunkIndex !== undefined)) throw invalid("Choose either a hunkIndex or side old/new.");
         const snapshot = await this.service.getSnapshot(reviewId, run.revisionId);
-        let data;
+        let data: {
+            file?: Omit<import("./diff.mjs").DiffFile, "hunks">;
+            hunkCount?: number;
+            hunk?: import("./diff.mjs").DiffHunk;
+            content?: AgentFileContent & { side: DiffSide; path: string };
+            files?: { path: string; status: string; binary: boolean; hunkCount: number }[];
+        };
         if (filePath !== undefined) {
             const file = snapshot.files.find((f) => f.path === filePath);
             if (!file) throw invalid("That file is not in this review's pinned snapshot.");
-            if (hunkIndex !== undefined && (!Number.isInteger(hunkIndex) || hunkIndex < 0 || hunkIndex >= file.hunks.length)) {
+            if (hunkIndex !== undefined && (typeof hunkIndex !== "number" || !Number.isInteger(hunkIndex) || hunkIndex < 0 || hunkIndex >= file.hunks.length)) {
                 throw invalid("hunkIndex is outside the pinned file.");
             }
             const { hunks, ...metadata } = file;
             data = { file: metadata, hunkCount: hunks.length, ...(hunkIndex !== undefined ? { hunk: hunks[hunkIndex] } : {}) };
             if (side !== undefined) {
                 const start = startLine ?? 1;
-                if (!Number.isSafeInteger(start) || start < 1) throw invalid("startLine must be a positive integer.");
-                let content;
+                if (typeof start !== "number" || !Number.isSafeInteger(start) || start < 1) throw invalid("startLine must be a positive integer.");
+                let content: AgentFileContent;
                 const absent = side === "old" ? file.status === "added" : file.status === "deleted";
                 if (absent) {
                     content = { available: true, absent: true, lines: [] };
                 } else if (file.binary) {
                     content = { available: false, reason: "binary" };
                 } else if (side === "new") {
-                    content = await this.service.getFileContent(reviewId, run.revisionId, filePath);
+                    content = await this.service.getFileContent(reviewId, run.revisionId, file.path);
                 } else {
                     const lines = await this.service.git.readCommitFile(review.repoRoot, snapshot.baseCommit, file.oldPath ?? file.path);
                     if (lines?.at(-1) === "") lines.pop();
@@ -254,7 +378,7 @@ export class AgentReview {
         };
     }
 
-    async report(reviewId, { runId, model, findings, summary, error, ponytail }) {
+    async report(reviewId: string, { runId, model, findings, summary, error, ponytail }: AgentReviewReport) {
         const owner = this.owner();
         if (error !== undefined) {
             if (typeof error !== "string" || !error.trim() || error.length > 4000 || findings !== undefined || summary !== undefined || ponytail !== undefined) {
@@ -267,35 +391,38 @@ export class AgentReview {
         }
         const digest = createHash("sha256").update(JSON.stringify({ findings, summary, error, ponytail })).digest("hex");
         const result = await this.store.updateReview(reviewId, async (review) => {
+            if (!review) throw new ReviewError("not_found", "Review not found.");
             const run = runIn(review, runId);
-            if (run.owner !== owner || !run.models.includes(model)) throw conflict("This model was not requested by this conversation.");
+            if (run.owner !== owner || typeof model !== "string" || !run.models.includes(model)) throw conflict("This model was not requested by this conversation.");
             const previous = run.results.find((r) => r.model === model);
             if (previous?.digest === digest) return { write: false, value: run };
             if (previous || !ACTIVE_RUN_STATES.includes(run.state)) throw conflict("This model's result or review is already finalized.");
             const ponytailRequested = run.skills?.some((skill) => skill.role === "ponytail");
-            let ponytailResult;
+            let ponytailResult: PonytailResult | undefined;
             if (!error && ponytailRequested) {
-                if (!ponytail || !["used", "unavailable"].includes(ponytail.status) || !Array.isArray(ponytail.benefits)
+                if (!isRecord(ponytail) || (ponytail.status !== "used" && ponytail.status !== "unavailable") || !Array.isArray(ponytail.benefits)
                     || ponytail.benefits.length > 5 || (ponytail.status === "unavailable" && ponytail.benefits.length)) {
                     throw invalid("Requested Ponytail needs a used/unavailable report, summary and up to five evidence-backed benefits; unavailable must have none.");
                 }
                 ponytailResult = {
                     status: ponytail.status, summary: requiredText(ponytail.summary, "ponytail.summary", 4000),
-                    benefits: ponytail.benefits.map((entry) => ({
-                        proposal: requiredText(entry?.proposal, "ponytail.proposal", 2000),
-                        benefit: requiredText(entry?.benefit, "ponytail.benefit", 2000),
-                        evidence: evidenceOf(entry?.evidence),
+                    benefits: ponytail.benefits.map((entry: unknown) => ({
+                        proposal: requiredText(isRecord(entry) ? entry.proposal : undefined, "ponytail.proposal", 2000),
+                        benefit: requiredText(isRecord(entry) ? entry.benefit : undefined, "ponytail.benefit", 2000),
+                        evidence: evidenceOf(isRecord(entry) ? entry.evidence : undefined),
                     })),
                 };
             } else if (ponytail !== undefined) {
                 throw invalid("Ponytail was not selected for this run.");
             }
             const snapshot = await this.service.getSnapshot(reviewId, run.revisionId);
-            const threads = [];
-            for (const f of findings ?? []) {
-                if (!f || !["line", "file", "overview"].includes(f.kind)
-                    || !["issue", "simplification"].includes(f.category)
-                    || !FINDING_ASSESSMENTS.includes(f.assessment) || !FINDING_SEVERITIES.includes(f.severity)
+            const threads: ReviewThread[] = [];
+            const candidates: unknown[] = Array.isArray(findings) ? findings : [];
+            for (const f of candidates) {
+                if (!isRecord(f) || (f.kind !== "line" && f.kind !== "file" && f.kind !== "overview")
+                    || (f.category !== "issue" && f.category !== "simplification")
+                    || typeof f.assessment !== "string" || !FINDING_ASSESSMENTS.includes(f.assessment)
+                    || typeof f.severity !== "string" || !FINDING_SEVERITIES.includes(f.severity)
                     || typeof f.body !== "string" || !f.body.trim() || f.body.length > 8000) throw invalid("Invalid review finding.");
                 const evidence = evidenceOf(f.evidence);
                 if ((run.focus === "review" && f.category !== "issue") || (run.focus === "simplify" && f.category !== "simplification")) {
@@ -306,7 +433,7 @@ export class AgentReview {
                     if (!file) throw invalid("A finding must reference a file in the pinned snapshot.");
                     if (f.kind === "line") {
                         const end = f.endLine ?? f.startLine;
-                        if (!["new", "old"].includes(f.side) || !Number.isInteger(f.startLine) || !Number.isInteger(end)
+                        if ((f.side !== "new" && f.side !== "old") || typeof f.startLine !== "number" || typeof end !== "number" || !Number.isInteger(f.startLine) || !Number.isInteger(end)
                             || f.startLine < 1 || end < f.startLine || end - f.startLine > 399
                             || selectedLines(file, f.side, f.startLine, end).length !== end - f.startLine + 1) {
                             throw invalid("Line findings must be anchored to the supplied diff rows.");
@@ -314,11 +441,14 @@ export class AgentReview {
                     }
                 }
                 const { thread } = await this.service.buildThread(review, {
-                    kind: f.kind, path: f.path, side: f.side, startLine: f.startLine, endLine: f.endLine,
+                    kind: f.kind, path: typeof f.path === "string" ? f.path : undefined,
+                    side: f.side === "old" ? "old" : "new",
+                    startLine: typeof f.startLine === "number" ? f.startLine : undefined,
+                    endLine: typeof f.endLine === "number" ? f.endLine : undefined,
                     body: f.body, author: "agent", revisionId: run.revisionId,
                 });
                 thread.agentReview = {
-                    runId, model, category: f.category, revisionId: run.revisionId,
+                    runId: run.runId, model, category: f.category, revisionId: run.revisionId,
                     assessment: f.assessment, severity: f.severity, evidence,
                 };
                 threads.push(thread);
@@ -327,14 +457,16 @@ export class AgentReview {
             if (run.revisionId !== review.currentRevisionId) {
                 await this.service.relocateThreads(review, review.currentRevisionId, review.git?.baseCommit);
             }
-            run.results.push({ model, digest, state: error ? "failed" : "completed", error, summary, ponytail: ponytailResult, threadIds: threads.map((t) => t.threadId), finishedAt: now() });
+            run.results.push({ model, digest, state: error ? "failed" : "completed",
+                error: typeof error === "string" ? error : undefined, summary: typeof summary === "string" ? summary : undefined,
+                ponytail: ponytailResult, threadIds: threads.map((t) => t.threadId), finishedAt: now() });
             run.state = "running";
             if (run.results.length === run.models.length) {
                 const failures = run.results.filter((r) => r.state === "failed").length;
                 run.state = failures === run.models.length ? "failed" : failures ? "partial" : "completed";
                 run.finishedAt = now();
                 if (ponytailRequested) {
-                    const benefits = new Map();
+                    const benefits = new Map<string, PonytailBenefit & { models: string[] }>();
                     for (const result of run.results) {
                         for (const benefit of result.ponytail?.benefits ?? []) {
                             const key = `${benefit.proposal}\0${benefit.benefit}`.replace(/\s+/g, " ").trim().toLowerCase();
@@ -345,7 +477,7 @@ export class AgentReview {
                     }
                     // No supported benefit means no success-shaped overview comment.
                     if (benefits.size) {
-                        const preview = (text, max) => text.length > max ? `${text.slice(0, max)}... [full text in run report]` : text;
+                        const preview = (text: string, max: number) => text.length > max ? `${text.slice(0, max)}... [full text in run report]` : text;
                         const body = [
                             "### Ponytail: proposed simplification benefits",
                             `Pinned revision: ${run.revisionId}.`,
@@ -360,7 +492,7 @@ export class AgentReview {
                         const { thread } = await this.service.buildThread(review, {
                             kind: "overview", body, author: "agent", revisionId: run.revisionId,
                         });
-                        thread.ponytailReport = { runId, revisionId: run.revisionId };
+                        thread.ponytailReport = { runId: run.runId, revisionId: run.revisionId };
                         review.threads.push(thread);
                         run.ponytailThreadId = thread.threadId;
                     }
@@ -372,7 +504,7 @@ export class AgentReview {
         return result;
     }
 
-    async close(reviewId, runId) {
+    async close(reviewId: string, runId: string) {
         const result = await this.store.updateReview(reviewId, (review) => {
             const run = runIn(review, runId);
             if (!ACTIVE_RUN_STATES.includes(run.state)) return { write: false, value: run };
@@ -384,7 +516,7 @@ export class AgentReview {
         return result;
     }
 
-    async recover(reviewId) {
+    async recover(reviewId: string) {
         await this.store.updateReview(reviewId, (review) => {
             let changed = false;
             for (const run of review?.agentReviews ?? []) {
@@ -399,17 +531,17 @@ export class AgentReview {
         });
     }
 
-    async approve(reviewId, threadId, revisionId) {
+    async approve(reviewId: string, threadId: string, revisionId?: string) {
         await this.service.refresh(reviewId);
         const result = await this.store.updateReview(reviewId, (review) => {
             const thread = review?.threads.find((t) => t.threadId === threadId);
-            if (!thread?.agentReview) throw invalid("Only agent review findings can be approved.");
+            if (!review || !thread?.agentReview) throw invalid("Only agent review findings can be approved.");
             if (thread.agentReview.approvalMessageId) {
                 return { write: false, value: { threadId, messageId: thread.agentReview.approvalMessageId } };
             }
             if (thread.agentReview.assessment !== "confirmed" || !FINDING_SEVERITIES.includes(thread.agentReview.severity)
                 || thread.agentReview.severity === "fyi"
-                || EVIDENCE_FIELDS.some((key) => typeof thread.agentReview.evidence?.[key] !== "string" || !thread.agentReview.evidence[key].trim())) {
+                || EVIDENCE_FIELDS.some((key) => typeof thread.agentReview!.evidence?.[key] !== "string" || !thread.agentReview!.evidence[key].trim())) {
                 throw conflict("Only confirmed, actionable findings with evidence can be approved. Discuss this assessment or run a fresh review.");
             }
             if (revisionId !== review.currentRevisionId || thread.agentReview.revisionId !== revisionId) {
@@ -417,7 +549,7 @@ export class AgentReview {
             }
             if (thread.status !== "active") throw conflict("Reopen the thread before approving it.");
             // Only trusted text is attributed to the user; the prompt renders the finding separately as untrusted model output.
-            const message = {
+            const message: ReviewMessage = {
                 messageId: `m-${randomUUID()}`, author: "user", createdAt: now(), reviewIntent: "approve",
                 body: "Approved. Implement this model suggestion, preserving intended behavior. Verify it and reply in this thread. If the suggestion is unsafe or no longer applies, explain rather than forcing it.",
                 delivery: { state: "saving", attempts: 0, claimPid: this.service.pid },

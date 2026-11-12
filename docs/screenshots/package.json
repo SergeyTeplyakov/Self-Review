@@ -4,7 +4,8 @@
   "type": "module",
   "description": "Renders the README screenshots from a scripted demo review.",
   "scripts": {
-    "render": "node render.mjs"
+    "build:tools": "npm --prefix ../.. run build:tools",
+    "render": "npm run build:tools && node ../../.build/docs/screenshots/render.mjs"
   },
   "devDependencies": {
     "playwright-core": "1.64.1"

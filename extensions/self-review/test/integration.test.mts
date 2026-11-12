@@ -5,25 +5,24 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { runGit } from "../dist/lib/git.mjs";
-import { Store } from "../dist/lib/store.mjs";
-import { ReviewService } from "../dist/lib/review-service.mjs";
-import { Delivery } from "../dist/lib/delivery.mjs";
-import { startReviewServer } from "../dist/lib/server.mjs";
+import { Delivery, ReviewService, Store, runGit, startReviewServer } from "./modules.mjs";
+import type { FileContent, ReviewMessage, ReviewService as ReviewServiceType, ReviewThread } from "../src/lib/review-service.mjs";
+import type { SendOptions } from "../src/lib/delivery.mjs";
+import type { Store as StoreType } from "../src/lib/store.mjs";
 
 const WEB_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "dist", "web");
-const lines = (n, f = (i) => `line ${i}`) => Array.from({ length: n }, (_, i) => f(i + 1)).join("\n") + "\n";
-const git = (cwd, ...args) => runGit(cwd, ["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "core.autocrlf=false", ...args]);
+const lines = (n: number, f: (i: number) => string = (i) => `line ${i}`) => Array.from({ length: n }, (_, i) => f(i + 1)).join("\n") + "\n";
+const git = (cwd: string, ...args: string[]) => runGit(cwd, ["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "core.autocrlf=false", ...args]);
 
-let tmp;
-let repo;
-let store;
-let service;
-let delivery;
-let sent;
-let reviewId;
+let tmp: string;
+let repo: string;
+let store: StoreType;
+let service: ReviewServiceType;
+let delivery: InstanceType<typeof Delivery>;
+let sent: SendOptions[];
+let reviewId: string;
 
-async function waitFor(predicate, label, timeoutMs = 5000) {
+async function waitFor<T>(predicate: () => T | Promise<T>, label: string, timeoutMs = 5000): Promise<Awaited<T>> {
     const start = Date.now();
     for (;;) {
         const value = await predicate();
@@ -33,7 +32,27 @@ async function waitFor(predicate, label, timeoutMs = 5000) {
     }
 }
 
-const deliveryState = async (messageId) => (await service.findMessage(reviewId, messageId)).message.delivery?.state;
+const deliveryState = async (messageId: string) => (await service.findMessage(reviewId, messageId)).message.delivery?.state;
+
+async function getReview() {
+    const review = await service.getReview(reviewId);
+    assert.ok(review);
+    return review;
+}
+
+function required<T>(value: T | null | undefined): T {
+    assert.ok(value);
+    return value;
+}
+
+function availableContent(content: FileContent): Extract<FileContent, { available: true }> {
+    assert.ok(content.available);
+    return content;
+}
+
+function errorHasCode(error: unknown, code: string): boolean {
+    return error instanceof Error && "code" in error && error.code === code;
+}
 
 before(async () => {
     tmp = await mkdtemp(path.join(os.tmpdir(), "mr-int-"));
@@ -77,19 +96,19 @@ test("ensureReview captures the working-tree diff vs merge-base with excludes an
     assert.equal(snap.branch, "feature");
 });
 
-let lineThread;
-let lineMessage;
+let lineThread: ReviewThread;
+let lineMessage: ReviewMessage;
 
 test("a line comment is delivered once with location, and the marker/messageId map tracks processing", async () => {
     const created = await service.createThread(reviewId, { kind: "line", path: "a.cs", side: "new", startLine: 10, endLine: 10, body: "Why CHANGED?", author: "user", clientRequestId: "c-1" });
     lineThread = created.thread;
     lineMessage = created.message;
-    assert.equal(lineMessage.delivery.state, "saving");
-    assert.deepEqual(lineThread.anchor.selectedLines, ["line 10 CHANGED"]);
+    assert.equal(lineMessage.delivery?.state, "saving");
+    assert.deepEqual(required(lineThread.anchor).selectedLines, ["line 10 CHANGED"]);
 
     const dup = await service.createThread(reviewId, { kind: "line", path: "a.cs", side: "new", startLine: 10, body: "Why CHANGED?", author: "user", clientRequestId: "c-1" });
     assert.equal(dup.duplicate, true);
-    assert.equal((await service.getReview(reviewId)).threads.length, 1);
+    assert.equal((await getReview()).threads.length, 1);
 
     const result = await delivery.deliver(reviewId, lineThread.threadId, lineMessage.messageId, "inst-1");
     assert.deepEqual(result, { delivered: true, sessionMessageId: "sm-1" });
@@ -109,17 +128,17 @@ test("refresh after edits relocates the thread by content", async () => {
     const r = await service.refresh(reviewId);
     assert.equal(r.revisionId, "r2");
     assert.equal(r.created, true);
-    const thread = (await service.getReview(reviewId)).threads.find((t) => t.threadId === lineThread.threadId);
-    assert.deepEqual([thread.location.revisionId, thread.location.startLine, thread.location.endLine, thread.location.state], ["r2", 13, 13, "current"]);
-    assert.equal(thread.anchor.startLine, 10, "the original anchor is preserved");
+    const thread = required((await getReview()).threads.find((t) => t.threadId === lineThread.threadId));
+    const location = required(thread.location);
+    assert.deepEqual([location.revisionId, location.startLine, location.endLine, location.state], ["r2", 13, 13, "current"]);
+    assert.equal(required(thread.anchor).startLine, 10, "the original anchor is preserved");
 });
 
 test("full-file content matches the revision and reports stale working trees", async () => {
-    const content = await service.getFileContent(reviewId, "r2", "a.cs");
-    assert.equal(content.available, true);
+    const content = availableContent(await service.getFileContent(reviewId, "r2", "a.cs"));
     assert.equal(content.lines.length, 23);
     assert.equal(content.lines[12], "line 10 CHANGED");
-    const added = await service.getFileContent(reviewId, "r2", "notes.md");
+    const added = availableContent(await service.getFileContent(reviewId, "r2", "notes.md"));
     assert.deepEqual(added.lines, ["# notes", "hello"]);
     await assert.rejects(service.getFileContent(reviewId, "r2", "keep.txt"), /not part of revision/);
     await assert.rejects(service.getFileContent(reviewId, "r2", "../outside.txt"), /escapes/);
@@ -135,7 +154,7 @@ test("full-file content matches the revision and reports stale working trees", a
 test("full-file content rejects edits outside the captured diff hunks", async () => {
     const snapshot = await service.getSnapshot(reviewId, "r2");
     const file = snapshot.files.find((entry) => entry.path === "a.cs");
-    assert.equal(file.hunks.some((hunk) => hunk.rows.some((row) => row.n === 23)), false);
+    assert.equal(required(file).hunks.some((hunk) => hunk.rows.some((row) => row.n === 23)), false);
     const original = await readFile(path.join(repo, "a.cs"), "utf8");
     try {
         await writeFile(path.join(repo, "a.cs"), original.replace("line 20\n", "line 20 EDITED\n"));
@@ -161,13 +180,11 @@ test("full-file content handles renamed files and empty modified files", async (
     const otherReviewId = await service.ensureReview({ repoPath: otherRepo, base: "main" });
     const snapshot = await service.getSnapshot(otherReviewId);
     const renamed = snapshot.files.find((entry) => entry.path === "renamed.cs");
-    assert.equal(renamed.status, "renamed");
-    assert.equal(renamed.oldPath, "old.cs");
-    const content = await service.getFileContent(otherReviewId, "r1", "renamed.cs");
-    assert.equal(content.available, true);
+    assert.equal(required(renamed).status, "renamed");
+    assert.equal(required(renamed).oldPath, "old.cs");
+    const content = availableContent(await service.getFileContent(otherReviewId, "r1", "renamed.cs"));
     assert.equal(content.lines[14], "line 15 CHANGED");
-    const empty = await service.getFileContent(otherReviewId, "r1", "empty.cs");
-    assert.equal(empty.available, true);
+    const empty = availableContent(await service.getFileContent(otherReviewId, "r1", "empty.cs"));
     assert.deepEqual(empty.lines, []);
 });
 
@@ -178,7 +195,7 @@ test("full-file content handles separated zero-context insertions and deletions"
     await git(otherRepo, "add", ".");
     await git(otherRepo, "commit", "-q", "-m", "base");
     await git(otherRepo, "checkout", "-q", "-b", "feature");
-    const updated = [];
+    const updated: string[] = [];
     for (let i = 1; i <= 100; i++) {
         if (i !== 95) updated.push(i === 5 ? "line 5 CHANGED" : `line ${i}`);
         if (i === 50) updated.push("inserted");
@@ -191,7 +208,8 @@ test("full-file content handles separated zero-context insertions and deletions"
     assert.equal(content.available, true);
     assert.deepEqual(content.lines, updated);
     await writeFile(path.join(otherRepo, "a.cs"), updated.join("\n").replace("line 20\n", "line 20 EDITED\n") + "\n");
-    assert.equal((await service.getFileContent(otherReviewId, "r1", "a.cs")).reason, "stale");
+    const stale = await service.getFileContent(otherReviewId, "r1", "a.cs");
+    assert.equal(stale.available ? null : stale.reason, "stale");
 });
 
 test("agent reply marks the comment replied and records lessons", async () => {
@@ -207,12 +225,12 @@ test("agent reply marks the comment replied and records lessons", async () => {
     assert.equal(await deliveryState(lineMessage.messageId), "replied");
     await delivery.onIdle();
     assert.equal(await deliveryState(lineMessage.messageId), "replied", "idle does not downgrade a replied comment");
-    const review = await service.getReview(reviewId);
+    const review = await getReview();
     assert.equal(review.lessons.length, 1);
     assert.equal((await store.readLessons()).length, 1);
     await assert.rejects(
         () => service.addMessage(reviewId, lineThread.threadId, { author: "agent", body: "x", outcome: "bogus" }),
-        (e) => e.code === "invalid_input",
+        (e) => errorHasCode(e, "invalid_input"),
     );
 });
 
@@ -237,24 +255,25 @@ test("user.message arriving before send() resolves still marks processing; idle 
     const retried = await racing.deliver(reviewId, thread.threadId, message.messageId, "inst-1", { retry: true });
     assert.equal(retried.delivered, true);
     assert.equal(await deliveryState(message.messageId), "queued");
-    assert.equal((await service.findMessage(reviewId, message.messageId)).message.delivery.attempts, 2);
+    assert.equal((await service.findMessage(reviewId, message.messageId)).message.delivery?.attempts, 2);
 });
 
 test("a change thread whose code is removed becomes outdated but stays visible", async () => {
     const snap = await service.getSnapshot(reviewId);
-    const hunk = snap.files.find((f) => f.path === "a.cs").hunks.find((h) => h.rows.some((r) => r.s === "line 10 CHANGED"));
-    const changeRow = hunk.rows.find((r) => r.s === "line 10 CHANGED");
-    const { thread } = await service.createThread(reviewId, { kind: "change", path: "a.cs", side: "new", startLine: changeRow.n, endLine: changeRow.n, body: "Drop this", author: "agent" });
+    const hunk = required(required(snap.files.find((f) => f.path === "a.cs")).hunks.find((candidate) => candidate.rows.some((row) => row.s === "line 10 CHANGED")));
+    const changeRow = required(hunk.rows.find((row) => row.s === "line 10 CHANGED"));
+    const lineNumber = required(changeRow.n);
+    const { thread } = await service.createThread(reviewId, { kind: "change", path: "a.cs", side: "new", startLine: lineNumber, endLine: lineNumber, body: "Drop this", author: "agent" });
     await writeFile(path.join(repo, "a.cs"), lines(20, (i) => (i === 10 ? "line 10 REWRITTEN" : `line ${i}`)));
     await service.refresh(reviewId);
-    const after = (await service.getReview(reviewId)).threads.find((t) => t.threadId === thread.threadId);
-    assert.equal(after.location.state, "outdated");
-    const summary = service.summarize(await service.getReview(reviewId));
+    const after = required((await getReview()).threads.find((t) => t.threadId === thread.threadId));
+    assert.equal(required(after.location).state, "outdated");
+    const summary = service.summarize(await getReview());
     assert.ok(summary.threads.some((t) => t.threadId === thread.threadId));
 });
 
 test("anchors are validated", async () => {
-    const bad = (input) => assert.rejects(() => service.createThread(reviewId, { author: "user", body: "x", ...input }), (e) => e.code === "invalid_input");
+    const bad = (input: Record<string, unknown>) => assert.rejects(() => service.createThread(reviewId, { author: "user", body: "x", ...input }), (e) => errorHasCode(e, "invalid_input"));
     await bad({ kind: "line", path: "a.cs", startLine: 0 });
     await bad({ kind: "line", path: "a.cs", startLine: 5, endLine: 4 });
     await bad({ kind: "line", path: "a.cs", startLine: 900 });
@@ -263,22 +282,56 @@ test("anchors are validated", async () => {
     await assert.rejects(() => service.createThread(reviewId, { kind: "file", path: "../outside.txt", body: "x" }));
 });
 
-function request(port, { method = "GET", pathName, headers = {}, body }) {
-    return new Promise((resolve, reject) => {
+interface HttpJson extends Record<string, unknown> {
+    review?: { reviewId: string; currentRevisionId: string };
+    files?: unknown[];
+    available?: boolean;
+    lines?: string[];
+    messageId?: string;
+    threadId?: string;
+    duplicate?: boolean;
+    status?: string;
+}
+
+interface HttpResponse {
+    status: number;
+    text: string;
+    json: HttpJson | null;
+    headers: http.IncomingHttpHeaders;
+}
+
+function request(
+    port: number,
+    { method = "GET", pathName, headers = {}, body }: {
+        method?: string;
+        pathName: string;
+        headers?: http.OutgoingHttpHeaders;
+        body?: unknown;
+    },
+): Promise<HttpResponse> {
+    return new Promise<HttpResponse>((resolve, reject) => {
         const req = http.request({ host: "127.0.0.1", port, method, path: pathName, headers }, (res) => {
-            const chunks = [];
-            res.on("data", (c) => chunks.push(c));
+            const chunks: Buffer[] = [];
+            res.on("data", (chunk: Buffer | string) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
             res.on("end", () => {
                 const text = Buffer.concat(chunks).toString("utf8");
-                let json = null;
+                if (res.statusCode === undefined) {
+                    reject(new Error("HTTP response has no status code."));
+                    return;
+                }
+                let json: HttpJson | null = null;
                 try {
-                    json = JSON.parse(text);
+                    const parsed: unknown = JSON.parse(text);
+                    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) json = parsed as HttpJson;
                 } catch {}
                 resolve({ status: res.statusCode, text, json, headers: res.headers });
             });
         });
         req.on("error", reject);
-        if (body !== undefined) req.write(typeof body === "string" ? body : JSON.stringify(body));
+        if (body !== undefined) {
+            const serialized = typeof body === "string" ? body : JSON.stringify(body);
+            if (serialized !== undefined) req.write(serialized);
+        }
         req.end();
     });
 }
@@ -288,7 +341,7 @@ test("HTTP server enforces token/host/origin and delivers posted comments", asyn
     try {
         const url = new URL(server.url);
         const port = Number(url.port);
-        const token = url.searchParams.get("t");
+        const token = required(url.searchParams.get("t"));
         const json = { "Content-Type": "application/json", "X-MR-Token": token };
 
         const page = await request(port, { pathName: "/" });
@@ -307,20 +360,22 @@ test("HTTP server enforces token/host/origin and delivers posted comments", asyn
         assert.equal((await request(port, { pathName: `/api/state?t=${token}`, headers: { Host: "evil.example:80" } })).status, 421);
         const state = await request(port, { pathName: `/api/state?t=${token}` });
         assert.equal(state.status, 200);
-        assert.equal(state.json.review.reviewId, reviewId);
+        const stateJson = required(state.json);
+        const stateReview = required(stateJson.review);
+        assert.equal(stateReview.reviewId, reviewId);
 
-        const snap = await request(port, { pathName: `/api/snapshot/${state.json.review.currentRevisionId}?t=${token}` });
+        const snap = await request(port, { pathName: `/api/snapshot/${stateReview.currentRevisionId}?t=${token}` });
         assert.equal(snap.status, 200);
-        assert.ok(Array.isArray(snap.json.files));
+        assert.ok(Array.isArray(required(snap.json).files));
         assert.equal((await request(port, { pathName: `/api/snapshot/..%2f..%2fx?t=${token}` })).status >= 400, true);
 
-        const contentPath = `/api/content/${state.json.review.currentRevisionId}?path=a.cs`;
+        const contentPath = `/api/content/${stateReview.currentRevisionId}?path=a.cs`;
         assert.equal((await request(port, { pathName: contentPath })).status, 403);
         const content = await request(port, { pathName: `${contentPath}&t=${token}` });
         assert.equal(content.status, 200);
-        assert.equal(content.json.available, true);
-        assert.equal(content.json.lines[9], "line 10 REWRITTEN");
-        assert.equal((await request(port, { pathName: `/api/content/${state.json.review.currentRevisionId}?path=..%2Foutside.txt&t=${token}` })).status >= 400, true);
+        assert.equal(required(content.json).available, true);
+        assert.equal(required(content.json).lines?.[9], "line 10 REWRITTEN");
+        assert.equal((await request(port, { pathName: `/api/content/${stateReview.currentRevisionId}?path=..%2Foutside.txt&t=${token}` })).status >= 400, true);
 
         assert.equal((await request(port, { method: "POST", pathName: `/api/threads?t=${token}`, headers: { "Content-Type": "application/json" }, body: { kind: "overview", body: "x" } })).status, 403, "POST needs the header token");
         assert.equal((await request(port, { method: "POST", pathName: "/api/threads", headers: { ...json, Origin: "http://evil.example" }, body: { kind: "overview", body: "x" } })).status, 403);
@@ -330,34 +385,37 @@ test("HTTP server enforces token/host/origin and delivers posted comments", asyn
         const before = sent.length;
         const posted = await request(port, { method: "POST", pathName: "/api/threads", headers: { ...json, Origin: `http://127.0.0.1:${port}` }, body: { kind: "file", path: "notes.md", body: "Is this file needed?", clientRequestId: "http-1" } });
         assert.equal(posted.status, 200);
-        await waitFor(async () => (await deliveryState(posted.json.messageId)) === "queued", "HTTP comment delivery");
+        const postedJson = required(posted.json);
+        const messageId = required(postedJson.messageId);
+        const threadId = required(postedJson.threadId);
+        await waitFor(async () => (await deliveryState(messageId)) === "queued", "HTTP comment delivery");
         assert.equal(sent.length, before + 1);
-        assert.match(sent.at(-1).prompt, /file notes\.md/);
+        assert.match(required(sent.at(-1)).prompt, /file notes\.md/);
 
         const again = await request(port, { method: "POST", pathName: "/api/threads", headers: json, body: { kind: "file", path: "notes.md", body: "Is this file needed?", clientRequestId: "http-1" } });
-        assert.equal(again.json.duplicate, true);
+        assert.equal(required(again.json).duplicate, true);
         assert.equal(sent.length, before + 1, "duplicate submit is not re-delivered");
 
-        const reply = await request(port, { method: "POST", pathName: `/api/threads/${posted.json.threadId}/messages`, headers: json, body: { body: "Follow-up" } });
+        const reply = await request(port, { method: "POST", pathName: `/api/threads/${threadId}/messages`, headers: json, body: { body: "Follow-up" } });
         assert.equal(reply.status, 200);
         await waitFor(() => sent.length === before + 2, "reply delivery");
-        assert.match(sent.at(-1).prompt, /Earlier messages in this thread/);
+        assert.match(required(sent.at(-1)).prompt, /Earlier messages in this thread/);
 
-        const status = await request(port, { method: "POST", pathName: `/api/threads/${posted.json.threadId}/status`, headers: json, body: { status: "resolved" } });
-        assert.deepEqual(status.json, { threadId: posted.json.threadId, status: "resolved" });
+        const status = await request(port, { method: "POST", pathName: `/api/threads/${threadId}/status`, headers: json, body: { status: "resolved" } });
+        assert.deepEqual(status.json, { threadId, status: "resolved" });
 
-        const events = await new Promise((resolve, reject) => {
+        const events = await new Promise<string>((resolve, reject) => {
             const req = http.get({ host: "127.0.0.1", port, path: `/api/events?t=${token}` }, (res) => {
                 let buf = "";
-                res.on("data", (c) => {
-                    buf += c;
+                res.on("data", (chunk: Buffer | string) => {
+                    buf += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk;
                     if (buf.includes("event: changed")) {
                         req.destroy();
                         resolve(buf);
                     }
                 });
             });
-            req.on("error", (e) => (e.code === "ECONNRESET" ? null : reject(e)));
+            req.on("error", (error: NodeJS.ErrnoException) => (error.code === "ECONNRESET" ? null : reject(error)));
             setTimeout(() => service.changed(reviewId, "test"), 100);
         });
         assert.match(events, /event: hello/);
@@ -400,18 +458,18 @@ test("review data never leaves the data root and the repo is untouched", async (
 });
 
 test("descriptions persist across reopen, reject stale updates, and are captured with overview comments", async () => {
-    assert.equal(service.summarize(await service.getReview(reviewId)).description, null, "old reviews need no migration");
-    const events = [];
-    const listener = (e) => events.push(e);
+    assert.equal(service.summarize(await getReview()).description, null, "old reviews need no migration");
+    const events: Array<{ reviewId: string; reason: string }> = [];
+    const listener = (event: { reviewId: string; reason: string }) => events.push(event);
     service.on("changed", listener);
     try {
         const first = await service.updateDescription(reviewId, { expectedVersion: 0, body: "## Purpose\n\nExplain the change." });
         assert.equal(first.version, 1);
-        assert.equal(first.revisionId, (await service.getReview(reviewId)).currentRevisionId);
-        assert.equal(events.at(-1).reason, "description");
+        assert.equal(first.revisionId, (await getReview()).currentRevisionId);
+        assert.equal(required(events.at(-1)).reason, "description");
         const reopened = new ReviewService({ store: new Store(path.join(tmp, "data")) });
         await reopened.ensureReview({ reviewId });
-        assert.deepEqual((await reopened.getReview(reviewId)).description, first);
+        assert.deepEqual(required(await reopened.getReview(reviewId)).description, first);
         const { thread, message } = await service.createThread(reviewId, { kind: "overview", body: "Revise this description", descriptionVersion: 1 });
         assert.deepEqual(message.descriptionContext, first);
         const updates = await Promise.allSettled([
@@ -419,18 +477,20 @@ test("descriptions persist across reopen, reject stale updates, and are captured
             service.updateDescription(reviewId, { expectedVersion: 1, body: "Concurrent edit." }),
         ]);
         assert.equal(updates.filter((r) => r.status === "fulfilled").length, 1);
-        assert.equal(updates.find((r) => r.status === "rejected").reason.code, "conflict");
-        assert.equal((await service.findMessage(reviewId, message.messageId)).message.descriptionContext.body, first.body);
-        await assert.rejects(() => service.createThread(reviewId, { kind: "overview", body: "Stale comment", descriptionVersion: 1 }), (e) => e.code === "conflict");
-        await assert.rejects(() => service.addMessage(reviewId, thread.threadId, { body: "Stale reply", descriptionVersion: 1 }), (e) => e.code === "conflict");
+        const rejectedUpdate = updates.find((result): result is PromiseRejectedResult => result.status === "rejected");
+        assert.ok(rejectedUpdate);
+        assert.ok(errorHasCode(rejectedUpdate.reason, "conflict"));
+        assert.equal(required((await service.findMessage(reviewId, message.messageId)).message.descriptionContext).body, first.body);
+        await assert.rejects(() => service.createThread(reviewId, { kind: "overview", body: "Stale comment", descriptionVersion: 1 }), (error) => errorHasCode(error, "conflict"));
+        await assert.rejects(() => service.addMessage(reviewId, thread.threadId, { body: "Stale reply", descriptionVersion: 1 }), (error) => errorHasCode(error, "conflict"));
         for (const body of ["", "x".repeat(20001)]) {
-            await assert.rejects(() => service.updateDescription(reviewId, { expectedVersion: 2, body }), (e) => e.code === "invalid_input");
+            await assert.rejects(() => service.updateDescription(reviewId, { expectedVersion: 2, body }), (error) => errorHasCode(error, "invalid_input"));
         }
         await service.addMessage(reviewId, thread.threadId, { author: "agent", inReplyTo: message.messageId, body: "Updated.", outcome: "changed" });
         await service.setThreadStatus(reviewId, thread.threadId, "resolved");
         const reply = await service.addMessage(reviewId, thread.threadId, { body: "One more point", descriptionVersion: 2 });
         assert.equal(reply.thread.status, "active", "user follow-up reopens a resolved thread");
-        assert.equal(reply.message.descriptionContext.version, 2);
+        assert.equal(required(reply.message.descriptionContext).version, 2);
     } finally {
         service.off("changed", listener);
     }

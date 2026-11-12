@@ -3,15 +3,53 @@
 
 const HUNK_HEADER = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/;
 
-function stripCr(line) {
+export interface DiffRow {
+    t: "ctx" | "del" | "add";
+    o: number | null;
+    n: number | null;
+    s: string;
+    noNewlineAtEnd?: boolean;
+}
+
+export interface DiffHunk {
+    header: string;
+    section: string;
+    oldStart: number;
+    oldLines: number;
+    newStart: number;
+    newLines: number;
+    rows: DiffRow[];
+    noNewlineAtEnd?: boolean;
+}
+
+export interface DiffFile {
+    path: string;
+    oldPath: string | null;
+    status: string;
+    binary: boolean;
+    untracked: boolean;
+    additions: number;
+    deletions: number;
+    hunks: DiffHunk[];
+    oldMode?: string;
+    newMode?: string;
+    typeChanged?: boolean;
+    contentHash?: string;
+    note?: string;
+}
+
+export type DiffSide = "old" | "new";
+type ParsedFile = Omit<DiffFile, "path"> & { path: string | null };
+
+function stripCr(line: string) {
     return line.endsWith("\r") ? line.slice(0, -1) : line;
 }
 
-function unquotePath(value) {
+function unquotePath(value: string) {
     let p = value.replace(/\t+$/, "");
     if (p.startsWith('"') && p.endsWith('"')) {
         p = p.slice(1, -1);
-        const escapes = { a: "\x07", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v", '"': '"', "\\": "\\" };
+        const escapes: Record<string, string> = { a: "\x07", b: "\b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v", '"': '"', "\\": "\\" };
         const chunks = [];
         let start = 0;
         for (const match of p.matchAll(/\\([0-7]{1,3}|["\\abfnrtv])/g)) {
@@ -25,14 +63,14 @@ function unquotePath(value) {
     return p;
 }
 
-function stripSidePrefix(p) {
+function stripSidePrefix(p: string) {
     if (p === "/dev/null") return null;
     return p.replace(/^[ab]\//, "");
 }
 
 // For an unquoted header whose two sides name the same path ("a/P b/P"), returns P. A path can itself contain
 // " b/", which makes the split ambiguous to a regex, but equal halves pin it down.
-function sameSidePath(rest) {
+function sameSidePath(rest: string) {
     if (!rest.startsWith("a/") || (rest.length - 5) % 2 !== 0) return null;
     const n = (rest.length - 5) / 2;
     if (n <= 0) return null;
@@ -40,14 +78,14 @@ function sameSidePath(rest) {
     return rest.slice(2 + n) === ` b/${p}` ? p : null;
 }
 
-function newFile() {
+function newFile(): ParsedFile {
     return { path: null, oldPath: null, status: "modified", binary: false, untracked: false, additions: 0, deletions: 0, hunks: [] };
 }
 
-export function parseUnifiedDiff(text) {
-    const files = [];
-    let file = null;
-    let hunk = null;
+export function parseUnifiedDiff(text: string): DiffFile[] {
+    const files: ParsedFile[] = [];
+    let file: ParsedFile | null = null;
+    let hunk: DiffHunk | null = null;
     let oldRemaining = 0;
     let newRemaining = 0;
     let oldNo = 0;
@@ -56,7 +94,7 @@ export function parseUnifiedDiff(text) {
     for (const raw of text.split("\n")) {
         const line = stripCr(raw);
 
-        if (hunk && (oldRemaining > 0 || newRemaining > 0)) {
+        if (file && hunk && (oldRemaining > 0 || newRemaining > 0)) {
             const c = line[0];
             // Some tools strip the single space git emits for empty context lines.
             if (c === " " || (line === "" && oldRemaining > 0 && newRemaining > 0)) {
@@ -152,8 +190,8 @@ export function parseUnifiedDiff(text) {
     }
     // Git splits a type change (regular file <-> symlink) into a deletion and addition.
     // Consumers identify files by path, so expose the complete replacement as one change.
-    const normalized = [];
-    const byPath = new Map();
+    const normalized: DiffFile[] = [];
+    const byPath = new Map<string | null, DiffFile>();
     for (const f of files) {
         const previous = byPath.get(f.path);
         if (previous?.status === "deleted" && f.status === "added") {
@@ -169,18 +207,21 @@ export function parseUnifiedDiff(text) {
                 }] : [],
             });
         } else {
-            normalized.push(f);
-            byPath.set(f.path, f);
+            // A well-formed Git header always supplies a path. Keep the historical
+            // parser representation for malformed input without changing its output.
+            const parsed = f as DiffFile;
+            normalized.push(parsed);
+            byPath.set(f.path, parsed);
         }
     }
     return normalized;
 }
 
 // Builds an "added file" entry for an untracked file's content.
-export function synthesizeAddedFile(relPath, content) {
+export function synthesizeAddedFile(relPath: string, content: string): DiffFile {
     const lines = content.split("\n").map(stripCr);
     if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
-    const rows = lines.map((s, i) => ({ t: "add", o: null, n: i + 1, s }));
+    const rows: DiffRow[] = lines.map((s, i) => ({ t: "add", o: null, n: i + 1, s }));
     if (content && !content.endsWith("\n")) rows[rows.length - 1].noNewlineAtEnd = true;
     return {
         path: relPath,
@@ -202,27 +243,27 @@ export function synthesizeAddedFile(relPath, content) {
     };
 }
 
-export function rowPrefix(row) {
+export function rowPrefix(row: DiffRow) {
     if (row.t === "add") return "+";
     if (row.t === "del") return "-";
     return " ";
 }
 
-function hunkLineRange(hunk, side) {
+function hunkLineRange(hunk: Pick<DiffHunk, "rows">, side: DiffSide) {
     const key = side === "old" ? "o" : "n";
     const nums = hunk.rows.map((r) => r[key]).filter((v) => v !== null);
     return nums.length ? { start: Math.min(...nums), end: Math.max(...nums) } : null;
 }
 
 // The anchor a "discuss this change" thread uses: new side unless the hunk only deletes.
-export function hunkAnchorRange(hunk) {
-    const side = hunk.rows.some((r) => r.t === "add") ? "new" : "old";
+export function hunkAnchorRange(hunk: Pick<DiffHunk, "rows">) {
+    const side: DiffSide = hunk.rows.some((r) => r.t === "add") ? "new" : "old";
     const range = hunkLineRange(hunk, side);
     return range ? { side, startLine: range.start, endLine: range.end } : null;
 }
 
 // Text of the hunk that contains a line range, trimmed to a window around the selection.
-export function hunkExcerpt(file, side, startLine, endLine, maxRows = 60) {
+export function hunkExcerpt(file: DiffFile, side: DiffSide, startLine: number, endLine: number, maxRows = 60) {
     const key = side === "old" ? "o" : "n";
     for (const hunk of file.hunks) {
         const idx = hunk.rows.findIndex((r) => r[key] !== null && r[key] >= startLine && r[key] <= endLine);
@@ -243,7 +284,7 @@ export function hunkExcerpt(file, side, startLine, endLine, maxRows = 60) {
 }
 
 // Selected source lines on one side of the diff.
-export function selectedLines(file, side, startLine, endLine) {
+export function selectedLines(file: DiffFile, side: DiffSide, startLine: number, endLine: number) {
     const key = side === "old" ? "o" : "n";
     const out = [];
     for (const hunk of file.hunks) {

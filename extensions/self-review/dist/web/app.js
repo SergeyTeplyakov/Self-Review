@@ -1,13 +1,254 @@
 // Self review canvas client: renders the diff, inline threads, and composers; talks to the
 // per-instance loopback server with the token from the URL.
 import { createSettingsApi } from "./settings-api.mjs";
-
+function isRecord(value) {
+    return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function isView(value) {
+    if (!isRecord(value))
+        return false;
+    if (value.type === "overview" || value.type === "lessons" || value.type === "agent-comments")
+        return true;
+    return (value.type === "file" || value.type === "folder") && typeof value.path === "string";
+}
+function errorMessage(error) {
+    return error instanceof Error ? error.message : String(error);
+}
+function isOptionalString(value) {
+    return value === undefined || value === null || typeof value === "string";
+}
+function isStringArray(value) {
+    return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+function isDiffRow(value) {
+    return isRecord(value)
+        && (value.t === "add" || value.t === "del" || value.t === "ctx")
+        && (value.o === undefined || value.o === null || typeof value.o === "number")
+        && (value.n === undefined || value.n === null || typeof value.n === "number")
+        && typeof value.s === "string"
+        && (value.noNewlineAtEnd === undefined || typeof value.noNewlineAtEnd === "boolean");
+}
+function isDiffHunk(value) {
+    return isRecord(value)
+        && typeof value.oldStart === "number" && typeof value.oldLines === "number"
+        && typeof value.newStart === "number" && typeof value.newLines === "number"
+        && typeof value.header === "string"
+        && Array.isArray(value.rows) && value.rows.every(isDiffRow)
+        && (value.gap === undefined || typeof value.gap === "boolean");
+}
+function isDiffFile(value) {
+    return isRecord(value)
+        && typeof value.path === "string"
+        && isOptionalString(value.oldPath)
+        && (value.status === "modified" || value.status === "added" || value.status === "deleted" || value.status === "renamed")
+        && typeof value.additions === "number" && typeof value.deletions === "number"
+        && typeof value.binary === "boolean" && isOptionalString(value.note)
+        && (value.untracked === undefined || typeof value.untracked === "boolean")
+        && isOptionalString(value.oldMode) && isOptionalString(value.newMode)
+        && (value.typeChanged === undefined || typeof value.typeChanged === "boolean")
+        && Array.isArray(value.hunks) && value.hunks.every(isDiffHunk)
+        && (value.full === undefined || typeof value.full === "boolean");
+}
+function isRevision(value) {
+    return isRecord(value)
+        && typeof value.revisionId === "string" && typeof value.createdAt === "string"
+        && typeof value.files === "number" && typeof value.additions === "number"
+        && typeof value.deletions === "number";
+}
+function isLocation(value) {
+    return isRecord(value) && typeof value.path === "string"
+        && (value.side === undefined || value.side === "old" || value.side === "new")
+        && (value.startLine === undefined || typeof value.startLine === "number")
+        && (value.endLine === undefined || typeof value.endLine === "number")
+        && (value.state === undefined || typeof value.state === "string");
+}
+function isAnchor(value) {
+    return isRecord(value) && typeof value.revisionId === "string"
+        && (value.selectedLines === undefined || isStringArray(value.selectedLines))
+        && isLocation(value);
+}
+function isMessage(value) {
+    if (!isRecord(value) || typeof value.messageId !== "string"
+        || (value.author !== "user" && value.author !== "agent")
+        || typeof value.body !== "string" || typeof value.createdAt !== "string"
+        || !isOptionalString(value.outcome) || !isOptionalString(value.verification)
+        || (value.lessonIds !== undefined && (!Array.isArray(value.lessonIds) || !value.lessonIds.every((id) => typeof id === "string")))) {
+        return false;
+    }
+    if (value.delivery == null)
+        return true;
+    return isRecord(value.delivery)
+        && ["draft", "saving", "queued", "processing", "replied", "no-reply", "failed"].includes(String(value.delivery.state))
+        && isOptionalString(value.delivery.queuedAt) && isOptionalString(value.delivery.error);
+}
+function isFinding(value) {
+    if (!isRecord(value) || typeof value.model !== "string" || typeof value.category !== "string"
+        || typeof value.assessment !== "string" || typeof value.severity !== "string"
+        || typeof value.revisionId !== "string" || typeof value.runId !== "string"
+        || !isOptionalString(value.approvalMessageId))
+        return false;
+    if (value.evidence === undefined || value.evidence === null)
+        return true;
+    return isRecord(value.evidence) && isOptionalString(value.evidence.source)
+        && isOptionalString(value.evidence.baseline) && isOptionalString(value.evidence.validation);
+}
+function isThread(value) {
+    if (!isRecord(value) || typeof value.threadId !== "string"
+        || !["overview", "file", "change", "line"].includes(String(value.kind))
+        || !["active", "resolved", "wontfix", "closed"].includes(String(value.status))
+        || !Array.isArray(value.messages) || !value.messages.every(isMessage)
+        || (value.location !== undefined && value.location !== null && !isLocation(value.location)))
+        return false;
+    if (value.anchor !== undefined && value.anchor !== null) {
+        if (!isAnchor(value.anchor))
+            return false;
+    }
+    return value.agentReview === undefined || value.agentReview === null || isFinding(value.agentReview);
+}
+function isLesson(value) {
+    return isRecord(value)
+        && typeof value.lessonId === "string" && typeof value.scope === "string"
+        && (value.status === undefined || typeof value.status === "string")
+        && typeof value.rule === "string" && isOptionalString(value.savedTo)
+        && typeof value.threadId === "string" && typeof value.createdAt === "string";
+}
+function isAgentReviewRun(value) {
+    if (!isRecord(value) || typeof value.runId !== "string" || typeof value.state !== "string"
+        || typeof value.focus !== "string" || typeof value.revisionId !== "string"
+        || !Array.isArray(value.models) || !value.models.every((model) => typeof model === "string")
+        || !Array.isArray(value.results) || !isOptionalString(value.intent) || !isOptionalString(value.error))
+        return false;
+    if (value.skills !== undefined && (!Array.isArray(value.skills) || !value.skills.every((skill) => isRecord(skill) && typeof skill.name === "string" && isOptionalString(skill.release))))
+        return false;
+    return value.results.every((result) => {
+        if (!isRecord(result) || typeof result.model !== "string" || !Array.isArray(result.threadIds)
+            || !result.threadIds.every((id) => typeof id === "string")
+            || !isOptionalString(result.error) || !isOptionalString(result.summary))
+            return false;
+        if (result.ponytail === undefined || result.ponytail === null)
+            return true;
+        return isRecord(result.ponytail) && typeof result.ponytail.status === "string"
+            && typeof result.ponytail.summary === "string" && Array.isArray(result.ponytail.benefits)
+            && result.ponytail.benefits.every((benefit) => isRecord(benefit)
+                && typeof benefit.proposal === "string" && typeof benefit.benefit === "string"
+                && isRecord(benefit.evidence) && typeof benefit.evidence.source === "string"
+                && typeof benefit.evidence.baseline === "string" && typeof benefit.evidence.validation === "string");
+    });
+}
+function isGitStatus(value) {
+    if (!isRecord(value) || !isOptionalString(value.headCommit) || !isOptionalString(value.baseCommit)
+        || !isOptionalString(value.branch) || (value.uncommittedFiles !== undefined && typeof value.uncommittedFiles !== "number"))
+        return false;
+    return value.upstream === undefined || value.upstream === null
+        || (isRecord(value.upstream) && (value.upstream.ahead === null || typeof value.upstream.ahead === "number")
+            && (value.upstream.behind === null || typeof value.upstream.behind === "number")
+            && typeof value.upstream.name === "string");
+}
+function isDescription(value) {
+    return isRecord(value) && typeof value.version === "number"
+        && (value.revisionId === null || typeof value.revisionId === "string") && typeof value.body === "string";
+}
+function isReview(value) {
+    return isRecord(value)
+        && typeof value.reviewId === "string"
+        && typeof value.title === "string"
+        && typeof value.repoRoot === "string"
+        && (value.base === null || typeof value.base === "string")
+        && (value.branch === undefined || value.branch === null || typeof value.branch === "string")
+        && (value.scope === undefined || value.scope === "all" || value.scope === "pending")
+        && (value.currentRevisionId === null || typeof value.currentRevisionId === "string")
+        && Array.isArray(value.revisions) && value.revisions.every(isRevision)
+        && Array.isArray(value.threads) && value.threads.every(isThread)
+        && Array.isArray(value.lessons) && value.lessons.every(isLesson)
+        && (value.git === undefined || value.git === null || isGitStatus(value.git))
+        && (value.description === undefined || value.description === null || isDescription(value.description))
+        && (value.deliveryMode === undefined || value.deliveryMode === null
+            || value.deliveryMode === "immediate" || value.deliveryMode === "batch")
+        && (value.agentReviews === undefined || (Array.isArray(value.agentReviews) && value.agentReviews.every(isAgentReviewRun)));
+}
+function parseReview(value) {
+    if (!isReview(value))
+        throw new Error("Invalid review state response.");
+    return value;
+}
+function isReviewFocus(value) {
+    return value === "review" || value === "simplify" || value === "both";
+}
+function isThreadStatus(value) {
+    return value === "active" || value === "resolved" || value === "wontfix" || value === "closed";
+}
+function isLearningMode(value) {
+    return value === "off" || value === "suggest" || value === "auto";
+}
+function isSnapshot(value) {
+    return isRecord(value) && typeof value.revisionId === "string"
+        && Array.isArray(value.files) && value.files.every(isDiffFile);
+}
+function parseSnapshot(value) {
+    if (!isSnapshot(value))
+        throw new Error("Invalid snapshot response.");
+    return value;
+}
+function parseContent(value, file) {
+    if (!isRecord(value) || typeof value.available !== "boolean")
+        throw new Error("Invalid content response.");
+    if (!value.available)
+        return { status: "unavailable", reason: typeof value.reason === "string" ? value.reason : undefined };
+    if (!isStringArray(value.lines)) {
+        throw new Error("Invalid full-file content response.");
+    }
+    return { status: "ready", full: buildFullFile(file, value.lines) };
+}
+function isStateResponse(value) {
+    if (!isRecord(value) || !isReview(value.review)
+        || (value.session !== undefined && (!isRecord(value.session)
+            || (value.session.busy !== null && typeof value.session.busy !== "boolean")))
+        || (value.pullRequest !== undefined && value.pullRequest !== null
+            && (!isRecord(value.pullRequest) || typeof value.pullRequest.number !== "number" || typeof value.pullRequest.url !== "string"))
+        || (value.agentReviewAvailable !== undefined && typeof value.agentReviewAvailable !== "boolean")
+        || (value.reviewSkillsAvailable !== undefined && typeof value.reviewSkillsAvailable !== "boolean")
+        || (value.agentReviewSuggestedModels !== undefined && !isStringArray(value.agentReviewSuggestedModels)))
+        return false;
+    return true;
+}
+function parseState(value) {
+    if (!isStateResponse(value))
+        throw new Error("Invalid state response.");
+    return {
+        review: value.review,
+        session: value.session === undefined ? undefined : { busy: value.session.busy },
+        pullRequest: value.pullRequest == null ? null : { number: value.pullRequest.number, url: value.pullRequest.url },
+        agentReviewAvailable: value.agentReviewAvailable === true,
+        reviewSkillsAvailable: value.reviewSkillsAvailable === true,
+        agentReviewSuggestedModels: value.agentReviewSuggestedModels ?? [],
+        settingsPayload: value,
+    };
+}
+function isSkill(value) {
+    return isRecord(value)
+        && typeof value.name === "string" && typeof value.title === "string"
+        && typeof value.role === "string" && typeof value.summary === "string"
+        && isRecord(value.upstream) && typeof value.upstream.repository === "string"
+        && typeof value.upstream.release === "string" && typeof value.upstream.path === "string"
+        && typeof value.upstream.fileCommit === "string"
+        && isRecord(value.license) && typeof value.license.spdx === "string"
+        && isOptionalString(value.attribution);
+}
+function isSkillCatalog(value) {
+    return isRecord(value)
+        && Array.isArray(value.selected) && value.selected.every((name) => typeof name === "string")
+        && Array.isArray(value.skills) && value.skills.every(isSkill);
+}
+function parseSkillCatalog(value) {
+    if (!isSkillCatalog(value))
+        throw new Error("Invalid review skills response.");
+    return value;
+}
 const TOKEN = new URLSearchParams(location.search).get("t") ?? "";
 const STATUSES = ["active", "resolved", "wontfix", "closed"];
 const STALE_QUEUE_MS = 120000;
 const FINDING_ASSESSMENTS = { confirmed: "Confirmed", "pre-existing": "Pre-existing", rejected: "Rejected", unverified: "Unverified" };
 const FINDING_SEVERITIES = { critical: "Critical", required: "Required", optional: "Optional", nit: "Nit", fyi: "FYI" };
-
 const state = {
     review: null,
     snapshot: null,
@@ -15,19 +256,20 @@ const state = {
     busy: null,
     connection: "connecting",
     view: { type: "overview" },
-    selection: null, // { path, hunk, anchor, from, to }
+    selection: null,
     dragging: false,
-    open: new Set(), // explicitly opened composer keys (file/change/reply)
-    pending: new Map(), // composer key -> { clientRequestId, sending, error }
-    expanded: new Set(), // outdated or non-active threads explicitly expanded
+    pendingJump: null,
+    open: new Set(),
+    pending: new Map(),
+    expanded: new Set(),
     showResolved: false,
-    collapsedDirs: null, // folder paths folded in the tree (persisted per review)
-    fileFold: new Map(), // path -> folded, for files stacked in a folder view
-    content: new Map(), // `${revisionId}:${path}` -> full-file load state for the file view
-    settings: null, // per-repository settings from the server; null hides the learning controls
-    dialog: null, // open Configure dialog: { learning, delivery, saving, error }
-    switching: false, // a scope switch is in flight
-    submitting: false, // a review submission is in flight
+    collapsedDirs: null,
+    fileFold: new Map(),
+    content: new Map(),
+    settings: null,
+    dialog: null,
+    switching: false,
+    submitting: false,
     agentReviewAvailable: false,
     agentReviewSettings: null,
     agentReviewSettingsAvailable: false,
@@ -38,10 +280,8 @@ const state = {
     skillOverrides: new Map(),
     approving: new Set(),
 };
-
 const FOLDER_VIEW_ROW_BUDGET = 3000;
 const settingsApi = createSettingsApi((method, path, body) => api(method, path, body));
-
 const LEARNING_MODES = ["off", "suggest", "auto"];
 const LEARNING = {
     off: { label: "Off", pill: "Off", hint: "Copilot only addresses each comment. It does not edit instruction files or record guidelines unless you ask." },
@@ -61,47 +301,64 @@ const LESSON_STATUSES = {
 };
 const scopeOf = (review) => (review?.scope === "pending" ? "pending" : "all");
 const scopeLabel = (scope) => (scope === "pending" ? "pending changes" : "all changes");
-const learningMode = () => (LEARNING_MODES.includes(state.settings?.learning) ? state.settings.learning : "off");
-const deliveryRepoMode = () => (DELIVERY_MODES.includes(state.settings?.delivery) ? state.settings.delivery : "immediate");
+const learningMode = () => {
+    const mode = state.settings?.learning;
+    return mode === "suggest" || mode === "auto" ? mode : "off";
+};
+const deliveryRepoMode = () => {
+    const mode = state.settings?.delivery;
+    return mode === "batch" || mode === "ask" ? mode : "immediate";
+};
 // Mirrors the server's resolveDelivery: null while an ask-mode review is undecided. Without settings nothing is held.
 function deliveryMode() {
-    if (!state.settings) return "immediate";
+    if (!state.settings)
+        return "immediate";
     const mode = deliveryRepoMode();
-    if (mode !== "ask") return mode;
+    if (mode !== "ask")
+        return mode;
     const chosen = state.review?.deliveryMode;
     return chosen === "immediate" || chosen === "batch" ? chosen : null;
 }
 const draftMessages = () => (state.review?.threads ?? []).flatMap((t) => t.messages).filter((m) => m.author === "user" && m.delivery?.state === "draft");
 // Lessons recorded before statuses existed were saved by definition.
-const lessonStatus = (lesson) => (Object.hasOwn(LESSON_STATUSES, lesson.status) ? lesson.status : "saved");
+const lessonStatus = (lesson) => (lesson.status === "proposed" || lesson.status === "declined" || lesson.status === "saved" ? lesson.status : "saved");
 const lessonBadge = (lesson) => {
     const status = lessonStatus(lesson);
     return `<span class="badge lesson-${status}" title="${esc(LESSON_STATUSES[status])}">${status}</span>`;
 };
-
 const $ = (sel, root = document) => root.querySelector(sel);
-
+const requiredElement = (sel) => {
+    const element = $(sel);
+    if (!element)
+        throw new Error(`Missing renderer element: ${sel}`);
+    return element;
+};
 function esc(value) {
-    return String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+    const entities = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+    return String(value ?? "").replace(/[&<>"']/g, (character) => entities[character] ?? character);
 }
-
 const CODE_KEYWORDS = new Set(("abstract as async await base bool boolean break byte case catch char checked class const continue decimal default delegate delete do double else enum event export extends extern false finally fixed float for foreach from function get if implements import in init int interface internal is let lock long namespace new null object operator out override params partial private protected public readonly record ref required return sbyte sealed set short sizeof stackalloc static string struct super switch this throw true try typeof uint ulong unchecked undefined unsafe ushort using var virtual void volatile while with yield").split(" "));
 const highlightedFiles = new WeakMap();
-
 function syntaxLanguage(filePath) {
-    const ext = filePath.split(".").pop().toLowerCase();
-    if (["cs", "js", "mjs", "cjs", "jsx", "ts", "tsx", "java", "c", "h", "cpp", "hpp"].includes(ext)) return "code";
-    if (["xml", "html", "htm", "csproj", "props", "targets", "config", "svg", "xaml"].includes(ext)) return "xml";
-    if (["json", "jsonc"].includes(ext)) return "json";
-    if (["yaml", "yml"].includes(ext)) return "yaml";
-    if (["md", "markdown", "mdx"].includes(ext)) return "markdown";
+    const ext = filePath.split(".").pop()?.toLowerCase() ?? "";
+    if (["cs", "js", "mjs", "cjs", "jsx", "ts", "tsx", "java", "c", "h", "cpp", "hpp"].includes(ext))
+        return "code";
+    if (["xml", "html", "htm", "csproj", "props", "targets", "config", "svg", "xaml"].includes(ext))
+        return "xml";
+    if (["json", "jsonc"].includes(ext))
+        return "json";
+    if (["yaml", "yml"].includes(ext))
+        return "yaml";
+    if (["md", "markdown", "mdx"].includes(ext))
+        return "markdown";
     return null;
 }
-
 // Lexical highlighting only: escape every source fragment and preserve its exact text.
 function highlightLine(text, language, lexical = {}) {
-    if (!language) return esc(text);
-    if (language === "markdown") return highlightMarkdown(text, lexical);
+    if (!language)
+        return esc(text);
+    if (language === "markdown")
+        return highlightMarkdown(text, lexical);
     const out = [];
     const emit = (value, kind) => out.push(kind ? `<span class="syn-${kind}">${esc(value)}</span>` : esc(value));
     const tokens = language === "xml"
@@ -114,7 +371,8 @@ function highlightLine(text, language, lexical = {}) {
             const next = end < 0 ? text.length : end + lexical.comment.length;
             emit(text.slice(offset, next), "comment");
             offset = next;
-            if (end < 0) break;
+            if (end < 0)
+                break;
             lexical.comment = null;
             continue;
         }
@@ -130,42 +388,46 @@ function highlightLine(text, language, lexical = {}) {
         if ((language === "xml" && token === "<!--") || (language === "code" && token === "/*")) {
             lexical.comment = language === "xml" ? "-->" : "*/";
             emit(token, "comment");
-        } else if (language === "xml") {
-            if (token.startsWith("<")) lexical.tag = true;
+        }
+        else if (language === "xml") {
+            if (token.startsWith("<"))
+                lexical.tag = true;
             const kind = token.startsWith("<") || /^\/?>$/.test(token) ? "keyword"
                 : /^["']/.test(token) ? "string" : lexical.tag ? "property" : null;
             emit(token, kind);
-            if (/\/?>$/.test(token)) lexical.tag = false;
-        } else if ((language === "code" || language === "json") && token.startsWith("//")
+            if (/\/?>$/.test(token))
+                lexical.tag = false;
+        }
+        else if ((language === "code" || language === "json") && token.startsWith("//")
             || language === "yaml" && token.startsWith("#")) {
             emit(token, "comment");
-        } else if (/^(?:@|\$)?["'`]/.test(token)) {
+        }
+        else if (/^(?:@|\$)?["'`]/.test(token)) {
             emit(token, language === "json" && /^\s*:/.test(text.slice(offset)) ? "property" : "string");
-        } else if (/^\d/.test(token)) {
+        }
+        else if (/^\d/.test(token)) {
             emit(token, "number");
-        } else {
+        }
+        else {
             const kind = language === "code" && CODE_KEYWORDS.has(token)
                 || language !== "code" && /^(true|false|null)$/.test(token) ? "keyword"
                 : language === "yaml" && /^\s*:/.test(text.slice(offset)) ? "property"
-                : language === "code" && /^[A-Z]/.test(token) ? "type" : null;
+                    : language === "code" && /^[A-Z]/.test(token) ? "type" : null;
             emit(token, kind);
         }
     }
     return out.join("");
 }
-
 const MD_FENCE_ALIASES = { javascript: "js", typescript: "ts", csharp: "cs", "c#": "cs", "c++": "cpp", markdown: "md" };
 const MD_INLINE = /\\[!-\/:-@[-`{-~]|`+|<!--|!?\[|<(?:https?:\/\/|mailto:)[^<>\s]+>|(?<![\w/])https?:\/\/[^\s<>]*[^\s<>.,;:!?'")\]]|<\/?[A-Za-z][\w-]*(?:\s[^<>]*)?\/?>|\*\*|__|~~|[*_|]/g;
 const MD_LINK = /!?\[((?:\\.|[^\\\]\n])*)\](?:\(([^()\s]*(?:\([^()\s]*\)[^()\s]*)*)((?:\s+(?:"[^"]*"|'[^']*'))?\s*)\)|\[([^\]\n]*)\])/y;
 const MD_STYLES = { "**": "strong", __: "strong", "*": "em", _: "em", "~~": "del" };
 const mdToken = (value, cls) => (value ? `<span class="${cls}">${esc(value)}</span>` : "");
 const mdBlock = (html) => `<span class="md-block">${html}</span>`;
-
 function fenceLanguage(info) {
-    const name = info.trim().split(/[\s{,]/)[0].toLowerCase();
+    const name = info.trim().split(/[\s{,]/)[0]?.toLowerCase() ?? "";
     return name ? syntaxLanguage(`fence.${MD_FENCE_ALIASES[name] ?? name}`) : null;
 }
-
 // Markdown stays source text: markers are dimmed, never removed, so selections and anchors match the file.
 function highlightMarkdown(text, lexical) {
     const fence = lexical.fence;
@@ -179,7 +441,8 @@ function highlightMarkdown(text, lexical) {
     }
     if (lexical.comment) {
         const end = text.indexOf("-->");
-        if (end < 0) return mdToken(text, "syn-comment");
+        if (end < 0)
+            return mdToken(text, "syn-comment");
         lexical.comment = null;
         return mdToken(text.slice(0, end + 3), "syn-comment") + mdInline(text.slice(end + 3), lexical);
     }
@@ -188,7 +451,8 @@ function highlightMarkdown(text, lexical) {
         lexical.fence = { marker: open[2], language: fenceLanguage(open[3]), lexical: {} };
         return mdBlock(esc(open[1]) + mdToken(open[2], "md-mark") + mdToken(open[3], "md-lang"));
     }
-    if (/^ {0,3}(?:([-*_])(?:[ \t]*\1){2,}|=+)[ \t]*$/.test(text)) return mdToken(text, "md-mark");
+    if (/^ {0,3}(?:([-*_])(?:[ \t]*\1){2,}|=+)[ \t]*$/.test(text))
+        return mdToken(text, "md-mark");
     const heading = text.match(/^( {0,3})(#{1,6})((?:\s.*?)?)((?:\s#+)?\s*)$/);
     if (heading) {
         return esc(heading[1]) + mdToken(heading[2], "md-mark")
@@ -211,21 +475,23 @@ function highlightMarkdown(text, lexical) {
         prefix += esc(item[1]) + mdToken(item[2], "md-list") + esc(item[3]) + mdToken(item[4], "md-mark");
         rest = rest.slice(item[0].length);
     }
-    if (/^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)+\|?\s*$/.test(rest)) return prefix + mdToken(rest, "md-mark");
+    if (/^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)+\|?\s*$/.test(rest))
+        return prefix + mdToken(rest, "md-mark");
     const body = mdInline(rest, lexical, /^\s*\|/.test(rest));
     return prefix + (quote ? `<span class="md-quote">${body}</span>` : body);
 }
-
 function mdInline(text, lexical, table = false, depth = 0) {
     // Delimiter matching rescans the line, so pathological lines stay plain.
-    if (depth > 6 || text.length > 4000) return esc(text);
+    if (depth > 6 || text.length > 4000)
+        return esc(text);
     const tokens = new RegExp(MD_INLINE);
     const out = [];
     let plain = 0;
     let match;
     while ((match = tokens.exec(text))) {
         const token = match[0];
-        if (token[0] === "\\") continue;
+        if (token[0] === "\\")
+            continue;
         const at = match.index;
         let end = tokens.lastIndex;
         let html = null;
@@ -233,38 +499,49 @@ function mdInline(text, lexical, table = false, depth = 0) {
             const closing = /`+/g;
             closing.lastIndex = end;
             let close;
-            while ((close = closing.exec(text)) && close[0].length !== token.length);
+            while ((close = closing.exec(text)) && close[0].length !== token.length)
+                ;
             if (close) {
                 html = `<span class="md-code">${mdToken(token, "md-mark")}${esc(text.slice(end, close.index))}${mdToken(close[0], "md-mark")}</span>`;
                 end = closing.lastIndex;
             }
-        } else if (token === "<!--") {
+        }
+        else if (token === "<!--") {
             const close = text.indexOf("-->", end);
-            if (close < 0) lexical.comment = "-->";
+            if (close < 0)
+                lexical.comment = "-->";
             end = close < 0 ? text.length : close + 3;
             html = mdToken(text.slice(at, end), "syn-comment");
-        } else if (token.endsWith("[")) {
+        }
+        else if (token.endsWith("[")) {
             MD_LINK.lastIndex = at;
             const link = MD_LINK.exec(text);
             if (link) {
-                const [, label, url, title, ref] = link;
+                const [, label = "", url, title, ref] = link;
                 end = MD_LINK.lastIndex;
                 const head = `${mdToken(token, "md-mark")}<span class="md-link">${mdInline(label, {}, false, depth + 1)}</span>`;
                 html = url != null
                     ? `${head}${mdToken("](", "md-mark")}${mdToken(url, "md-url")}${mdToken(title, "md-mark")}${mdToken(")", "md-mark")}`
                     : `${head}${mdToken("][", "md-mark")}${mdToken(ref, "md-url")}${mdToken("]", "md-mark")}`;
             }
-        } else if (/^<(?:https?:|mailto:)/.test(token)) {
+        }
+        else if (/^<(?:https?:|mailto:)/.test(token)) {
             html = `${mdToken("<", "md-mark")}${mdToken(token.slice(1, -1), "md-url")}${mdToken(">", "md-mark")}`;
-        } else if (token.startsWith("<")) {
+        }
+        else if (token.startsWith("<")) {
             html = mdToken(token, "md-html");
-        } else if (token.startsWith("http")) {
+        }
+        else if (token.startsWith("http")) {
             html = mdToken(token, "md-url");
-        } else if (token === "|") {
-            if (table) html = mdToken(token, "md-mark");
-        } else {
+        }
+        else if (token === "|") {
+            if (table)
+                html = mdToken(token, "md-mark");
+        }
+        else {
             const mark = token[0];
-            if (mark === "_" && /[\p{L}\p{N}]/u.test(text[at - 1] ?? "")) continue;
+            if (mark === "_" && /[\p{L}\p{N}]/u.test(text[at - 1] ?? ""))
+                continue;
             const c = mark === "*" ? "\\*" : mark;
             const closing = new RegExp(`(?=[^\\s${c}])(.*?[^\\s\\\\${c}])${c.repeat(token.length)}(?!${c})${mark === "_" ? "(?![\\p{L}\\p{N}])" : ""}`, "uy");
             closing.lastIndex = end;
@@ -274,26 +551,35 @@ function mdInline(text, lexical, table = false, depth = 0) {
                 html = `<span class="md-${MD_STYLES[token]}">${mdToken(token, "md-mark")}${mdInline(close[1], {}, table, depth + 1)}${mdToken(token, "md-mark")}</span>`;
             }
         }
-        if (html == null) continue;
-        if (at > plain) out.push(esc(text.slice(plain, at)));
+        if (html == null)
+            continue;
+        if (at > plain)
+            out.push(esc(text.slice(plain, at)));
         out.push(html);
         plain = tokens.lastIndex = end;
     }
-    if (plain < text.length) out.push(esc(text.slice(plain)));
+    if (plain < text.length)
+        out.push(esc(text.slice(plain)));
     return out.join("");
 }
-
 function highlightFile(file) {
-    if (highlightedFiles.has(file)) return highlightedFiles.get(file);
+    const cached = highlightedFiles.get(file);
+    if (cached)
+        return cached;
     const language = syntaxLanguage(file.path);
-    const sides = { old: { next: null, lexical: {} }, new: { next: null, lexical: {} } };
+    const sides = {
+        old: { next: null, lexical: {} }, new: { next: null, lexical: {} },
+    };
     const rows = file.hunks.map((hunk) => hunk.rows.map((row) => {
         let html;
-        for (const [side, line] of [["old", row.o], ["new", row.n]]) {
-            if (line == null) continue;
+        const lineSides = [["old", row.o], ["new", row.n]];
+        for (const [side, line] of lineSides) {
+            if (line == null)
+                continue;
             const cursor = sides[side];
             // Omitted diff context cannot establish a multiline token's state.
-            if (cursor.next !== line) cursor.lexical = {};
+            if (cursor.next !== line)
+                cursor.lexical = {};
             html = highlightLine(row.s, language, cursor.lexical);
             cursor.next = line + 1;
         }
@@ -302,25 +588,25 @@ function highlightFile(file) {
     highlightedFiles.set(file, rows);
     return rows;
 }
-
 function inline(text) {
     return text
         .split(/(`[^`\n]+`)/)
         .map((part) => (part.length > 1 && part.startsWith("`") && part.endsWith("`")
-            ? `<code>${esc(part.slice(1, -1))}</code>`
-            : esc(part).replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")))
+        ? `<code>${esc(part.slice(1, -1))}</code>`
+        : esc(part).replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")))
         .join("");
 }
-
 function md(text) {
     const out = [];
     let para = [];
     let code = null;
     let list = null;
     const flush = () => {
-        if (para.length) out.push(`<p>${para.map(inline).join("<br>")}</p>`);
+        if (para.length)
+            out.push(`<p>${para.map(inline).join("<br>")}</p>`);
         para = [];
-        if (list) out.push(`</${list}>`);
+        if (list)
+            out.push(`</${list}>`);
         list = null;
     };
     for (const line of String(text ?? "").replace(/\r/g, "").split("\n")) {
@@ -328,19 +614,30 @@ function md(text) {
             if (/^\s*```/.test(line)) {
                 out.push(`<pre><code>${esc(code.join("\n"))}</code></pre>`);
                 code = null;
-            } else code.push(line);
+            }
+            else
+                code.push(line);
             continue;
         }
         if (/^\s*```/.test(line)) {
             flush();
             code = [];
-        } else if (!line.trim()) flush();
+        }
+        else if (!line.trim())
+            flush();
         else if (/^#{1,6}\s/.test(line)) {
             flush();
-            const [, hashes, title] = line.match(/^(#{1,6})\s+(.*)$/);
+            const heading = line.match(/^(#{1,6})\s+(.*)$/);
+            if (!heading)
+                continue;
+            const [, hashes, title] = heading;
             out.push(`<h${hashes.length}>${inline(title)}</h${hashes.length}>`);
-        } else if (/^(?:[-*]|\d+\.)\s+/.test(line)) {
-            const [, bullet, item] = line.match(/^([-*]|\d+\.)\s+(.*)$/);
+        }
+        else if (/^(?:[-*]|\d+\.)\s+/.test(line)) {
+            const match = line.match(/^([-*]|\d+\.)\s+(.*)$/);
+            if (!match)
+                continue;
+            const [, bullet, item] = match;
             const tag = /^\d/.test(bullet) ? "ol" : "ul";
             if (list !== tag) {
                 flush();
@@ -348,43 +645,50 @@ function md(text) {
                 list = tag;
             }
             out.push(`<li>${inline(item)}</li>`);
-        } else {
-            if (list) flush();
+        }
+        else {
+            if (list)
+                flush();
             para.push(line);
         }
     }
-    if (code) out.push(`<pre><code>${esc(code.join("\n"))}</code></pre>`);
+    if (code)
+        out.push(`<pre><code>${esc(code.join("\n"))}</code></pre>`);
     flush();
     return `<div class="md">${out.join("")}</div>`;
 }
-
 function ago(iso) {
-    if (!iso) return "";
+    if (!iso)
+        return "";
     const s = (Date.now() - Date.parse(iso)) / 1000;
-    if (s < 45) return "just now";
-    if (s < 3600) return `${Math.round(s / 60)}m ago`;
-    if (s < 86400) return `${Math.round(s / 3600)}h ago`;
+    if (s < 45)
+        return "just now";
+    if (s < 3600)
+        return `${Math.round(s / 60)}m ago`;
+    if (s < 86400)
+        return `${Math.round(s / 3600)}h ago`;
     return new Date(iso).toLocaleString();
 }
-
 function uuid() {
     return globalThis.crypto?.randomUUID?.() ?? `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
 }
-
 // ---------- API ----------
-
 async function api(method, path, body) {
     const headers = { "X-MR-Token": TOKEN };
-    if (state.review) headers["X-MR-Review"] = state.review.reviewId;
-    if (body !== undefined) headers["Content-Type"] = "application/json";
+    if (state.review)
+        headers["X-MR-Review"] = state.review.reviewId;
+    if (body !== undefined)
+        headers["Content-Type"] = "application/json";
     const res = await fetch(`/api/${path}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
     const json = await res.json().catch(() => ({}));
     // The server switched reviews under this page; catch up so the next attempt targets the review on screen.
-    if (res.status === 409) scheduleReload();
-    if (!res.ok) throw new Error(json?.error?.message ?? `${res.status} ${res.statusText}`);
+    if (res.status === 409)
+        scheduleReload();
+    const error = isRecord(json) && isRecord(json.error) && typeof json.error.message === "string" ? json.error.message : null;
+    if (!res.ok)
+        throw new Error(error ?? `${res.status} ${res.statusText}`);
     return json;
 }
-
 // A scope switch points this page at a different review; nothing derived from the previous one may carry over.
 function resetForReview() {
     state.snapshot = null;
@@ -399,7 +703,6 @@ function resetForReview() {
     state.collapsedDirs = null;
     viewRestored = false;
 }
-
 let loading = null;
 let reloadAgain = false;
 async function loadState() {
@@ -410,21 +713,24 @@ async function loadState() {
     loading = (async () => {
         do {
             reloadAgain = false;
-            const data = await api("GET", "state");
-            if (state.review && state.review.reviewId !== data.review.reviewId) resetForReview();
+            const data = parseState(await api("GET", "state"));
+            if (state.review && state.review.reviewId !== data.review.reviewId)
+                resetForReview();
             state.review = data.review;
             state.reviewSkillsAvailable = data.reviewSkillsAvailable === true;
             state.pullRequest = data.pullRequest ?? null;
-            const settingsState = settingsApi.readState(data);
+            const settingsState = settingsApi.readState(data.settingsPayload);
             state.settings = settingsState.settings;
-            state.agentReviewAvailable = data.agentReviewAvailable === true;
+            state.agentReviewAvailable = data.agentReviewAvailable;
             state.agentReviewSettings = settingsState.agentReviewSettings;
             state.agentReviewSettingsAvailable = settingsState.agentReviewSettingsAvailable;
             state.agentReviewSettingsError = settingsState.agentReviewSettingsError ?? "";
-            state.agentReviewSuggestedModels = Array.isArray(data.agentReviewSuggestedModels) ? data.agentReviewSuggestedModels : [];
-            if (data.session) state.busy = data.session.busy;
+            state.agentReviewSuggestedModels = data.agentReviewSuggestedModels;
+            if (data.session)
+                state.busy = data.session.busy;
             const rev = state.review.currentRevisionId;
-            if (rev && state.snapshot?.revisionId !== rev) state.snapshot = await api("GET", `snapshot/${rev}`);
+            if (rev && state.snapshot?.revisionId !== rev)
+                state.snapshot = parseSnapshot(await api("GET", `snapshot/${rev}`));
             restoreView();
         } while (reloadAgain);
         render();
@@ -433,25 +739,25 @@ async function loadState() {
     });
     return loading;
 }
-
 let reloadTimer;
 function scheduleReload() {
     clearTimeout(reloadTimer);
-    reloadTimer = setTimeout(() => loadState().catch((err) => toast(err.message, true)), 120);
+    reloadTimer = window.setTimeout(() => loadState().catch((err) => toast(errorMessage(err), true)), 120);
 }
-
 function connect() {
     const es = new EventSource(`/api/events?t=${encodeURIComponent(TOKEN)}`);
-    es.addEventListener("hello", (e) => {
+    es.addEventListener("hello", (event) => {
         state.connection = "open";
-        state.busy = JSON.parse(e.data).busy;
+        const payload = JSON.parse(event.data);
+        state.busy = isRecord(payload) && typeof payload.busy === "boolean" ? payload.busy : null;
         scheduleReload();
     });
     es.addEventListener("changed", scheduleReload);
     // The extension's web assets changed on disk (dev hot reload).
     es.addEventListener("assets", () => location.reload());
-    es.addEventListener("session", (e) => {
-        state.busy = JSON.parse(e.data).busy;
+    es.addEventListener("session", (event) => {
+        const payload = JSON.parse(event.data);
+        state.busy = isRecord(payload) && typeof payload.busy === "boolean" ? payload.busy : null;
         renderTop();
     });
     es.onerror = () => {
@@ -459,66 +765,79 @@ function connect() {
         renderTop();
     };
 }
-
 // ---------- Drafts & view persistence ----------
-
 const draftKey = (key) => `sr:${state.review?.reviewId}:draft:${key}`;
 const getDraft = (key) => localStorage.getItem(draftKey(key)) ?? "";
 function setDraft(key, value) {
-    if (value) localStorage.setItem(draftKey(key), value);
-    else localStorage.removeItem(draftKey(key));
+    if (value)
+        localStorage.setItem(draftKey(key), value);
+    else
+        localStorage.removeItem(draftKey(key));
 }
-
 function saveView() {
-    if (state.review) sessionStorage.setItem(`sr:${state.review.reviewId}:view`, JSON.stringify(state.view));
+    if (state.review)
+        sessionStorage.setItem(`sr:${state.review.reviewId}:view`, JSON.stringify(state.view));
 }
 let viewRestored = false;
 function restoreView() {
-    if (viewRestored || !state.review) return;
+    if (viewRestored || !state.review)
+        return;
     viewRestored = true;
     try {
-        const v = JSON.parse(sessionStorage.getItem(`sr:${state.review.reviewId}:view`) ?? "null");
-        if (v?.type) state.view = v;
-    } catch { /* ignore */ }
+        const value = JSON.parse(sessionStorage.getItem(`sr:${state.review.reviewId}:view`) ?? "null");
+        if (isView(value))
+            state.view = value;
+    }
+    catch { /* ignore */ }
 }
-
 function collapsedDirs() {
     if (!state.collapsedDirs) {
         try {
-            state.collapsedDirs = new Set(JSON.parse(localStorage.getItem(`sr:${state.review?.reviewId}:collapsed`) ?? "[]"));
-        } catch {
+            const value = JSON.parse(localStorage.getItem(`sr:${state.review?.reviewId}:collapsed`) ?? "[]");
+            state.collapsedDirs = isStringArray(value) ? new Set(value) : new Set();
+        }
+        catch {
             state.collapsedDirs = new Set();
         }
     }
     return state.collapsedDirs;
 }
 function setDirCollapsed(dir, collapsed) {
+    const review = state.review;
+    if (!review)
+        return;
     const set = collapsedDirs();
-    if (collapsed) set.add(dir);
-    else set.delete(dir);
-    localStorage.setItem(`sr:${state.review.reviewId}:collapsed`, JSON.stringify([...set]));
+    if (collapsed)
+        set.add(dir);
+    else
+        set.delete(dir);
+    localStorage.setItem(`sr:${review.reviewId}:collapsed`, JSON.stringify([...set]));
 }
 function expandAncestors(path) {
     for (const dir of collapsedDirs()) {
-        if (dir === "" || path.startsWith(`${dir}/`)) setDirCollapsed(dir, false);
+        if (dir === "" || path.startsWith(`${dir}/`))
+            setDirCollapsed(dir, false);
     }
 }
-
 // ---------- File tree ----------
-
 const inDir = (path, dir) => dir === "" || path.startsWith(`${dir}/`);
 const filesUnder = (dir) => (state.snapshot?.files ?? []).filter((f) => inDir(f.path, dir)).sort((a, b) => a.path.localeCompare(b.path));
 const repoName = () => (state.review?.repoRoot ?? "").split(/[\\/]/).filter(Boolean).pop() ?? "All files";
-
 // Folders first, then files; chains of single-child folders are compacted like ADO ("src/Common/Foo").
 function buildTree(files) {
-    const root = { name: repoName(), path: "", dirs: new Map(), files: [] };
+    const root = { name: repoName(), path: "", dirs: new Map(), files: [], children: [] };
     for (const f of files) {
         const parts = f.path.split("/");
         let node = root;
         for (let i = 0; i < parts.length - 1; i++) {
-            if (!node.dirs.has(parts[i])) node.dirs.set(parts[i], { name: parts[i], path: parts.slice(0, i + 1).join("/"), dirs: new Map(), files: [] });
-            node = node.dirs.get(parts[i]);
+            const part = parts[i];
+            if (part === undefined)
+                continue;
+            if (!node.dirs.has(part))
+                node.dirs.set(part, { name: part, path: parts.slice(0, i + 1).join("/"), dirs: new Map(), files: [], children: [] });
+            const next = node.dirs.get(part);
+            if (next)
+                node = next;
         }
         node.files.push(f);
     }
@@ -527,6 +846,8 @@ function buildTree(files) {
             let d = dir;
             while (!d.files.length && d.dirs.size === 1) {
                 const only = d.dirs.values().next().value;
+                if (!only)
+                    break;
                 d = { ...only, name: `${d.name}/${only.name}` };
             }
             return finish(d);
@@ -536,16 +857,13 @@ function buildTree(files) {
     };
     return finish(root);
 }
-
 // ---------- Diff helpers ----------
-
 function hunkAnchorRange(hunk) {
     const side = hunk.rows.some((r) => r.t === "add") ? "new" : "old";
     const key = side === "old" ? "o" : "n";
     const nums = hunk.rows.map((r) => r[key]).filter((v) => v != null);
     return nums.length ? { side, startLine: Math.min(...nums), endLine: Math.max(...nums) } : null;
 }
-
 function selectionRange(file, sel) {
     const rows = file.hunks[sel.hunk].rows.slice(sel.from, sel.to + 1);
     const side = rows.every((r) => r.t === "del") ? "old" : "new";
@@ -553,117 +871,127 @@ function selectionRange(file, sel) {
     const nums = rows.map((r) => r[key]).filter((v) => v != null);
     return { side, startLine: Math.min(...nums), endLine: Math.max(...nums) };
 }
-
 const fileOf = (p) => state.snapshot?.files.find((f) => f.path === p) ?? null;
-
 // ADO parity: selecting a file shows the whole file (changes inline); folders show diffs only.
 // The full view interleaves unchanged "gap" hunks with the snapshot hunks, so selection,
 // placement, and anchoring keep working on the same { hunks: [{ rows }] } shape.
 function needsContent(file) {
     return !file.binary && file.status !== "added" && file.status !== "deleted" && file.hunks.length > 0;
 }
-
 function contentEntry(file) {
     const rev = state.snapshot?.revisionId;
+    if (!rev)
+        return { status: "unavailable", reason: "missing" };
     const key = `${rev}:${file.path}`;
     let entry = state.content.get(key);
     if (!entry) {
         entry = { status: "loading" };
         state.content.set(key, entry);
         api("GET", `content/${encodeURIComponent(rev)}?path=${encodeURIComponent(file.path)}`)
-            .then((data) => {
-                Object.assign(entry, data.available ? { status: "ready", full: buildFullFile(file, data.lines) } : { status: "unavailable", reason: data.reason });
-            })
-            .catch((err) => Object.assign(entry, { status: "unavailable", reason: err.message }))
+            .then((data) => { state.content.set(key, parseContent(data, file)); })
+            .catch((err) => { state.content.set(key, { status: "unavailable", reason: errorMessage(err) }); })
             .finally(() => {
-                if (state.view.type === "file" && state.view.path === file.path && !state.dragging) {
-                    render();
-                    revealPendingJump();
-                }
-            });
+            if (state.view.type === "file" && state.view.path === file.path && !state.dragging) {
+                render();
+                revealPendingJump();
+            }
+        });
     }
-    return entry;
+    return entry ?? { status: "loading" };
 }
-
 function buildFullFile(file, lines) {
     const hunks = [];
     let nextNew = 1;
     let nextOld = 1;
     const gap = (untilNew) => {
         const rows = [];
-        for (let n = nextNew; n < untilNew; n++) rows.push({ t: "ctx", o: nextOld + (n - nextNew), n, s: lines[n - 1] ?? "" });
-        if (rows.length) hunks.push({ gap: true, rows });
+        for (let n = nextNew; n < untilNew; n++)
+            rows.push({ t: "ctx", o: nextOld + (n - nextNew), n, s: lines[n - 1] ?? "" });
+        if (rows.length)
+            hunks.push({ gap: true, rows });
         nextOld += Math.max(0, untilNew - nextNew);
         nextNew = Math.max(nextNew, untilNew);
     };
     for (const hunk of file.hunks) {
-        gap(hunk.newLines > 0 ? hunk.newStart : hunk.newStart + 1);
+        const newStart = hunk.newStart ?? 1;
+        const newLines = hunk.newLines ?? 0;
+        const oldStart = hunk.oldStart ?? 1;
+        const oldLines = hunk.oldLines ?? 0;
+        gap(newLines > 0 ? newStart : newStart + 1);
         hunks.push(hunk);
-        nextNew = (hunk.newLines > 0 ? hunk.newStart : hunk.newStart + 1) + hunk.newLines;
-        nextOld = (hunk.oldLines > 0 ? hunk.oldStart : hunk.oldStart + 1) + hunk.oldLines;
+        nextNew = (newLines > 0 ? newStart : newStart + 1) + newLines;
+        nextOld = (oldLines > 0 ? oldStart : oldStart + 1) + oldLines;
     }
     gap(lines.length + 1);
     return { ...file, hunks, full: true };
 }
-
 // The file object rendered for a path in the current view: full file in file view when loaded.
 function displayFile(path) {
     const file = fileOf(path);
-    if (!file || state.view.type !== "file" || state.view.path !== path || !needsContent(file)) return file;
+    if (!file || state.view.type !== "file" || state.view.path !== path || !needsContent(file))
+        return file;
     const entry = contentEntry(file);
-    if (state.selection?.path === path && state.selection.full === false) return file;
+    if (state.selection?.path === path && state.selection.full === false)
+        return file;
     return entry.status === "ready" ? entry.full : file;
 }
-
 // Where a thread renders inside a file view, or null when it cannot be placed in the diff.
 function placeThread(thread, file) {
     const loc = thread.location;
-    if (!file || !loc || loc.path !== file.path) return null;
-    if (thread.kind === "file") return { where: "file" };
-    if (loc.state === "outdated") return null;
+    if (!file || !loc || loc.path !== file.path)
+        return null;
+    if (thread.kind === "file")
+        return { where: "file" };
+    if (loc.state === "outdated")
+        return null;
+    if (loc.startLine === undefined || loc.endLine === undefined)
+        return null;
     const key = loc.side === "old" ? "o" : "n";
     for (let h = 0; h < file.hunks.length; h++) {
         const hunk = file.hunks[h];
         if (thread.kind === "change") {
-            if (hunk.gap) continue;
+            if (hunk.gap)
+                continue;
             const r = hunkAnchorRange(hunk);
-            if (r && r.side === loc.side && r.startLine <= loc.endLine && r.endLine >= loc.startLine) return { where: "hunk", hunk: h };
+            if (r && r.side === loc.side && r.startLine <= loc.endLine && r.endLine >= loc.startLine)
+                return { where: "hunk", hunk: h };
             continue;
         }
         for (let i = hunk.rows.length - 1; i >= 0; i--) {
-            if (hunk.rows[i][key] === loc.endLine) return { where: "row", hunk: h, row: i };
+            if (hunk.rows[i][key] === loc.endLine)
+                return { where: "row", hunk: h, row: i };
         }
     }
     return null;
 }
-
 function isPlaced(thread) {
-    if (thread.kind === "overview") return true;
+    if (thread.kind === "overview")
+        return true;
     return placeThread(thread, fileOf(thread.location?.path)) !== null;
 }
-
 function lineLabel(loc) {
-    if (!loc || loc.startLine == null) return "";
+    if (!loc || loc.startLine == null)
+        return "";
     return loc.startLine === loc.endLine ? `L${loc.startLine}` : `L${loc.startLine}–${loc.endLine}`;
 }
-
 function locLabel(thread) {
     const loc = thread.location ?? thread.anchor ?? {};
-    if (thread.kind === "overview") return "Overall";
-    if (thread.kind === "file") return loc.path;
-    return `${loc.path} ${lineLabel(loc)}${loc.side === "old" ? " (old)" : ""}`;
+    if (thread.kind === "overview")
+        return "Overall";
+    if (thread.kind === "file")
+        return loc.path ?? "";
+    return `${loc.path ?? ""} ${lineLabel(loc)}${loc.side === "old" ? " (old)" : ""}`;
 }
-
 const STATUS_LETTER = { modified: "M", added: "A", deleted: "D", renamed: "R" };
-
 // ---------- Rendering ----------
-
 function render() {
     const active = document.activeElement;
-    const focusKey = active?.dataset?.composer;
-    const selStart = active?.selectionStart;
-    const selEnd = active?.selectionEnd;
+    const focusKey = active instanceof HTMLTextAreaElement ? active.dataset.composer : undefined;
+    const selStart = active instanceof HTMLTextAreaElement ? active.selectionStart : null;
+    const selEnd = active instanceof HTMLTextAreaElement ? active.selectionEnd : null;
     const main = $("#main");
+    if (!main)
+        return;
     const scroll = main.scrollTop;
     renderTop();
     renderBanner();
@@ -675,11 +1003,11 @@ function render() {
         const el = document.querySelector(`textarea[data-composer="${CSS.escape(focusKey)}"]`);
         if (el) {
             el.focus();
-            if (selStart != null) el.setSelectionRange(selStart, selEnd);
+            if (selStart != null)
+                el.setSelectionRange(selStart, selEnd);
         }
     }
 }
-
 function scopeToggleHtml(scope) {
     const button = (value, label, title) => `<button type="button" data-action="scope" data-scope="${value}" aria-pressed="${scope === value}" title="${esc(title)}"${state.switching ? " disabled" : ""}>${label}</button>`;
     return `<span class="seg" role="group" aria-label="Review scope">`
@@ -687,14 +1015,14 @@ function scopeToggleHtml(scope) {
         + button("pending", "Pending changes", "Only uncommitted work: staged, unstaged and untracked files compared with HEAD")
         + `</span>`;
 }
-
 function renderTop() {
     const r = state.review;
-    if (!r) return;
+    if (!r)
+        return;
     const rev = r.revisions.find((x) => x.revisionId === r.currentRevisionId);
     const git = r.git ?? {};
     const scope = scopeOf(r);
-    const awaiting = r.threads.flatMap((t) => t.messages).filter((m) => ["queued", "processing"].includes(m.delivery?.state)).length;
+    const awaiting = r.threads.flatMap((t) => t.messages).filter((m) => m.delivery && ["queued", "processing"].includes(m.delivery.state)).length;
     const branch = `<span class="pill mono" title="HEAD ${esc(git.headCommit ?? "")}">${esc(r.branch ?? "?")}</span>`;
     const parts = [
         `<section class="change-context" role="group" aria-label="Change context">`,
@@ -704,19 +1032,28 @@ function renderTop() {
         state.pullRequest ? `<a class="pill pr-link" href="${esc(state.pullRequest.url)}" target="_blank" rel="noopener noreferrer" title="Open pull request #${esc(state.pullRequest.number)} in browser">Open PR #${esc(state.pullRequest.number)}</a>` : "",
         `</div><div class="change-context-details">${scopeToggleHtml(scope)}`,
     ];
-    if (rev) parts.push(`<span class="pill" title="Revision captured ${esc(rev.createdAt)}">${esc(rev.revisionId)} · ${rev.files} files · <span class="add">+${rev.additions}</span> <span class="del">−${rev.deletions}</span></span>`);
+    if (rev)
+        parts.push(`<span class="pill" title="Revision captured ${esc(rev.createdAt)}">${esc(rev.revisionId)} · ${rev.files} files · <span class="add">+${rev.additions}</span> <span class="del">−${rev.deletions}</span></span>`);
     if (scope === "all") {
         if (git.upstream) {
             const { ahead, behind, name } = git.upstream;
-            parts.push(`<span class="pill${ahead || behind ? " warn" : ""}" title="${esc(name)}">↑${ahead} ↓${behind}</span>`);
-        } else if (git.branch) parts.push(`<span class="pill warn">no upstream</span>`);
-        if (git.uncommittedFiles) parts.push(`<span class="pill warn" title="Diff includes working-tree changes">${git.uncommittedFiles} uncommitted</span>`);
+            const countsUnavailable = ahead === null || behind === null;
+            const countLabel = countsUnavailable ? "↑? ↓?" : `↑${ahead} ↓${behind}`;
+            const hasChanges = !countsUnavailable && (ahead !== 0 || behind !== 0);
+            parts.push(`<span class="pill${countsUnavailable || hasChanges ? " warn" : ""}" title="${esc(name)}">${countLabel}</span>`);
+        }
+        else if (git.branch)
+            parts.push(`<span class="pill warn">no upstream</span>`);
+        if (git.uncommittedFiles)
+            parts.push(`<span class="pill warn" title="Diff includes working-tree changes">${git.uncommittedFiles} uncommitted</span>`);
     }
-    if (state.connection === "lost") parts.push(`<span class="pill warn" title="If this persists, reopen the canvas">disconnected</span>`);
-    else if (state.busy === true) parts.push(`<span class="pill busy"><span class="dot"></span>Copilot working${awaiting ? ` · ${awaiting} pending` : ""}</span>`);
-    else if (state.busy === false) parts.push(`<span class="pill"><span class="dot muted"></span>Copilot idle${awaiting ? ` · ${awaiting} pending` : ""}</span>`);
+    if (state.connection === "lost")
+        parts.push(`<span class="pill warn" title="If this persists, reopen the canvas">disconnected</span>`);
+    else if (state.busy === true)
+        parts.push(`<span class="pill busy"><span class="dot"></span>Copilot working${awaiting ? ` · ${awaiting} pending` : ""}</span>`);
+    else if (state.busy === false)
+        parts.push(`<span class="pill"><span class="dot muted"></span>Copilot idle${awaiting ? ` · ${awaiting} pending` : ""}</span>`);
     parts.push(`<span class="spacer"></span><button data-action="refresh" title="Re-read the working tree">Refresh</button></div></section>`);
-
     const drafts = draftMessages().length;
     const workflows = [];
     if (state.agentReviewAvailable) {
@@ -736,7 +1073,8 @@ function renderTop() {
         + `<div class="review-lane-heading"><h2 id="manual-review-title">Manual Review</h2><p class="muted">Your comments guide the coding agent; these settings control how they are sent and learned from.</p></div>`
         + `<div class="review-lane-actions">`);
     workflows.push(`<span class="feedback-draft-count">${drafts} draft ${drafts === 1 ? "comment" : "comments"}</span>`);
-    if (drafts) workflows.push(`<button class="primary" data-action="submit-review" title="Send every draft comment to Copilot together, as one review"${state.submitting ? " disabled>Submitting…" : `>Submit review (${drafts})`}</button>`);
+    if (drafts)
+        workflows.push(`<button class="primary" data-action="submit-review" title="Send every draft comment to Copilot together, as one review"${state.submitting ? " disabled>Submitting…" : `>Submit review (${drafts})`}</button>`);
     if (state.settings) {
         const repoMode = deliveryRepoMode();
         const chosen = repoMode === "ask" ? deliveryMode() : null;
@@ -747,51 +1085,51 @@ function renderTop() {
         workflows.push(`<span class="pill" title="${esc(mode.hint)}">Learning: ${esc(mode.pill)}</span><button data-action="configure" title="Change how manual review comments are delivered and used for learning in this repository">Manual review settings</button>`);
     }
     workflows.push(`</div></section>`);
-    if (workflows.length) parts.push(`<div class="review-workflows">${workflows.join("")}</div>`);
-    $("#top").innerHTML = parts.join("");
+    if (workflows.length)
+        parts.push(`<div class="review-workflows">${workflows.join("")}</div>`);
+    requiredElement("#top").innerHTML = parts.join("");
 }
-
 // ---------- Repository settings: first-use banner, per-review delivery question, and Configure dialog ----------
-
 function learningBannerHtml() {
     const s = state.settings;
-    if (!s || s.configured || s.dismissed) return "";
+    if (!s || s.configured || s.dismissed)
+        return "";
     const choice = (mode, primary) => `<button data-action="learning-set" data-mode="${mode}"${primary ? ` class="primary"` : ""} title="${esc(LEARNING[mode].hint)}">${esc(LEARNING[mode].label)}</button>`;
     return `<div class="banner-row"><span class="banner-text"><strong>Learn from your review feedback in ${esc(s.repoName)}?</strong> Copilot can turn your comments into reusable coding guidelines. The choice is stored on this machine only, and Configure changes it any time.</span>`
         + `<span class="banner-actions">${choice("suggest", true)}${choice("auto", false)}`
         + `<button class="link" data-action="learning-dismiss" title="Hide this notice. Learning stays off until you choose a mode with Configure.">Not now</button></span></div>`;
 }
-
 // Shown while an ask-mode review is undecided; until then the server holds new comments as drafts.
 function deliveryBannerHtml() {
-    if (!state.settings || !state.review || deliveryRepoMode() !== "ask" || deliveryMode()) return "";
+    if (!state.settings || !state.review || deliveryRepoMode() !== "ask" || deliveryMode())
+        return "";
     const drafts = draftMessages().length;
     const waiting = drafts ? `${drafts} draft ${drafts === 1 ? "comment is" : "comments are"} waiting.` : "Until you choose, new comments wait as drafts.";
     const choice = (mode, label) => `<button data-action="delivery-choose" data-mode="${mode}" title="${esc(DELIVERY[mode].hint)}">${label}</button>`;
     return `<div class="banner-row"><span class="banner-text"><strong>How should Copilot receive your comments on this review?</strong> Send each one as you post it, or batch them and submit the review when you are done. ${waiting}</span>`
         + `<span class="banner-actions">${choice("immediate", "Send each now")}${choice("batch", "Batch into a review")}</span></div>`;
 }
-
 function bannerHtml() {
     return learningBannerHtml() + deliveryBannerHtml();
 }
-
 function renderBanner() {
     const el = $("#banner");
     const html = bannerHtml();
+    if (!el)
+        return;
     el.hidden = !html;
     el.innerHTML = html;
 }
-
 function choicesHtml(name, modes, table, selected) {
     return modes.map((mode) => `<label class="choice"><input type="radio" name="${name}" value="${mode}"${selected === mode ? " checked" : ""}>`
         + `<span><span class="choice-title">${esc(table[mode].label)}</span><span class="choice-hint">${esc(table[mode].hint)}</span></span></label>`).join("");
 }
-
 function dialogHtml() {
     const d = state.dialog;
-    if (!d) return "";
-    if (d.type === "agent-review") return agentReviewDialogHtml(d);
+    if (!d)
+        return "";
+    if (d.type === "agent-review")
+        return agentReviewDialogHtml(d);
     return `<div class="modal-backdrop" data-action="dialog-backdrop"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby="dialog-desc">`
         + `<h2 id="dialog-title">Review settings</h2>`
         + `<p id="dialog-desc" class="muted">Settings for ${esc(state.settings?.repoName ?? "this repository")}. They are stored on this machine only and never committed.</p>`
@@ -802,44 +1140,51 @@ function dialogHtml() {
         + `<button class="primary" data-action="dialog-save"${d.saving ? " disabled" : ""}>${d.saving ? "Saving…" : "Save"}</button></div>`
         + `</div></div>`;
 }
-
 function focusIn(selector) {
     $(selector)?.focus?.();
 }
-
 // The dialog is rendered on its own so re-renders of the page never disturb its focus or radio state.
 function renderDialog() {
-    const active = document.activeElement?.closest?.("#dialog") ? document.activeElement : null;
-    const key = active?.name ? `[name="${active.name}"]${active.type === "checkbox" ? `[value="${CSS.escape(active.value)}"]` : ""}`
-        : active?.dataset?.action ? `[data-action="${active.dataset.action}"]` : null;
-    const selection = active && "selectionStart" in active ? [active.selectionStart, active.selectionEnd] : null;
-    $("#dialog").innerHTML = dialogHtml();
+    const active = document.activeElement instanceof HTMLElement && document.activeElement.closest("#dialog") ? document.activeElement : null;
+    const key = active instanceof HTMLInputElement && active.name ? `[name="${active.name}"]${active.type === "checkbox" ? `[value="${CSS.escape(active.value)}"]` : ""}`
+        : active instanceof HTMLSelectElement && active.name ? `[name="${active.name}"]`
+            : active instanceof HTMLTextAreaElement && active.name ? `[name="${active.name}"]`
+                : active?.dataset?.action ? `[data-action="${active.dataset.action}"]` : null;
+    const selection = active instanceof HTMLTextAreaElement || active instanceof HTMLInputElement
+        ? [active.selectionStart, active.selectionEnd] : null;
+    const dialog = $("#dialog");
+    if (!dialog)
+        return;
+    dialog.innerHTML = dialogHtml();
     for (const id of ["#top", "#banner", "#layout"]) {
         const el = $(id);
-        if (el) el.inert = Boolean(state.dialog);
+        if (el)
+            el.inert = Boolean(state.dialog);
     }
     const restored = key ? document.querySelector(`#dialog ${key}`) : null;
-    if (restored && !restored.disabled) {
+    if (restored && !("disabled" in restored && restored.disabled)) {
         restored.focus();
-        if (selection && selection[0] !== null) try { restored.setSelectionRange(...selection); } catch { /* not a text field */ }
+        if (selection && selection[0] !== null
+            && (restored instanceof HTMLTextAreaElement || (restored instanceof HTMLInputElement && restored.type === "text"))) {
+            restored.setSelectionRange(...selection);
+        }
     }
 }
-
 function openConfigure() {
-    if (!state.settings || state.dialog) return;
-    state.dialog = { learning: learningMode(), delivery: deliveryRepoMode(), saving: false, error: "" };
+    if (!state.settings || state.dialog)
+        return;
+    state.dialog = { type: "configure", learning: learningMode(), delivery: deliveryRepoMode(), saving: false, error: "" };
     renderDialog();
     focusIn('#dialog input[name="learning"]:checked');
 }
-
 function closeConfigure() {
-    if (!state.dialog || state.dialog.saving) return;
+    if (!state.dialog || state.dialog.saving)
+        return;
     const opener = state.dialog.type === "agent-review" ? state.dialog.opener ?? "agent-review" : "configure";
     state.dialog = null;
     renderDialog();
     focusIn(`[data-action="${opener}"]`);
 }
-
 function reviewSkillsSectionHtml(d) {
     const disabled = d.saving || d.skillsLoading;
     const names = d.skillNames ?? [];
@@ -858,37 +1203,39 @@ function reviewSkillsSectionHtml(d) {
         + (state.agentReviewSettingsAvailable ? `<label class="choice"><input type="checkbox" name="review-skill-defaults"${d.saveSkillDefaults ? " checked" : ""}${disabled || !d.skillCatalog ? " disabled" : ""}><span>Save these skill choices as my defaults across repositories</span></label>` : "")
         + `<p class="muted">Unchecked choices apply to this review until you save them as defaults. Third-party notices and license texts are in the extension's bundled-skills folder.</p></fieldset>`;
 }
-
 async function refreshReviewSkills() {
     const d = state.dialog;
-    if (d?.type !== "agent-review" || d.saving || d.skillsLoading) return;
+    if (d?.type !== "agent-review" || d.saving || d.skillsLoading)
+        return;
     d.skillsLoading = true;
     d.skillsError = "";
     renderDialog();
     try {
         const firstLoad = !d.skillCatalog;
-        const catalog = await api("GET", "review-skills");
-        if (state.dialog !== d) return;
+        const catalog = parseSkillCatalog(await api("GET", "review-skills"));
+        if (state.dialog !== d)
+            return;
         d.skillCatalog = catalog;
         if (firstLoad && d.skillNames === undefined) {
             d.skillNames = [...catalog.selected];
         }
-    } catch (err) {
-        d.skillsError = err.message;
-    } finally {
+    }
+    catch (err) {
+        d.skillsError = errorMessage(err);
+    }
+    finally {
         d.skillsLoading = false;
         if (state.dialog === d) {
             renderDialog();
-            if (!document.activeElement?.closest?.("#dialog")) focusIn(d.skillsError ? '#dialog [data-action="review-skills-refresh"]' : '#dialog [data-action="review-tab"][aria-selected="true"]');
+            if (!document.activeElement?.closest?.("#dialog"))
+                focusIn(d.skillsError ? '#dialog [data-action="review-skills-refresh"]' : '#dialog [data-action="review-tab"][aria-selected="true"]');
         }
     }
 }
-
 function reviewTabsHtml(d) {
     const tab = (id, label) => `<button role="tab" id="review-tab-${id}" class="review-tab" data-action="review-tab" data-tab="${id}" aria-controls="review-panel-${id}" aria-selected="${d.tab === id}">${label}</button>`;
     return `<div class="review-tabs" role="tablist" aria-label="Review settings sections">${tab("general", "General")}${tab("skills", "Review skills")}</div>`;
 }
-
 function agentReviewDialogHtml(d) {
     const options = [["review", "Review issues"], ["simplify", "Simplification"], ["both", "Review and simplification"]];
     return `<div class="modal-backdrop" data-action="dialog-backdrop"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby="dialog-desc">`
@@ -917,38 +1264,38 @@ function agentReviewDialogHtml(d) {
         + (d.settingsOnly ? "" : `<button class="primary" data-action="agent-review-start"${d.saving || d.skillsLoading ? " disabled" : ""}>${d.saving ? "Please wait..." : "Run review"}</button>`)
         + `</div></div></div>`;
 }
-
 function openAgentReview(opener = "agent-review") {
-    if (!state.agentReviewAvailable || !state.review || state.dialog) return;
+    if (!state.agentReviewAvailable || !state.review || state.dialog)
+        return;
+    const revisionId = state.review.currentRevisionId;
     const last = state.review.agentReviews?.at(-1);
     const defaults = state.agentReviewSettings;
     state.dialog = {
-        type: "agent-review", reviewId: state.review.reviewId, revisionId: state.review.currentRevisionId,
+        type: "agent-review", reviewId: state.review.reviewId, revisionId,
         scope: scopeLabel(scopeOf(state.review)), models: (defaults?.models ?? last?.models ?? state.agentReviewSuggestedModels).join(", "),
-        focus: defaults?.focus ?? last?.focus ?? "review", intent: defaults?.intent ?? "", saving: false,
+        focus: defaults?.focus ?? (isReviewFocus(last?.focus) ? last.focus : "review"), intent: defaults?.intent ?? "", saving: false,
         skillNames: state.skillOverrides.get(state.review.reviewId) ?? defaults?.skillNames,
         skillCatalog: null, skillsLoading: false, skillsError: "", saveSkillDefaults: false, tab: "general",
         saveDefaults: Boolean(defaults), skipDialog: defaults?.skipDialog ?? false, opener, settingsOnly: opener === "agent-review-configure", error: state.agentReviewSettingsError,
     };
     renderDialog();
     focusIn('#dialog input[name="review-models"]');
-    if (state.reviewSkillsAvailable) refreshReviewSkills().catch((err) => toast(err.message, true));
+    if (state.reviewSkillsAvailable)
+        refreshReviewSkills().catch((err) => toast(errorMessage(err), true));
 }
-
 function agentReviewOptions(d) {
     return { models: d.models.split(",").map((m) => m.trim()), focus: d.focus, intent: d.intent,
         ...(d.skillNames !== undefined ? { skillNames: d.skillNames } : {}) };
 }
-
 async function saveAgentReviewDefaults(d) {
     const { skillNames: _skillNames, ...options } = agentReviewOptions(d);
     state.agentReviewSettings = await settingsApi.updateAgentReview({ ...options, skipDialog: d.skipDialog });
     state.agentReviewSettingsError = "";
 }
-
 async function startAgentReview(saveOnly = false) {
     const d = state.dialog;
-    if (d?.type !== "agent-review" || d.saving || (d.settingsOnly && !saveOnly)) return;
+    if (d?.type !== "agent-review" || d.saving || (d.settingsOnly && !saveOnly))
+        return;
     d.saving = true;
     d.error = "";
     renderDialog();
@@ -956,13 +1303,17 @@ async function startAgentReview(saveOnly = false) {
         if (!saveOnly && (d.reviewId !== state.review?.reviewId || d.revisionId !== state.review?.currentRevisionId)) {
             throw new Error("The review scope changed or revision is stale. Close this dialog and try again.");
         }
-        if (saveOnly && !d.saveDefaults && !d.saveSkillDefaults) throw new Error("Select Save these models, focus, and guidance, or save skill choices, first.");
-        if (d.saveDefaults) await saveAgentReviewDefaults(d);
+        if (saveOnly && !d.saveDefaults && !d.saveSkillDefaults)
+            throw new Error("Select Save these models, focus, and guidance, or save skill choices, first.");
+        if (d.saveDefaults)
+            await saveAgentReviewDefaults(d);
         if (d.saveSkillDefaults) {
-            if (d.reviewId !== state.review?.reviewId) throw new Error("The review changed. Close this dialog and try again.");
+            if (d.reviewId !== state.review?.reviewId)
+                throw new Error("The review changed. Close this dialog and try again.");
             await api("POST", "review-skills", { names: d.skillNames ?? [], saveDefaults: true });
         }
-        if (d.skillCatalog && d.skillNames !== undefined) state.skillOverrides.set(d.reviewId, [...d.skillNames]);
+        if (d.skillCatalog && d.skillNames !== undefined)
+            state.skillOverrides.set(d.reviewId, [...d.skillNames]);
         if (!saveOnly) {
             if (d.reviewId !== state.review?.reviewId || d.revisionId !== state.review?.currentRevisionId) {
                 throw new Error("The review scope changed or revision is stale. Close this dialog and try again.");
@@ -974,17 +1325,19 @@ async function startAgentReview(saveOnly = false) {
         focusIn('[data-action="agent-review"]');
         await loadState();
         toast(saveOnly ? "User defaults saved. No review was started." : "Review requested. Model results will appear as suggestions.");
-    } catch (err) {
+    }
+    catch (err) {
         d.saving = false;
-        d.error = err.message;
-        if (state.dialog === d) renderDialog();
-        await loadState().catch((loadError) => toast(loadError.message, true));
+        d.error = errorMessage(err);
+        if (state.dialog === d)
+            renderDialog();
+        await loadState().catch((loadError) => toast(errorMessage(loadError), true));
     }
 }
-
 function applyReviewSkills() {
     const d = state.dialog;
-    if (d?.type !== "agent-review" || d.saving || !d.skillCatalog) return;
+    if (d?.type !== "agent-review" || d.saving || !d.skillCatalog)
+        return;
     if (d.reviewId !== state.review?.reviewId) {
         d.error = "The review changed. Close this dialog and try again.";
         renderDialog();
@@ -996,10 +1349,10 @@ function applyReviewSkills() {
     focusIn('[data-action="agent-review-configure"]');
     toast("Review skills applied to this review only. Defaults are unchanged and no review was started.");
 }
-
 async function runAgentReview() {
     if (!state.agentReviewAvailable || !state.review || state.dialog || state.startingReview
-        || state.review.agentReviews?.some((run) => ["sending", "queued", "running"].includes(run.state))) return;
+        || state.review.agentReviews?.some((run) => ["sending", "queued", "running"].includes(run.state)))
+        return;
     if (!state.agentReviewSettings?.skipDialog || state.agentReviewSettingsError) {
         openAgentReview();
         return;
@@ -1021,34 +1374,37 @@ async function runAgentReview() {
         const skillNames = state.skillOverrides.get(reviewId);
         await api("POST", "agent-reviews", { useDefaults: true, oneClick: true, revisionId, ...(skillNames !== undefined ? { skillNames } : {}) });
         toast("Review requested with your saved defaults.");
-    } finally {
+    }
+    finally {
         state.startingReview = false;
         renderTop();
         await loadState();
     }
 }
-
 function agentComments() {
-    return state.review?.threads.filter((thread) => thread.agentReview) ?? [];
+    return state.review?.threads.filter((thread) => Boolean(thread.agentReview)) ?? [];
 }
-
 function agentCommentsView() {
+    const review = state.review;
+    if (!review)
+        return "";
     const threads = agentComments();
     const active = threads.filter((thread) => thread.status === "active").length;
-    const older = threads.filter((thread) => thread.agentReview.revisionId !== state.review.currentRevisionId).length;
+    const older = threads.filter((thread) => thread.agentReview.revisionId !== review.currentRevisionId).length;
     return `<h2>Agent reviews</h2>`
         + agentReviewsHtml()
         + `<h2>Agent comments (<span aria-live="polite">${threads.length}</span>)</h2>`
         + `<p class="muted">${active} active, ${threads.length - active} closed or resolved; ${older} from older revisions. Counts include all agent findings in this scope, not replies or manual threads.</p>`
         + (threads.length ? threads.map((thread) => threadHtml(thread, { showLocation: true })).join("") : `<div class="empty">No agent comments yet. A review may still be running or may have reported no findings; check its status above.</div>`);
 }
-
 function agentReviewsHtml() {
-    const runs = state.review?.agentReviews ?? [];
-    if (!runs.length) return "";
+    const review = state.review;
+    const runs = review?.agentReviews ?? [];
+    if (!runs.length)
+        return "";
     const active = (r) => ["sending", "queued", "running"].includes(r.state);
     return `<h3>Review runs</h3><p class="muted">Assessments and verification are reported by the coordinating agent, not independently attested by the canvas.</p>${[...runs].reverse().map((r) => `<div class="card agent-review-run">`
-        + `<strong>${esc(r.focus)}: ${esc(r.state)}</strong> <span class="pill">${agentComments().filter((thread) => thread.agentReview.runId === r.runId).length} agent comments</span> <span class="muted">${esc(r.revisionId)}${r.revisionId !== state.review.currentRevisionId ? " (older diff)" : ""}</span>`
+        + `<strong>${esc(r.focus)}: ${esc(r.state)}</strong> <span class="pill">${agentComments().filter((thread) => thread.agentReview.runId === r.runId).length} agent comments</span> <span class="muted">${esc(r.revisionId)}${r.revisionId !== review?.currentRevisionId ? " (older diff)" : ""}</span>`
         + (r.intent ? `<p class="review-summary">Goal / spec / guidance: ${esc(r.intent)}</p>` : "")
         + (r.skills?.length ? `<p class="review-summary">Bundled skills supplied: ${esc(r.skills.map((skill) => skill.release ? `${skill.name} (${skill.release})` : skill.name).join(", "))}. See actual use and limits in each result.</p>` : "")
         + (r.error ? `<p class="err">${esc(r.error)}</p>` : "")
@@ -1058,11 +1414,12 @@ function agentReviewsHtml() {
             if (result) {
                 if (result.error) {
                     outcome = `Failed: ${esc(result.error)}`;
-                } else {
+                }
+                else {
                     const counts = {};
                     for (const id of result.threadIds) {
-                        const assessment = state.review.threads.find((t) => t.threadId === id)?.agentReview?.assessment;
-                        const key = Object.hasOwn(FINDING_ASSESSMENTS, assessment) ? assessment : "unverified";
+                        const assessment = review?.threads.find((t) => t.threadId === id)?.agentReview?.assessment;
+                        const key = typeof assessment === "string" && Object.hasOwn(FINDING_ASSESSMENTS, assessment) ? assessment : "unverified";
                         counts[key] = (counts[key] ?? 0) + 1;
                     }
                     outcome = result.threadIds.length ? Object.keys(FINDING_ASSESSMENTS).filter((key) => counts[key]).map((key) => `${counts[key]} ${key}`).join(", ") : "No findings reported";
@@ -1081,22 +1438,22 @@ function agentReviewsHtml() {
         + (active(r) ? `<button data-action="agent-review-close" data-run="${esc(r.runId)}" title="Stop accepting results for this review. This does not stop agents already running.">Close review</button>` : "")
         + `</div>`).join("")}`;
 }
-
 // A delivery change alters every composer's buttons, so it needs a full render once a diff is shown.
 async function updateSettings(patch) {
     const before = deliveryMode();
     state.settings = await settingsApi.update(patch);
     if (deliveryMode() !== before && state.snapshot) {
         render();
-    } else {
+    }
+    else {
         renderTop();
         renderBanner();
     }
 }
-
 async function saveConfigure() {
     const d = state.dialog;
-    if (!d || d.saving) return;
+    if (!d || d.type !== "configure" || d.saving)
+        return;
     d.saving = true;
     d.error = "";
     renderDialog();
@@ -1106,72 +1463,77 @@ async function saveConfigure() {
         renderDialog();
         focusIn('[data-action="configure"]');
         toast(`Saved. Learning: ${LEARNING[learningMode()].pill} · Delivery: ${DELIVERY[deliveryRepoMode()].pill}`);
-    } catch (err) {
+    }
+    catch (err) {
         d.saving = false;
-        d.error = err.message;
+        d.error = errorMessage(err);
         renderDialog();
         focusIn('#dialog [data-action="dialog-save"]');
     }
 }
-
 // Keeps Tab inside the open dialog; each radio group is a single tab stop (its checked radio).
 function trapTab(e) {
     const groupStop = (name) => {
-        const radios = [...document.querySelectorAll(`#dialog input[name="${name}"]`)];
+        const radios = Array.from(document.querySelectorAll(`#dialog input[name="${name}"]`));
         return radios.find((x) => x.checked) ?? radios[0];
     };
     const stops = state.dialog?.type === "agent-review"
-        ? [...document.querySelectorAll("#dialog input:not([disabled]), #dialog select:not([disabled]), #dialog textarea:not([disabled]), #dialog a[href], #dialog button:not([disabled])")]
-        : [...new Set([groupStop("learning"), groupStop("delivery"), ...document.querySelectorAll("#dialog button:not([disabled])")].filter(Boolean))];
-    if (!stops.length) return;
+        ? Array.from(document.querySelectorAll("#dialog input:not([disabled]), #dialog select:not([disabled]), #dialog textarea:not([disabled]), #dialog a[href], #dialog button:not([disabled])"))
+        : [groupStop("learning"), groupStop("delivery"), ...Array.from(document.querySelectorAll("#dialog button:not([disabled])"))]
+            .filter((el) => el instanceof HTMLInputElement || el instanceof HTMLButtonElement);
+    if (!stops.length)
+        return;
     const first = stops[0];
     const last = stops[stops.length - 1];
     if (e.shiftKey && document.activeElement === first) {
         e.preventDefault();
         last.focus();
-    } else if (!e.shiftKey && document.activeElement === last) {
+    }
+    else if (!e.shiftKey && document.activeElement === last) {
         e.preventDefault();
         first.focus();
     }
 }
-
 async function switchScope(scope) {
-    if (state.switching || scope === scopeOf(state.review)) return;
+    if (state.switching || scope === scopeOf(state.review))
+        return;
     state.switching = true;
     renderTop();
     try {
         await api("POST", "scope", { scope });
         await loadState();
-    } finally {
+    }
+    finally {
         state.switching = false;
         renderTop();
         renderSide();
     }
 }
-
 function activeCount(pathName) {
-    return state.review.threads.filter((t) => t.status === "active" && t.kind !== "overview" && t.location?.path === pathName).length;
+    return state.review?.threads.filter((t) => t.status === "active" && t.kind !== "overview" && t.location?.path === pathName).length ?? 0;
 }
-
 const CHEVRON = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 const FOLDER_ICON = `<svg class="ficon" viewBox="0 0 16 16" aria-hidden="true"><path d="M1.75 3h4.1l1.5 1.5h6.9c.41 0 .75.34.75.75v7c0 .41-.34.75-.75.75H1.75A.75.75 0 0 1 1 12.25v-8.5c0-.41.34-.75.75-.75Z" fill="currentColor"/></svg>`;
-
 const statHtml = (adds, dels) => `<span class="stat"><span class="add">+${adds}</span> <span class="del">−${dels}</span></span>`;
-
 function treeHtml(node, depth, out) {
+    const review = state.review;
+    if (!review)
+        return;
     const v = state.view;
     const collapsed = collapsedDirs().has(node.path);
     const files = filesUnder(node.path);
     const n = files.reduce((sum, f) => sum + activeCount(f.path), 0);
-    const title = node.path === "" ? `${state.review.repoRoot} — ${scopeLabel(scopeOf(state.review))}` : node.path;
+    const title = node.path === "" ? `${review.repoRoot} — ${scopeLabel(scopeOf(review))}` : node.path;
     out.push(`<div class="nav-item tree dir${v.type === "folder" && v.path === node.path ? " active" : ""}" data-action="nav" data-view="folder" data-path="${esc(node.path)}" style="--depth:${depth}" title="${esc(title)}" role="treeitem" aria-expanded="${!collapsed}">`
         + `<span class="twisty${collapsed ? "" : " open"}" data-action="fold" data-path="${esc(node.path)}" title="${collapsed ? "Expand" : "Collapse"}">${CHEVRON}</span>`
         + FOLDER_ICON
         + `<span class="name">${esc(node.name)}</span>`
         + `<span class="count${n ? "" : " zero"}">${n}</span>`
         + `</div>`);
-    if (collapsed) return;
-    for (const child of node.children) treeHtml(child, depth + 1, out);
+    if (collapsed)
+        return;
+    for (const child of node.children)
+        treeHtml(child, depth + 1, out);
     for (const f of node.files) {
         const letter = STATUS_LETTER[f.status] ?? "M";
         const fn = activeCount(f.path);
@@ -1183,8 +1545,10 @@ function treeHtml(node, depth, out) {
             + `${statHtml(f.additions, f.deletions)}</div>`);
     }
 }
-
 function setAllDirsCollapsed(collapse) {
+    const review = state.review;
+    if (!review)
+        return;
     const dirs = [];
     const walk = (node) => {
         for (const child of node.children) {
@@ -1192,23 +1556,27 @@ function setAllDirsCollapsed(collapse) {
             walk(child);
         }
     };
-    if (collapse) walk(buildTree(state.snapshot?.files ?? []));
+    if (collapse)
+        walk(buildTree(state.snapshot?.files ?? []));
     state.collapsedDirs = new Set(dirs);
-    localStorage.setItem(`sr:${state.review.reviewId}:collapsed`, JSON.stringify(dirs));
+    localStorage.setItem(`sr:${review.reviewId}:collapsed`, JSON.stringify(dirs));
 }
-
 function descriptionHtml() {
-    const d = state.review.description;
-    const stale = d && d.revisionId !== state.review.currentRevisionId;
+    const review = state.review;
+    if (!review)
+        return "";
+    const d = review.description;
+    const stale = d && d.revisionId !== review.currentRevisionId;
     return `<div class="section-head"><h2>Change overview</h2><span class="spacer"></span>`
         + `<button data-action="discuss-description">Discuss / request edits</button></div>`
         + `<div class="card description"><div class="muted">Local PR-style draft; not synced to the published PR.`
         + (d ? ` v${d.version} · based on ${esc(d.revisionId)}${stale ? " · Diff changed; description may need updating." : ""}` : "")
         + `</div>${d ? md(d.body) : `<div class="empty">No description yet. Ask Copilot below to describe the purpose, behavior, scope, verification, and risks.</div>`}</div>`;
 }
-
 function renderSide() {
     const r = state.review;
+    if (!r)
+        return;
     const files = state.snapshot?.files ?? [];
     const v = state.view;
     const overviewCount = r.threads.filter((t) => t.status === "active" && (t.kind === "overview" || !isPlaced(t))).length;
@@ -1219,20 +1587,19 @@ function renderSide() {
         `<div class="section">Files (${files.length})</div>`,
     ];
     if (files.length) {
-        html.push(
-            `<div class="tree-controls"><button class="link" data-action="fold-tree" data-fold="1">Collapse all</button><button class="link" data-action="fold-tree" data-fold="0">Expand all</button></div>`,
-            `<div role="tree">`,
-        );
+        html.push(`<div class="tree-controls"><button class="link" data-action="fold-tree" data-fold="1">Collapse all</button><button class="link" data-action="fold-tree" data-fold="0">Expand all</button></div>`, `<div role="tree">`);
         treeHtml(buildTree(files), 0, html);
         html.push(`</div>`);
-    } else if (state.snapshot) {
+    }
+    else if (state.snapshot) {
         html.push(`<div class="side-empty">${scopeOf(r) === "pending" ? "No uncommitted changes." : "No changes against the base."}</div>`);
     }
-    $("#side").innerHTML = html.join("");
+    requiredElement("#side").innerHTML = html.join("");
 }
-
 function renderMain() {
     const main = $("#main");
+    if (!main)
+        return;
     if (state.view.type === "file") {
         const file = displayFile(state.view.path);
         if (file) {
@@ -1250,8 +1617,7 @@ function renderMain() {
     }
     main.innerHTML = state.view.type === "lessons" ? lessonsView() : state.view.type === "agent-comments" ? agentCommentsView() : overviewView();
 }
-
-function composerHtml(key, { label, placeholder, kind, path, side, startLine, endLine, alwaysOpen }) {
+function composerHtml(key, { label, placeholder, kind, path, side, startLine, endLine, alwaysOpen, }) {
     const draft = getDraft(key);
     const p = state.pending.get(key);
     const open = alwaysOpen || state.open.has(key) || Boolean(draft) || Boolean(p);
@@ -1278,10 +1644,10 @@ function composerHtml(key, { label, placeholder, kind, path, side, startLine, en
         + `${buttons}</div>`
         + `</div>`;
 }
-
 function deliveryHtml(m) {
     const d = m.delivery;
-    if (!d) return "";
+    if (!d)
+        return "";
     const resend = (label) => `<button class="link" data-action="retry" data-message="${esc(m.messageId)}">${label}</button>`;
     switch (d.state) {
         case "draft":
@@ -1305,10 +1671,9 @@ function deliveryHtml(m) {
             return "";
     }
 }
-
 function messageHtml(m) {
     const agent = m.author === "agent";
-    const lessons = (m.lessonIds ?? []).map((id) => state.review.lessons.find((l) => l.lessonId === id)).filter(Boolean);
+    const lessons = (m.lessonIds ?? []).map((id) => state.review?.lessons.find((l) => l.lessonId === id)).filter((lesson) => Boolean(lesson));
     return `<div class="msg" data-message-id="${esc(m.messageId)}">`
         + `<div class="msg-head"><span class="avatar${agent ? " agent" : ""}">${agent ? "AI" : "Me"}</span>`
         + `<span class="who">${agent ? "Copilot" : "You"}</span><span class="when" title="${esc(m.createdAt)}">${esc(ago(m.createdAt))}</span>`
@@ -1319,24 +1684,24 @@ function messageHtml(m) {
         + (lessons.length ? `<div class="lessons">Guidelines:<ul>${lessons.map((l) => `<li><span class="badge">${esc(l.scope)}</span> ${lessonBadge(l)} ${inline(l.rule)}${l.savedTo ? ` <span class="muted mono">→ ${esc(l.savedTo)}</span>` : ""}</li>`).join("")}</ul></div>` : "")
         + `</div>`;
 }
-
 function findingApprovalIssue(finding) {
-    if (finding.assessment !== "confirmed") return "Only confirmed findings can be approved; discuss the assessment or run a fresh review.";
-    if (!Object.hasOwn(FINDING_SEVERITIES, finding.severity) || finding.severity === "fyi") return "This finding is not an actionable suggestion; use Discuss.";
-    if (["source", "baseline", "validation"].some((key) => typeof finding.evidence?.[key] !== "string" || !finding.evidence[key].trim())) {
+    if (finding.assessment !== "confirmed")
+        return "Only confirmed findings can be approved; discuss the assessment or run a fresh review.";
+    if (!Object.hasOwn(FINDING_SEVERITIES, finding.severity) || finding.severity === "fyi")
+        return "This finding is not an actionable suggestion; use Discuss.";
+    const fields = ["source", "baseline", "validation"];
+    if (fields.some((key) => typeof finding.evidence?.[key] !== "string" || !finding.evidence[key]?.trim())) {
         return "Evidence is missing; run a fresh review or use Discuss.";
     }
     return "";
 }
-
 function findingEvidenceHtml(finding) {
-    if (!finding) return "";
+    if (!finding)
+        return "";
     return `<details class="finding-evidence"><summary>Evidence and verification</summary><dl>`
-        + [["source", "Source / requirement"], ["baseline", "Baseline comparison"], ["validation", "Validation / limits"]].map(([key, label]) =>
-            `<dt>${label}</dt><dd>${typeof finding.evidence?.[key] === "string" ? md(finding.evidence[key]) : "Not recorded"}</dd>`).join("")
+        + [["source", "Source / requirement"], ["baseline", "Baseline comparison"], ["validation", "Validation / limits"]].map(([key, label]) => `<dt>${label}</dt><dd>${typeof finding.evidence?.[key] === "string" ? md(finding.evidence[key]) : "Not recorded"}</dd>`).join("")
         + `</dl></details>`;
 }
-
 function threadHtml(t, { showLocation = false } = {}) {
     const loc = t.location ?? {};
     const outdated = loc.state === "outdated";
@@ -1344,14 +1709,15 @@ function threadHtml(t, { showLocation = false } = {}) {
     const collapsed = collapsible && !state.expanded.has(t.threadId);
     const pending = t.messages.filter((m) => m.delivery && m.delivery.state !== "replied");
     const notInDiff = !outdated && !isPlaced(t);
-    const moved = t.anchor?.startLine != null && loc.startLine != null && (t.anchor.startLine !== loc.startLine || t.anchor.endLine !== loc.endLine);
+    const anchor = t.anchor;
+    const moved = anchor?.startLine != null && loc.startLine != null && (anchor.startLine !== loc.startLine || anchor.endLine !== loc.endLine);
     const options = STATUSES.map((s) => `<option value="${s}"${s === t.status ? " selected" : ""}>${s === "wontfix" ? "won't fix" : s}</option>`).join("");
     const head = `<div class="thread-head">`
         + `<span class="badge kind">${t.kind === "change" ? "change" : t.kind}</span>`
         + (t.agentReview ? `<span class="badge" title="Reported reviewer model">${esc(t.agentReview.model)} / ${esc(t.agentReview.category)}</span>` : "")
         + (t.agentReview ? `<span class="badge" title="Assessment reported by the coordinating agent">${esc(FINDING_ASSESSMENTS[t.agentReview.assessment] ?? "Unverified")}</span><span class="badge">${esc(FINDING_SEVERITIES[t.agentReview.severity] ?? "Severity not reported")}</span>` : "")
         + `<span class="loc">${showLocation ? `<button class="link" data-action="jump" data-thread="${esc(t.threadId)}">${esc(locLabel(t))}</button>` : esc(locLabel(t))}`
-        + (moved ? ` <span class="muted" title="Line numbers changed since ${esc(t.anchor.revisionId)}">(originally ${esc(lineLabel(t.anchor))} in ${esc(t.anchor.revisionId)})</span>` : "")
+        + (moved && anchor ? ` <span class="muted" title="Line numbers changed since ${esc(anchor.revisionId)}">(originally ${esc(lineLabel(anchor))} in ${esc(anchor.revisionId)})</span>` : "")
         + `</span>`
         + (outdated ? `<span class="badge outdated" title="The commented code changed or was removed">Outdated</span>` : "")
         + (notInDiff ? `<span class="badge outdated" title="This location is not part of the current diff">Not in diff</span>` : "")
@@ -1364,7 +1730,7 @@ function threadHtml(t, { showLocation = false } = {}) {
         ? `<div class="original muted">Originally commented code (${esc(t.anchor.revisionId)}, ${esc(lineLabel(t.anchor))}):<pre>${esc(t.anchor.selectedLines.join("\n"))}</pre></div>`
         : "";
     const reply = composerHtml(`reply:${t.threadId}`, { placeholder: "Reply…" });
-    const staleFinding = t.agentReview && t.agentReview.revisionId !== state.review.currentRevisionId;
+    const staleFinding = t.agentReview && t.agentReview.revisionId !== state.review?.currentRevisionId;
     const approvalIssue = t.agentReview ? findingApprovalIssue(t.agentReview) : "";
     const actions = t.agentReview
         ? `<div class="finding-actions"><button class="primary" data-action="approve-finding" data-thread="${esc(t.threadId)}" title="${esc(staleFinding ? "Review changed; rerun before approving" : approvalIssue || "Send this suggestion to the coding agent for implementation")}"${t.agentReview.approvalMessageId || staleFinding || approvalIssue || t.status !== "active" || state.approving.has(t.threadId) ? " disabled" : ""}>${t.agentReview.approvalMessageId ? "Approved" : "Approve"}</button>`
@@ -1372,20 +1738,21 @@ function threadHtml(t, { showLocation = false } = {}) {
         : "";
     return `<div class="thread${collapsed ? " collapsed" : ""}" data-thread-id="${esc(t.threadId)}">${head}<div class="thread-body">${original}${t.messages.map((m, i) => messageHtml(m) + (i === 0 ? findingEvidenceHtml(t.agentReview) : "")).join("")}${actions}${reply}</div></div>`;
 }
-
 // Explains an empty diff and, for pending changes, offers the way back to the full branch diff.
 function emptyDiffHtml() {
     const files = state.snapshot?.files;
-    if (!files || files.length) return "";
+    if (!files || files.length)
+        return "";
     if (scopeOf(state.review) === "pending") {
         return `<div class="card empty-diff"><strong>No uncommitted changes.</strong> The working tree matches HEAD, so there is nothing to review in this scope.`
             + ` <button data-action="scope" data-scope="all">Switch to All changes</button></div>`;
     }
-    return `<div class="card empty-diff"><strong>No changes to review.</strong> Nothing differs from ${esc(state.review.base)}.</div>`;
+    return `<div class="card empty-diff"><strong>No changes to review.</strong> Nothing differs from ${esc(state.review?.base)}.</div>`;
 }
-
 function overviewView() {
     const r = state.review;
+    if (!r)
+        return "";
     const overall = r.threads.filter((t) => t.kind === "overview" && t.status === "active");
     const unplaced = r.threads.filter((t) => t.kind !== "overview" && t.status === "active" && !isPlaced(t));
     const others = r.threads.filter((t) => t.kind !== "overview");
@@ -1409,9 +1776,9 @@ function overviewView() {
         + `<h2>Active threads (${active.length})</h2><div class="card">${active.length ? active.map(listRow).join("") : `<div class="empty">No active threads. Select lines in a file to comment.</div>`}</div>`
         + (done.length ? `<h2>Closed threads (${done.length})</h2>${done.map((t) => threadHtml(t, { showLocation: true })).join("")}` : "");
 }
-
 function lessonsEmptyHint() {
-    if (!state.settings) return "Copilot records reusable rules here when your comments reveal a preference.";
+    if (!state.settings)
+        return "Copilot records reusable rules here when your comments reveal a preference.";
     switch (learningMode()) {
         case "suggest":
             return "Copilot proposes reusable guidelines here when your comments reveal a preference, and saves one after you approve it.";
@@ -1421,16 +1788,15 @@ function lessonsEmptyHint() {
             return "Learning is off for this repository, so Copilot does not record guidelines from your comments. Use Configure to turn it on.";
     }
 }
-
 function lessonsView() {
-    const lessons = state.review.lessons;
-    if (!lessons.length) return `<h2>Lessons learned</h2><div class="empty">${lessonsEmptyHint()}</div>`;
+    const lessons = state.review?.lessons ?? [];
+    if (!lessons.length)
+        return `<h2>Lessons learned</h2><div class="empty">${lessonsEmptyHint()}</div>`;
     const rows = [...lessons].reverse().map((l) => `<tr><td><span class="badge">${esc(l.scope)}</span></td><td>${lessonBadge(l)}</td><td>${inline(l.rule)}</td><td class="mono muted">${esc(l.savedTo ?? "")}</td><td><button class="link" data-action="jump" data-thread="${esc(l.threadId)}">thread</button><div class="muted">${esc(ago(l.createdAt))}</div></td></tr>`).join("");
     return `<h2>Lessons learned (${lessons.length})</h2><table class="lessons-table"><thead><tr><th>Scope</th><th>Status</th><th>Rule</th><th>Saved to</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
 }
-
 function fileView(file, { stacked = false, folded = false } = {}) {
-    const threads = state.review.threads.filter((t) => t.kind !== "overview" && t.location?.path === file.path);
+    const threads = (state.review?.threads ?? []).filter((t) => t.kind !== "overview" && t.location?.path === file.path);
     const placed = new Map();
     const unplaced = [];
     for (const t of threads) {
@@ -1440,15 +1806,18 @@ function fileView(file, { stacked = false, folded = false } = {}) {
             continue;
         }
         const key = p.where === "file" ? "file" : p.where === "hunk" ? `h${p.hunk}` : `r${p.hunk}:${p.row}`;
-        if (!placed.has(key)) placed.set(key, []);
-        placed.get(key).push(t);
+        if (!placed.has(key))
+            placed.set(key, []);
+        placed.get(key)?.push(t);
     }
     const highlighted = new Set();
     for (const t of threads) {
-        if (t.kind !== "line" || t.status !== "active" || t.location?.state === "outdated") continue;
-        for (let n = t.location.startLine; n <= t.location.endLine; n++) highlighted.add(`${t.location.side}:${n}`);
+        if (t.kind !== "line" || t.status !== "active" || !t.location || t.location.state === "outdated"
+            || t.location.startLine === undefined || t.location.endLine === undefined)
+            continue;
+        for (let n = t.location.startLine; n <= t.location.endLine; n++)
+            highlighted.add(`${t.location.side}:${n}`);
     }
-
     const letter = STATUS_LETTER[file.status] ?? "M";
     const fileKey = `file:${file.path}`;
     const activeHere = threads.filter((t) => t.status === "active").length;
@@ -1457,11 +1826,11 @@ function fileView(file, { stacked = false, folded = false } = {}) {
         : esc(file.path);
     const html = [`<section class="file-section" data-file="${esc(file.path)}">`,
         `<div class="file-head${stacked ? " stacked" : ""}">`
-        + (stacked ? `<span class="twisty${folded ? "" : " open"}" data-action="fold-file" data-path="${esc(file.path)}" title="${folded ? "Show diff" : "Hide diff"}">${CHEVRON}</span>` : "")
-        + `<span class="status-letter ${letter}">${letter}</span><span class="path">${pathHtml}${file.oldPath && file.oldPath !== file.path ? ` <span class="muted">(from ${esc(file.oldPath)})</span>` : ""}${file.untracked ? ` <span class="badge">untracked</span>` : ""}</span>`
-        + (stacked && folded && activeHere ? `<span class="count">${activeHere}</span>` : "")
-        + `<span class="stat"><span class="add">+${file.additions}</span> <span class="del">−${file.deletions}</span></span>`
-        + `<button data-action="open" data-key="${esc(fileKey)}" data-path="${esc(file.path)}">Comment on file</button></div>`];
+            + (stacked ? `<span class="twisty${folded ? "" : " open"}" data-action="fold-file" data-path="${esc(file.path)}" title="${folded ? "Show diff" : "Hide diff"}">${CHEVRON}</span>` : "")
+            + `<span class="status-letter ${letter}">${letter}</span><span class="path">${pathHtml}${file.oldPath && file.oldPath !== file.path ? ` <span class="muted">(from ${esc(file.oldPath)})</span>` : ""}${file.untracked ? ` <span class="badge">untracked</span>` : ""}</span>`
+            + (stacked && folded && activeHere ? `<span class="count">${activeHere}</span>` : "")
+            + `<span class="stat"><span class="add">+${file.additions}</span> <span class="del">−${file.deletions}</span></span>`
+            + `<button data-action="open" data-key="${esc(fileKey)}" data-path="${esc(file.path)}">Comment on file</button></div>`];
     if (folded) {
         html.push(`</section>`);
         return html.join("");
@@ -1473,17 +1842,20 @@ function fileView(file, { stacked = false, folded = false } = {}) {
     if (state.open.has(fileKey) || getDraft(fileKey) || state.pending.has(fileKey)) {
         html.push(`<div class="thread">${composerHtml(fileKey, { kind: "file", path: file.path, label: `Comment on ${file.path}`, alwaysOpen: true })}</div>`);
     }
-    if (file.binary) html.push(`<div class="card muted">${esc(file.note ?? "Binary file not shown.")}</div>`);
-    if (!file.binary && !file.hunks.length) html.push(`<div class="card muted">No textual changes (mode or rename only).</div>`);
+    if (file.binary)
+        html.push(`<div class="card muted">${esc(file.note ?? "Binary file not shown.")}</div>`);
+    if (!file.binary && !file.hunks.length)
+        html.push(`<div class="card muted">No textual changes (mode or rename only).</div>`);
     if (!stacked && !file.full && needsContent(file)) {
         const entry = contentEntry(file);
-        const why = { stale: "the working tree changed since this revision; Refresh to see the full file", "too-large": "the file is too large", missing: "the file is missing from the working tree", "base-unavailable": "the base revision cannot be read" }[entry.reason] ?? entry.reason;
+        const why = entry.status === "unavailable"
+            ? { stale: "the working tree changed since this revision; Refresh to see the full file", "too-large": "the file is too large", missing: "the file is missing from the working tree", "base-unavailable": "the base revision cannot be read" }[entry.reason ?? ""] ?? entry.reason
+            : "";
         const note = entry.status === "loading" ? "Loading full file…"
             : entry.status === "ready" ? "Showing changes only until the current line selection is closed."
-            : `Showing changes only: ${esc(why)}.`;
+                : `Showing changes only: ${esc(why)}.`;
         html.push(`<div class="muted full-note">${note}</div>`);
     }
-
     const sel = state.selection?.path === file.path ? state.selection : null;
     const selRange = sel ? selectionRange(file, sel) : null;
     const syntax = highlightFile(file);
@@ -1497,10 +1869,10 @@ function fileView(file, { stacked = false, folded = false } = {}) {
                 : `<div class="hunk-head"><span class="h" title="${esc(hunk.header)}">${esc(hunk.header)}</span>${range ? `<button data-action="open" data-key="${esc(changeKey)}">Discuss this change</button>` : ""}</div>`);
         }
         const hunkThreads = placed.get(`h${h}`) ?? [];
-        const showChangeComposer = changeKey && (state.open.has(changeKey) || getDraft(changeKey) || state.pending.has(changeKey));
+        const showChangeComposer = Boolean(range && changeKey && (state.open.has(changeKey) || getDraft(changeKey) || state.pending.has(changeKey)));
         if (hunkThreads.length || showChangeComposer) {
             html.push(`<div class="hunk-threads">${hunkThreads.map((t) => threadHtml(t)).join("")}`
-                + (showChangeComposer ? `<div class="thread">${composerHtml(changeKey, { kind: "change", path: file.path, side: range.side, startLine: range.startLine, endLine: range.endLine, label: `Discuss this change (${range.side === "old" ? "old " : ""}${lineLabel(range)})`, alwaysOpen: true })}</div>` : "")
+                + (showChangeComposer && range && changeKey ? `<div class="thread">${composerHtml(changeKey, { kind: "change", path: file.path, side: range.side, startLine: range.startLine, endLine: range.endLine, label: `Discuss this change (${range.side === "old" ? "old " : ""}${lineLabel(range)})`, alwaysOpen: true })}</div>` : "")
                 + `</div>`);
         }
         html.push(`<table class="rows"><colgroup><col style="width:52px"><col style="width:52px"><col style="width:22px"><col></colgroup><tbody>`);
@@ -1516,11 +1888,11 @@ function fileView(file, { stacked = false, folded = false } = {}) {
                 html.push(`<tr class="eof-note"><td colspan="3"></td><td>\\ No newline at end of file (${side})</td></tr>`);
             }
             const rowThreads = placed.get(`r${h}:${i}`) ?? [];
-            const composerHere = sel && !state.dragging && sel.hunk === h && sel.to === i;
-            if (rowThreads.length || composerHere) {
-                const lineKey = composerHere ? `line:${file.path}:${selRange.side}:${selRange.startLine}-${selRange.endLine}` : null;
+            const composerHere = Boolean(sel && selRange && !state.dragging && sel.hunk === h && sel.to === i);
+            if (rowThreads.length || (composerHere && selRange)) {
+                const lineKey = composerHere && selRange ? `line:${file.path}:${selRange.side}:${selRange.startLine}-${selRange.endLine}` : "";
                 html.push(`<tr class="inline"><td colspan="4">${rowThreads.map((t) => threadHtml(t)).join("")}`
-                    + (composerHere ? `<div class="thread">${composerHtml(lineKey, { kind: "line", path: file.path, side: selRange.side, startLine: selRange.startLine, endLine: selRange.endLine, label: `Comment on ${selRange.side === "old" ? "old " : ""}${lineLabel(selRange)}`, alwaysOpen: true })}</div>` : "")
+                    + (composerHere && selRange ? `<div class="thread">${composerHtml(lineKey, { kind: "line", path: file.path, side: selRange.side, startLine: selRange.startLine, endLine: selRange.endLine, label: `Comment on ${selRange.side === "old" ? "old " : ""}${lineLabel(selRange)}`, alwaysOpen: true })}</div>` : "")
                     + `</td></tr>`);
             }
         });
@@ -1533,7 +1905,6 @@ function fileView(file, { stacked = false, folded = false } = {}) {
     html.push(`</section>`);
     return html.join("");
 }
-
 // Folder selection shows every changed file under it, stacked, like ADO's Files tab.
 // Past a row budget, files start folded so huge folders stay responsive.
 function folderView(dir) {
@@ -1541,43 +1912,45 @@ function folderView(dir) {
     const adds = files.reduce((s, f) => s + f.additions, 0);
     const dels = files.reduce((s, f) => s + f.deletions, 0);
     const html = [`<div class="folder-head">${FOLDER_ICON}<span class="path">${esc(dir === "" ? repoName() : dir)}</span>`
-        + `<span class="muted">${files.length} file${files.length === 1 ? "" : "s"}</span>`
-        + `<span class="stat"><span class="add">+${adds}</span> <span class="del">−${dels}</span></span>`
-        + `<span class="spacer"></span><button class="link" data-action="fold-all" data-fold="1">Collapse all</button><button class="link" data-action="fold-all" data-fold="0">Expand all</button></div>`];
+            + `<span class="muted">${files.length} file${files.length === 1 ? "" : "s"}</span>`
+            + `<span class="stat"><span class="add">+${adds}</span> <span class="del">−${dels}</span></span>`
+            + `<span class="spacer"></span><button class="link" data-action="fold-all" data-fold="1">Collapse all</button><button class="link" data-action="fold-all" data-fold="0">Expand all</button></div>`];
     let rows = 0;
     for (const f of files) {
         const size = f.hunks.reduce((s, h) => s + h.rows.length, 0);
         const folded = state.fileFold.has(f.path) ? state.fileFold.get(f.path) : rows + size > FOLDER_VIEW_ROW_BUDGET && rows > 0;
-        if (!folded) rows += size;
+        if (!folded)
+            rows += size;
         html.push(fileView(f, { stacked: true, folded }));
     }
     return html.join("");
 }
-
 // ---------- Actions ----------
-
 let toastTimer;
 function toast(text, error = false) {
     const el = $("#toast");
+    if (!el)
+        return;
     el.textContent = text;
     el.className = error ? "error" : "";
     el.hidden = false;
     clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => {
+    toastTimer = window.setTimeout(() => {
         el.hidden = true;
     }, error ? 6000 : 2500);
 }
-
 function navigate(view) {
     state.view = view;
     state.selection = null;
     state.pendingJump = null;
-    if (view.type === "file" || view.type === "folder") expandAncestors(view.path);
+    if (view.type === "file" || view.type === "folder")
+        expandAncestors(view.path);
     saveView();
     render();
-    $("#main").scrollTop = 0;
+    const main = $("#main");
+    if (main)
+        main.scrollTop = 0;
 }
-
 function focusComposer(key) {
     const el = document.querySelector(`textarea[data-composer="${CSS.escape(key)}"]`);
     if (el) {
@@ -1585,27 +1958,33 @@ function focusComposer(key) {
         el.scrollIntoView({ block: "nearest" });
     }
 }
-
 function jumpToThread(threadId) {
-    const t = state.review.threads.find((x) => x.threadId === threadId);
-    if (!t) return;
-    if (t.status !== "active" || t.location?.state === "outdated") state.expanded.add(threadId);
-    const inFile = t.kind !== "overview" && isPlaced(t) && fileOf(t.location.path);
+    const review = state.review;
+    if (!review)
+        return;
+    const t = review.threads.find((x) => x.threadId === threadId);
+    if (!t)
+        return;
+    if (t.status !== "active" || t.location?.state === "outdated")
+        state.expanded.add(threadId);
+    const path = t.location?.path;
+    const inFile = t.kind !== "overview" && isPlaced(t) && fileOf(path);
     const unplacedInFile = t.kind !== "overview" && !isPlaced(t) && fileOf(t.location?.path);
-    if ((inFile || unplacedInFile) && state.view.type === "folder" && inDir(t.location.path, state.view.path)) {
-        state.fileFold.set(t.location.path, false);
+    if ((inFile || unplacedInFile) && path && state.view.type === "folder" && inDir(path, state.view.path)) {
+        state.fileFold.set(path, false);
         render();
-    } else {
-        navigate(inFile || unplacedInFile ? { type: "file", path: t.location.path } : { type: "overview" });
+    }
+    else {
+        navigate((inFile || unplacedInFile) && path ? { type: "file", path } : { type: "overview" });
     }
     state.pendingJump = threadId;
     revealPendingJump();
 }
-
 // Scrolls to a jumped-to thread; retried after the full file loads, since it may move or appear then.
 function revealPendingJump() {
     const threadId = state.pendingJump;
-    if (!threadId) return;
+    if (!threadId)
+        return;
     const el = document.querySelector(`[data-thread-id="${CSS.escape(threadId)}"]`);
     if (el) {
         el.scrollIntoView({ block: "center" });
@@ -1613,27 +1992,32 @@ function revealPendingJump() {
         setTimeout(() => el.classList.remove("flash"), 1600);
     }
     const loading = state.view.type === "file" && [...state.content.values()].some((e) => e.status === "loading");
-    if (!loading) state.pendingJump = null;
+    if (!loading)
+        state.pendingJump = null;
 }
-
 function closeComposer(key, discard) {
-    if (discard) setDraft(key, "");
+    if (discard)
+        setDraft(key, "");
     state.open.delete(key);
     state.pending.delete(key);
-    if (key.startsWith("line:")) state.selection = null;
-    if (document.activeElement?.dataset?.composer === key) document.activeElement.blur();
+    if (key.startsWith("line:"))
+        state.selection = null;
+    if (document.activeElement instanceof HTMLElement && document.activeElement.dataset.composer === key)
+        document.activeElement.blur();
     render();
 }
-
 // The composer's default action: undefined lets the server apply the delivery mode; otherwise the comment is held as a draft.
 function defaultDraft() {
     return deliveryMode() === "immediate" ? undefined : true;
 }
-
 async function submit(key, draft = defaultDraft()) {
+    const review = state.review;
+    if (!review)
+        return;
     const box = document.querySelector(`.composer[data-key="${CSS.escape(key)}"]`);
     const textarea = box?.querySelector("textarea");
-    if (!box || !textarea) return;
+    if (!box || !textarea)
+        return;
     const body = textarea.value.trim();
     if (!body) {
         textarea.focus();
@@ -1649,8 +2033,9 @@ async function submit(key, draft = defaultDraft()) {
         let res;
         const hold = draft === undefined ? {} : { draft };
         if (key.startsWith("reply:")) {
-            res = await api("POST", `threads/${encodeURIComponent(key.slice(6))}/messages`, { body, clientRequestId: pending.clientRequestId, descriptionVersion: state.review.description?.version ?? 0, ...hold });
-        } else {
+            res = await api("POST", `threads/${encodeURIComponent(key.slice(6))}/messages`, { body, clientRequestId: pending.clientRequestId, descriptionVersion: review.description?.version ?? 0, ...hold });
+        }
+        else {
             const d = box.dataset;
             res = await api("POST", "threads", {
                 kind: d.kind,
@@ -1658,8 +2043,8 @@ async function submit(key, draft = defaultDraft()) {
                 side: d.side,
                 startLine: d.start ? Number(d.start) : undefined,
                 endLine: d.end ? Number(d.end) : undefined,
-                revisionId: state.review.currentRevisionId,
-                descriptionVersion: state.review.description?.version ?? 0,
+                revisionId: review.currentRevisionId,
+                descriptionVersion: review.description?.version ?? 0,
                 body,
                 clientRequestId: pending.clientRequestId,
                 ...hold,
@@ -1668,25 +2053,34 @@ async function submit(key, draft = defaultDraft()) {
         setDraft(key, "");
         state.pending.delete(key);
         state.open.delete(key);
-        if (key.startsWith("line:")) state.selection = null;
-        document.activeElement?.blur?.();
+        if (key.startsWith("line:"))
+            state.selection = null;
+        if (document.activeElement instanceof HTMLElement)
+            document.activeElement.blur();
         await loadState();
-        if (res?.threadId && !key.startsWith("reply:")) {
+        if (isRecord(res) && typeof res.threadId === "string" && !key.startsWith("reply:")) {
             const el = document.querySelector(`[data-thread-id="${CSS.escape(res.threadId)}"]`);
             el?.classList.add("flash");
             setTimeout(() => el?.classList.remove("flash"), 1600);
         }
-    } catch (err) {
+    }
+    catch (err) {
         pending.sending = false;
-        pending.error = err.message;
+        pending.error = errorMessage(err);
         render();
     }
 }
-
+function dataValue(element, name) {
+    return element.dataset[name] ?? "";
+}
 async function onClick(e) {
+    if (!(e.target instanceof Element))
+        return;
     const target = e.target.closest("[data-action]");
-    if (!target || target.tagName === "SELECT") return;
-    const { action } = target.dataset;
+    if (!target || target instanceof HTMLSelectElement)
+        return;
+    const value = (name) => dataValue(target, name);
+    const action = value("action");
     try {
         switch (action) {
             case "agent-review":
@@ -1705,24 +2099,30 @@ async function onClick(e) {
                 await startAgentReview();
                 break;
             case "agent-review-close":
-                await api("POST", `agent-reviews/${encodeURIComponent(target.dataset.run)}/close`, {});
+                await api("POST", `agent-reviews/${encodeURIComponent(value("run"))}/close`, {});
                 await loadState();
                 break;
             case "discuss-finding":
-                state.expanded.add(target.dataset.thread);
-                state.open.add(`reply:${target.dataset.thread}`);
+                state.expanded.add(value("thread"));
+                state.open.add(`reply:${value("thread")}`);
                 render();
-                focusComposer(`reply:${target.dataset.thread}`);
+                focusComposer(`reply:${value("thread")}`);
                 break;
             case "approve-finding": {
-                const id = target.dataset.thread;
-                if (state.approving.has(id)) break;
+                const id = value("thread");
+                const review = state.review;
+                if (!review || !id)
+                    break;
+                if (state.approving.has(id))
+                    break;
                 state.approving.add(id);
                 render();
                 try {
-                    const res = await api("POST", `threads/${encodeURIComponent(id)}/approve`, { revisionId: state.review.currentRevisionId });
-                    toast(res?.error ? `Approved, but delivery failed: ${res.error}. Retry in the thread.` : "Approved and sent to the coding agent", Boolean(res?.error));
-                } finally {
+                    const res = await api("POST", `threads/${encodeURIComponent(id)}/approve`, { revisionId: review.currentRevisionId });
+                    const message = isRecord(res) && typeof res.error === "string" ? res.error : null;
+                    toast(message ? `Approved, but delivery failed: ${message}. Retry in the thread.` : "Approved and sent to the coding agent", Boolean(message));
+                }
+                finally {
                     state.approving.delete(id);
                     await loadState();
                 }
@@ -1732,93 +2132,113 @@ async function onClick(e) {
                 focusComposer("overview:new");
                 break;
             case "nav": {
-                const { view, path } = target.dataset;
+                const view = value("view");
+                const path = value("path");
                 if (view === "folder" && state.view.type === "folder" && state.view.path === path) {
                     setDirCollapsed(path, !collapsedDirs().has(path));
                     render();
-                } else {
-                    navigate(view === "file" || view === "folder" ? { type: view, path } : { type: view });
+                }
+                else {
+                    if (view === "file" || view === "folder")
+                        navigate({ type: view, path });
+                    else if (view === "overview" || view === "lessons" || view === "agent-comments")
+                        navigate({ type: view });
                 }
                 break;
             }
             case "fold":
-                setDirCollapsed(target.dataset.path, !collapsedDirs().has(target.dataset.path));
+                setDirCollapsed(value("path"), !collapsedDirs().has(value("path")));
                 render();
                 break;
             case "fold-tree":
-                setAllDirsCollapsed(target.dataset.fold === "1");
+                setAllDirsCollapsed(value("fold") === "1");
                 render();
                 break;
             case "fold-file": {
-                const path = target.dataset.path;
+                const path = value("path");
                 state.fileFold.set(path, target.classList.contains("open"));
                 render();
                 document.querySelector(`.file-section[data-file="${CSS.escape(path)}"]`)?.scrollIntoView({ block: "nearest" });
                 break;
             }
             case "fold-all":
-                for (const f of filesUnder(state.view.path ?? "")) state.fileFold.set(f.path, target.dataset.fold === "1");
+                for (const f of filesUnder(state.view.type === "folder" ? state.view.path : ""))
+                    state.fileFold.set(f.path, value("fold") === "1");
                 render();
                 break;
             case "refresh":
-                target.disabled = true;
+                target.setAttribute("disabled", "");
                 await api("POST", "refresh", {});
                 await loadState();
                 toast("Refreshed from the working tree");
                 break;
             case "open":
-                if (target.dataset.path) state.fileFold.set(target.dataset.path, false);
-                state.open.add(target.dataset.key);
+                if (value("path"))
+                    state.fileFold.set(value("path"), false);
+                state.open.add(value("key"));
                 render();
-                focusComposer(target.dataset.key);
+                focusComposer(value("key"));
                 break;
             case "cancel":
-                closeComposer(target.dataset.key, true);
+                closeComposer(value("key"), true);
                 break;
             case "submit": {
-                const flag = target.dataset.draft;
-                await submit(target.dataset.key, flag === "1" ? true : flag === "0" ? false : defaultDraft());
+                const flag = value("draft");
+                await submit(value("key"), flag === "1" ? true : flag === "0" ? false : defaultDraft());
                 break;
             }
             case "retry":
-                await api("POST", `messages/${encodeURIComponent(target.dataset.message)}/retry`, {});
+                await api("POST", `messages/${encodeURIComponent(value("message"))}/retry`, {});
                 await loadState();
                 toast("Sent to Copilot again");
                 break;
             case "send-draft": {
-                const res = await api("POST", `messages/${encodeURIComponent(target.dataset.message)}/send`, {});
+                const res = await api("POST", `messages/${encodeURIComponent(value("message"))}/send`, {});
                 await loadState();
-                toast(res?.error ? res.error : "Sent to Copilot", Boolean(res?.error));
+                const message = isRecord(res) && typeof res.error === "string" ? res.error : null;
+                toast(message ?? "Sent to Copilot", Boolean(message));
                 break;
             }
             case "discard-draft":
-                await api("POST", `messages/${encodeURIComponent(target.dataset.message)}/discard`, {});
+                await api("POST", `messages/${encodeURIComponent(value("message"))}/discard`, {});
                 await loadState();
                 toast("Draft discarded");
                 break;
             case "submit-review": {
-                if (state.submitting) break;
+                if (state.submitting)
+                    break;
                 state.submitting = true;
                 renderTop();
                 try {
                     const res = await api("POST", "submit", {});
-                    if (res?.error) toast(res.error, true);
-                    else toast(`Sent ${res.submitted} ${res.submitted === 1 ? "comment" : "comments"} to Copilot`);
-                } finally {
+                    const submitted = isRecord(res) && typeof res.submitted === "number" ? res.submitted : 0;
+                    const error = isRecord(res) && typeof res.error === "string" ? res.error : null;
+                    if (error)
+                        toast(error, true);
+                    else
+                        toast(`Sent ${submitted} ${submitted === 1 ? "comment" : "comments"} to Copilot`);
+                }
+                finally {
                     state.submitting = false;
                     await loadState();
                 }
                 break;
             }
             case "delivery-choose": {
-                const mode = target.dataset.mode;
+                const mode = value("mode");
+                if (mode !== "immediate" && mode !== "batch")
+                    break;
                 const res = await api("POST", "delivery", { mode });
                 await loadState();
-                const drafts = `${res?.submitted} waiting ${res?.submitted === 1 ? "draft" : "drafts"}`;
-                if (res?.error) toast(`Sending each comment now, but ${drafts} could not be sent: ${res.error}`, true);
-                else toast(mode === "immediate"
-                    ? (res?.submitted ? `Sending each comment now. Sent ${drafts}.` : "Sending each comment now")
-                    : "Batching comments. Submit the review when you are done.");
+                const submitted = isRecord(res) && typeof res.submitted === "number" ? res.submitted : 0;
+                const error = isRecord(res) && typeof res.error === "string" ? res.error : null;
+                const drafts = `${submitted} waiting ${submitted === 1 ? "draft" : "drafts"}`;
+                if (error)
+                    toast(`Sending each comment now, but ${drafts} could not be sent: ${error}`, true);
+                else
+                    toast(mode === "immediate"
+                        ? (submitted ? `Sending each comment now. Sent ${drafts}.` : "Sending each comment now")
+                        : "Batching comments. Submit the review when you are done.");
                 break;
             }
             case "delivery-reask":
@@ -1826,24 +2246,30 @@ async function onClick(e) {
                 await loadState();
                 break;
             case "toggle": {
-                const id = target.dataset.thread;
-                if (state.expanded.has(id)) state.expanded.delete(id);
-                else state.expanded.add(id);
+                const id = value("thread");
+                if (state.expanded.has(id))
+                    state.expanded.delete(id);
+                else
+                    state.expanded.add(id);
                 render();
                 break;
             }
             case "jump":
-                jumpToThread(target.dataset.thread);
+                jumpToThread(value("thread"));
                 break;
             case "scope":
-                await switchScope(target.dataset.scope);
+                {
+                    const scope = value("scope");
+                    if (scope === "all" || scope === "pending")
+                        await switchScope(scope);
+                }
                 break;
             case "review-skills-refresh":
                 await refreshReviewSkills();
                 break;
             case "review-tab":
-                if (state.dialog?.type === "agent-review" && state.dialog.tab !== target.dataset.tab) {
-                    state.dialog.tab = target.dataset.tab === "skills" ? "skills" : "general";
+                if (state.dialog?.type === "agent-review" && state.dialog.tab !== value("tab")) {
+                    state.dialog.tab = value("tab") === "skills" ? "skills" : "general";
                     renderDialog();
                     focusIn(`#dialog [data-action="review-tab"][data-tab="${state.dialog.tab}"]`);
                 }
@@ -1855,13 +2281,18 @@ async function onClick(e) {
                 closeConfigure();
                 break;
             case "dialog-backdrop":
-                if (e.target === target) closeConfigure();
+                if (e.target === target)
+                    closeConfigure();
                 break;
             case "dialog-save":
                 await saveConfigure();
                 break;
             case "learning-set":
-                await updateSettings({ learning: target.dataset.mode });
+                {
+                    const mode = value("mode");
+                    if (isLearningMode(mode))
+                        await updateSettings({ learning: mode });
+                }
                 toast(`Learning mode: ${LEARNING[learningMode()].label}`);
                 break;
             case "learning-dismiss":
@@ -1870,54 +2301,70 @@ async function onClick(e) {
             default:
                 break;
         }
-    } catch (err) {
-        toast(err.message, true);
-        if (action === "refresh") target.disabled = false;
+    }
+    catch (err) {
+        toast(errorMessage(err), true);
+        if (action === "refresh")
+            target.removeAttribute("disabled");
     }
 }
-
 async function onChange(e) {
     const el = e.target;
-    if (el.name === "review-skill-defaults" && state.dialog?.type === "agent-review") {
+    if (!(el instanceof HTMLInputElement || el instanceof HTMLSelectElement))
+        return;
+    if (el instanceof HTMLInputElement && el.name === "review-skill-defaults" && state.dialog?.type === "agent-review") {
         state.dialog.saveSkillDefaults = el.checked;
         renderDialog();
         focusIn(`#dialog input[name="${el.name}"]`);
         return;
     }
-    if (el.name === "review-skill" && state.dialog?.type === "agent-review") {
+    if (el instanceof HTMLInputElement && el.name === "review-skill" && state.dialog?.type === "agent-review") {
         const names = new Set(state.dialog.skillNames ?? []);
-        if (el.checked) names.add(el.value);
-        else names.delete(el.value);
+        if (el.checked)
+            names.add(el.value);
+        else
+            names.delete(el.value);
         state.dialog.skillNames = (state.dialog.skillCatalog?.skills.map((skill) => skill.name) ?? [...names]).filter((name) => names.has(name));
         return;
     }
-    if ((el.name === "review-save-defaults" || el.name === "review-skip-dialog") && state.dialog?.type === "agent-review") {
+    if (el instanceof HTMLInputElement && (el.name === "review-save-defaults" || el.name === "review-skip-dialog") && state.dialog?.type === "agent-review") {
         state.dialog[el.name === "review-save-defaults" ? "saveDefaults" : "skipDialog"] = el.checked;
         renderDialog();
         focusIn(`#dialog input[name="${el.name}"]`);
         return;
     }
     if (el.name === "review-focus" && state.dialog?.type === "agent-review") {
-        state.dialog.focus = el.value;
+        if (isReviewFocus(el.value))
+            state.dialog.focus = el.value;
         return;
     }
-    if ((el.name === "learning" || el.name === "delivery") && state.dialog) {
-        state.dialog[el.name] = el.value;
+    if ((el.name === "learning" || el.name === "delivery") && state.dialog?.type === "configure") {
+        if (el.name === "learning" && (el.value === "off" || el.value === "suggest" || el.value === "auto"))
+            state.dialog.learning = el.value;
+        if (el.name === "delivery" && (el.value === "immediate" || el.value === "batch" || el.value === "ask"))
+            state.dialog.delivery = el.value;
         return;
     }
-    if (el.dataset?.action !== "status") return;
+    if (el.dataset?.action !== "status")
+        return;
+    const threadId = el.dataset.thread;
+    if (!threadId || !isThreadStatus(el.value))
+        return;
     try {
-        await api("POST", `threads/${encodeURIComponent(el.dataset.thread)}/status`, { status: el.value });
-        if (el.value !== "active") state.expanded.delete(el.dataset.thread);
+        await api("POST", `threads/${encodeURIComponent(threadId)}/status`, { status: el.value });
+        if (el.value !== "active")
+            state.expanded.delete(threadId);
         await loadState();
-    } catch (err) {
-        toast(err.message, true);
-        await loadState().catch(() => {});
+    }
+    catch (err) {
+        toast(errorMessage(err), true);
+        await loadState().catch(() => undefined);
     }
 }
-
 function onInput(e) {
     const el = e.target;
+    if (!(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement))
+        return;
     if ((el.name === "review-models" || el.name === "review-intent") && state.dialog?.type === "agent-review") {
         state.dialog[el.name === "review-models" ? "models" : "intent"] = el.value;
         return;
@@ -1927,49 +2374,56 @@ function onInput(e) {
         el.closest(".composer")?.classList.add("open");
     }
 }
-
 function onKeyDown(e) {
     if (state.dialog) {
         if (e.key === "Escape") {
             e.preventDefault();
             closeConfigure();
-        } else if (e.key === "Tab") trapTab(e);
+        }
+        else if (e.key === "Tab")
+            trapTab(e);
         return;
     }
     const el = e.target;
-    const key = el.dataset?.composer;
-    if (!key) return;
+    if (!(el instanceof HTMLTextAreaElement))
+        return;
+    const key = el.dataset.composer;
+    if (!key)
+        return;
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
         e.preventDefault();
         submit(key);
-    } else if (e.key === "Escape") {
+    }
+    else if (e.key === "Escape") {
         e.preventDefault();
         if (key.startsWith("reply:") && !el.value.trim()) {
             el.closest(".composer")?.classList.remove("open");
             el.blur();
-        } else if (!el.value.trim()) closeComposer(key, true);
-        else el.blur();
+        }
+        else if (!el.value.trim())
+            closeComposer(key, true);
+        else
+            el.blur();
     }
 }
-
 function onFocusIn(e) {
     const el = e.target;
-    if (el.dataset?.composer) el.closest(".composer")?.classList.add("open");
+    if (el instanceof HTMLTextAreaElement && el.dataset.composer)
+        el.closest(".composer")?.classList.add("open");
 }
-
 function onFocusOut(e) {
     const el = e.target;
+    if (!(el instanceof HTMLTextAreaElement))
+        return;
     const key = el.dataset?.composer;
-    if (!key || !key.startsWith("reply:")) return;
+    if (!key || !key.startsWith("reply:"))
+        return;
     setTimeout(() => {
         const box = el.closest(".composer");
-        if (box && !el.value.trim() && !box.contains(document.activeElement)) box.classList.remove("open");
+        if (box && !el.value.trim() && !box.contains(document.activeElement))
+            box.classList.remove("open");
     }, 150);
 }
-
-// ---------- Overview ruler (change markers beside the scrollbar) ----------
-
-// Merges adjacent rows of the same kind so a long change becomes one marker, not one per line.
 function rulerMarks(items, scrollHeight, minPx = 3) {
     const marks = [];
     for (const it of items) {
@@ -1988,18 +2442,19 @@ function rulerMarks(items, scrollHeight, minPx = 3) {
         minPx,
     }));
 }
-
 function renderRuler() {
     const main = $("#main");
     const ruler = $("#ruler");
-    if (!main || !ruler) return;
+    if (!main || !ruler)
+        return;
     const mainRect = main.getBoundingClientRect();
     ruler.style.right = `${main.offsetWidth - main.clientWidth}px`;
     const offset = main.scrollTop - mainRect.top;
     const items = [];
-    for (const el of main.querySelectorAll("tr.row.add, tr.row.del, tr.inline")) {
+    for (const el of Array.from(main.querySelectorAll("tr.row.add, tr.row.del, tr.inline"))) {
         const r = el.getBoundingClientRect();
-        if (!r.height) continue;
+        if (!r.height)
+            continue;
         const kind = el.classList.contains("inline") ? "thread" : el.classList.contains("add") ? "add" : "del";
         items.push({ kind, top: r.top + offset, height: r.height });
     }
@@ -2015,81 +2470,87 @@ function renderRuler() {
         + `<div class="viewport"></div>`;
     paintRulerViewport();
 }
-
 function paintRulerViewport() {
     const main = $("#main");
     const vp = $("#ruler .viewport");
-    if (!main || !vp) return;
+    if (!main || !vp)
+        return;
     vp.style.top = `${(main.scrollTop / main.scrollHeight) * 100}%`;
     vp.style.height = `${(main.clientHeight / main.scrollHeight) * 100}%`;
 }
-
 function onRulerClick(e) {
     const main = $("#main");
     const ruler = $("#ruler");
+    if (!main || !ruler || !(e.target instanceof Element))
+        return;
     const mark = e.target.closest(".mark");
     const target = mark
         ? Number(mark.dataset.top)
         : ((e.clientY - ruler.getBoundingClientRect().top) / ruler.clientHeight) * main.scrollHeight;
     main.scrollTo({ top: Math.max(0, target - main.clientHeight / 3), behavior: "smooth" });
 }
-
 // ---------- Line selection (click / shift-click / drag on line numbers or "+") ----------
-
 function rowFromEvent(e) {
+    if (!(e.target instanceof Element))
+        return null;
     const tr = e.target.closest("tr.row");
     const path = tr?.closest("[data-file]")?.dataset.file;
-    if (!tr || !path) return null;
+    if (!tr || !path)
+        return null;
     return { path, h: Number(tr.dataset.h), i: Number(tr.dataset.i), full: Boolean(tr.closest(".diff")?.classList.contains("full")) };
 }
-
 function paintSelection() {
     const sel = state.selection;
-    for (const tr of document.querySelectorAll("tr.row")) {
+    for (const tr of Array.from(document.querySelectorAll("tr.row"))) {
         const on = sel && tr.closest("[data-file]")?.dataset.file === sel.path && Number(tr.dataset.h) === sel.hunk && Number(tr.dataset.i) >= sel.from && Number(tr.dataset.i) <= sel.to;
         tr.classList.toggle("sel", Boolean(on));
     }
 }
-
 function onMouseDown(e) {
-    if (e.button !== 0 || !e.target.closest("td.ln, td.gut")) return;
+    if (e.button !== 0 || !(e.target instanceof Element) || !e.target.closest("td.ln, td.gut"))
+        return;
     const pos = rowFromEvent(e);
-    if (!pos) return;
+    if (!pos)
+        return;
     e.preventDefault();
     const { path } = pos;
     const sel = state.selection;
     if (e.shiftKey && sel && sel.path === path && sel.hunk === pos.h && sel.full === pos.full) {
         sel.from = Math.min(sel.anchor, pos.i);
         sel.to = Math.max(sel.anchor, pos.i);
-    } else {
+    }
+    else {
         state.selection = { path, hunk: pos.h, anchor: pos.i, from: pos.i, to: pos.i, full: pos.full };
     }
     state.dragging = true;
     paintSelection();
 }
-
 function onMouseOver(e) {
-    if (!state.dragging) return;
+    if (!state.dragging)
+        return;
     const pos = rowFromEvent(e);
     const sel = state.selection;
-    if (!pos || !sel || pos.path !== sel.path || pos.h !== sel.hunk) return;
+    if (!pos || !sel || pos.path !== sel.path || pos.h !== sel.hunk)
+        return;
     sel.from = Math.min(sel.anchor, pos.i);
     sel.to = Math.max(sel.anchor, pos.i);
     paintSelection();
 }
-
 function onMouseUp() {
-    if (!state.dragging) return;
+    if (!state.dragging)
+        return;
     state.dragging = false;
-    const file = displayFile(state.selection?.path);
-    if (!file) return;
-    const r = selectionRange(file, state.selection);
+    const selection = state.selection;
+    if (!selection)
+        return;
+    const file = displayFile(selection.path);
+    if (!file)
+        return;
+    const r = selectionRange(file, selection);
     render();
     focusComposer(`line:${file.path}:${r.side}:${r.startLine}-${r.endLine}`);
 }
-
 // ---------- Boot ----------
-
 document.addEventListener("click", onClick);
 document.addEventListener("change", onChange);
 document.addEventListener("input", onInput);
@@ -2100,24 +2561,29 @@ document.addEventListener("mousedown", onMouseDown);
 document.addEventListener("mouseover", onMouseOver);
 document.addEventListener("mouseup", onMouseUp);
 document.addEventListener("click", (e) => {
-    if (e.target.closest?.("#ruler")) onRulerClick(e);
-    else requestAnimationFrame(renderRuler);
+    if (e.target instanceof Element && e.target.closest("#ruler"))
+        onRulerClick(e);
+    else
+        requestAnimationFrame(renderRuler);
 });
-document.addEventListener("scroll", (e) => { if (e.target?.id === "main") paintRulerViewport(); }, true);
+document.addEventListener("scroll", (e) => { if (e.target instanceof HTMLElement && e.target.id === "main")
+    paintRulerViewport(); }, true);
 globalThis.addEventListener?.("resize", () => requestAnimationFrame(renderRuler));
-
 setInterval(() => {
-    if (!state.review || state.dragging) return;
-    if (document.activeElement?.tagName === "TEXTAREA") renderTop();
-    else render();
+    if (!state.review || state.dragging)
+        return;
+    if (document.activeElement?.tagName === "TEXTAREA")
+        renderTop();
+    else
+        render();
 }, 30000);
-
 if (!TOKEN) {
-    $("#top").innerHTML = `<span class="del">Missing access token. Reopen the canvas.</span>`;
-} else {
+    requiredElement("#top").innerHTML = `<span class="del">Missing access token. Reopen the canvas.</span>`;
+}
+else {
     loadState()
         .catch((err) => {
-            $("#top").innerHTML = `<span class="del">${esc(err.message)}</span>`;
-        })
+        requiredElement("#top").innerHTML = `<span class="del">${esc(errorMessage(err))}</span>`;
+    })
         .finally(connect);
 }

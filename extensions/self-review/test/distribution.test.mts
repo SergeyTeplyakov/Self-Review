@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const extensionRoot = fileURLToPath(new URL("..", import.meta.url));
 
-async function filesUnder(directory) {
+async function filesUnder(directory: string): Promise<string[]> {
     const files = [];
     for (const entry of await readdir(directory, { withFileTypes: true })) {
         const file = path.join(directory, entry.name);
@@ -48,7 +48,9 @@ test("the installation-shaped distribution contains executable modules and all b
     for (const file of installedFiles.filter((candidate) => /\.(?:mjs|js)$/.test(candidate))) {
         const source = await readFile(file, "utf8");
         for (const match of source.matchAll(/(?:\bfrom\s*|\bimport\s*)["'](\.{1,2}\/[^"']+)["']/g)) {
-            const dependency = fileURLToPath(new URL(match[1], pathToFileURL(file)));
+            const specifier = match[1];
+            if (!specifier) continue;
+            const dependency = fileURLToPath(new URL(specifier, pathToFileURL(file)));
             await stat(dependency);
         }
     }
@@ -57,7 +59,7 @@ test("the installation-shaped distribution contains executable modules and all b
     assert.match(html, /href="styles\.css"/);
     assert.match(html, /src="app\.js"/);
 
-    const { reviewOptions } = await import(pathToFileURL(path.join(installedDist, "web", "contracts.mjs")));
+    const { reviewOptions } = await import(pathToFileURL(path.join(installedDist, "web", "contracts.mjs")).href);
     assert.deepEqual(reviewOptions({ models: ["model-a"], focus: "both" }), {
         models: ["model-a"], focus: "both", intent: "",
     });

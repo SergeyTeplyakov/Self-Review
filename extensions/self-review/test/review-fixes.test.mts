@@ -1,28 +1,43 @@
 import { test } from "node:test";
+import type { TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { Store } from "../dist/lib/store.mjs";
-import { ReviewService } from "../dist/lib/review-service.mjs";
-import { Delivery } from "../dist/lib/delivery.mjs";
-import { hunkExcerpt, parseUnifiedDiff } from "../dist/lib/diff.mjs";
-import { normalizeRemoteUrl, SettingsService } from "../dist/lib/settings.mjs";
-import { relocate } from "../dist/lib/anchors.mjs";
-import { captureSnapshot, readWorkingFile, runGit, safeJoin } from "../dist/lib/git.mjs";
+import {
+    Delivery, ReviewService, SettingsService, Store, captureSnapshot, hunkExcerpt, normalizeRemoteUrl,
+    parseUnifiedDiff, readWorkingFile, relocate, runGit, safeJoin,
+} from "./modules.mjs";
+import type { MessageDelivery, Review, ReviewMessage, ReviewService as ReviewServiceType, ThreadInput } from "../src/lib/review-service.mjs";
+import type { Store as StoreType } from "../src/lib/store.mjs";
+import type { SendOptions } from "../src/lib/delivery.mjs";
+import type { DiffSide } from "../src/lib/diff.mjs";
 
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-const git = (cwd, ...args) => runGit(cwd, ["-c", "user.name=test", "-c", "user.email=test@example.com", "-c", "core.autocrlf=false", ...args]);
+const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+const git = (cwd: string, ...args: string[]) => runGit(cwd, ["-c", "user.name=test", "-c", "user.email=test@example.com", "-c", "core.autocrlf=false", ...args]);
 
-async function temporary(t) {
+function required<T>(value: T | null | undefined): T {
+    assert.ok(value);
+    return value;
+}
+
+function hasErrorCode(value: unknown, code: string): boolean {
+    return typeof value === "object" && value !== null && "code" in value && value.code === code;
+}
+
+async function messageDelivery(service: ReviewServiceType, reviewId: string, messageId: string): Promise<MessageDelivery> {
+    return required((await service.findMessage(reviewId, messageId)).message.delivery);
+}
+
+async function temporary(t: TestContext): Promise<string> {
     const dir = await mkdtemp(path.join(os.tmpdir(), "mr-review-fixes-"));
     t.after(() => rm(dir, { recursive: true, force: true }));
     return dir;
 }
 
-async function fixture(t, branch = "main") {
+async function fixture(t: TestContext, branch = "main"): Promise<{ dir: string; repo: string; text: string; store: StoreType; service: ReviewServiceType }> {
     const dir = await temporary(t);
     const repo = path.join(dir, "repo");
     await git(dir, "init", "-q", "-b", branch, repo);
@@ -63,7 +78,7 @@ test("anchor fallback preserves spaces inside literals and between tokens", () =
 test("separate provider processes preserve review, settings, lesson and instance updates", { timeout: 30000 }, async (t) => {
     const dir = await temporary(t);
     const store = new Store(dir);
-    await store.updateReview("shared", () => ({ review: { values: [] } }));
+    await store.updateReview("shared", () => ({ review: { values: [] } as unknown as Review }));
     const source = `
         import { Store } from ${JSON.stringify(new URL("../dist/lib/store.mjs", import.meta.url).href)};
         const store = new Store(process.argv[1]);
@@ -86,13 +101,13 @@ test("separate provider processes preserve review, settings, lesson and instance
     const workers = Array.from({ length: 4 }, (_, n) => {
         const child = spawn(process.execPath, ["--input-type=module", "-e", source, dir, String(n)], { stdio: ["ignore", "ignore", "pipe", "ipc"], windowsHide: true });
         let stderr = "";
-        child.stderr.on("data", (chunk) => { stderr += chunk; });
-        const ready = new Promise((resolve, reject) => {
+        required(child.stderr).on("data", (chunk: Buffer) => { stderr += chunk; });
+        const ready = new Promise<void>((resolve, reject) => {
             child.once("message", resolve);
             child.once("error", reject);
             child.once("exit", () => reject(new Error(`Worker exited before ready: ${stderr}`)));
         });
-        const done = new Promise((resolve, reject) => {
+        const done = new Promise<void>((resolve, reject) => {
             child.once("error", reject);
             child.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`Worker failed (${code}): ${stderr}`)));
         });
@@ -103,7 +118,8 @@ test("separate provider processes preserve review, settings, lesson and instance
     await Promise.all(workers.map((worker) => worker.ready));
     workers.forEach((worker) => worker.child.send("go"));
     await finished;
-    assert.equal(new Set((await store.readReview("shared")).values).size, 32);
+    const shared = required(await store.readReview("shared")) as Review & { values: string[] };
+    assert.equal(new Set(shared.values).size, 32);
     assert.equal(Object.keys((await store.readSettings()).repos).length, 32);
     assert.equal(Object.keys(JSON.parse(await readFile(path.join(dir, "instances.json"), "utf8"))).length, 32);
     assert.equal((await store.readLessons()).length, 32);
@@ -178,26 +194,26 @@ test("reopening applies explicit capture options and retains unspecified ones", 
 test("out-of-hunk selections and prompt context reject changed working files instead of labeling live text as saved", async (t) => {
     const { repo, text, service } = await fixture(t);
     const id = await service.ensureReview({ repoPath: repo, base: "main", context: 0 });
-    const input = { kind: "line", path: "a.txt", side: "new", startLine: 50, endLine: 51, revisionId: "r1", body: "Explain these lines" };
+    const input = { kind: "line", path: "a.txt", side: "new", startLine: 50, endLine: 51, revisionId: "r1", body: "Explain these lines" } satisfies ThreadInput;
     const { thread, message } = await service.createThread(id, input);
-    assert.deepEqual(thread.anchor.selectedLines, ["line 50", "line 51"]);
+    assert.deepEqual(required(thread.anchor).selectedLines, ["line 50", "line 51"]);
     assert.deepEqual((await service.promptContext(id, thread.threadId)).selected, ["line 50", "line 51"]);
     await writeFile(path.join(repo, "a.txt"), "inserted\n" + text);
-    await assert.rejects(service.createThread(id, input), (e) => e.code === "conflict");
-    await assert.rejects(service.promptContext(id, thread.threadId), (e) => e.code === "conflict");
-    const sent = [];
+    await assert.rejects(service.createThread(id, input), (e: unknown) => hasErrorCode(e, "conflict"));
+    await assert.rejects(service.promptContext(id, thread.threadId), (e: unknown) => hasErrorCode(e, "conflict"));
+    const sent: SendOptions[] = [];
     const delivery = new Delivery({ service, send: async (options) => { sent.push(options); return "sm"; } });
     assert.equal((await delivery.deliver(id, thread.threadId, message.messageId, "inst")).delivered, false);
     assert.equal(sent.length, 0);
-    assert.equal((await service.findMessage(id, message.messageId)).message.delivery.state, "failed");
+    assert.equal(required((await service.findMessage(id, message.messageId)).message.delivery).state, "failed");
     const captured = await service.createThread(id, { ...input, startLine: 5, endLine: 5 });
-    assert.deepEqual(captured.thread.anchor.selectedLines, ["line 5 edited"], "saved hunk text remains usable");
+    assert.deepEqual(required(captured.thread.anchor).selectedLines, ["line 5 edited"], "saved hunk text remains usable");
     const old = await service.createThread(id, { ...input, side: "old" });
-    assert.deepEqual(old.thread.anchor.selectedLines, ["line 50", "line 51"], "the committed old side is immutable");
+    assert.deepEqual(required(old.thread.anchor).selectedLines, ["line 50", "line 51"], "the committed old side is immutable");
     await service.refresh(id);
     assert.deepEqual((await service.promptContext(id, thread.threadId)).selected, ["line 50", "line 51"]);
     assert.equal((await delivery.deliver(id, thread.threadId, message.messageId, "inst", { retry: true })).delivered, true);
-    await assert.rejects(service.createThread(id, input), (e) => e.code === "conflict");
+    await assert.rejects(service.createThread(id, input), (e: unknown) => hasErrorCode(e, "conflict"));
 });
 
 test("concurrent deliveries and retries claim one send, and stale retries do not reset active or replied messages", async (t) => {
@@ -208,24 +224,24 @@ test("concurrent deliveries and retries claim one send, and stale retries do not
     const send = async () => { const n = ++sends; await delay(50); return `sm-${n}`; };
     const first = new Delivery({ service, send });
     const second = new Delivery({ service: new ReviewService({ store: new Store(store.root) }), send });
-    const args = [id, thread.threadId, message.messageId, "inst"];
+    const args: [string, string, string, string] = [id, thread.threadId, message.messageId, "inst"];
     const calls = Array.from({ length: 10 }, (_, i) => (i % 2 ? first : second).deliver(...args));
     await Promise.all(calls);
     assert.equal(sends, 1);
     await service.setDelivery(id, message.messageId, { state: "processing" });
     assert.equal(await service.setDelivery(id, message.messageId, { state: "failed" }), false, "late transport failures cannot reset an already processing message");
     await first.deliver(...args, { retry: true });
-    assert.equal((await service.findMessage(id, message.messageId)).message.delivery.state, "processing");
+    assert.equal((await messageDelivery(service, id, message.messageId)).state, "processing");
     await service.settleProcessing(id);
-    const oldAttempt = (await service.findMessage(id, message.messageId)).message.delivery.attemptId;
+    const oldAttempt = (await messageDelivery(service, id, message.messageId)).attemptId;
     await Promise.all(Array.from({ length: 10 }, (_, i) => (i % 2 ? first : second).deliver(...args, { retry: true })));
     assert.equal(sends, 2);
-    assert.equal((await service.findMessage(id, message.messageId)).message.delivery.attempts, 2);
-    assert.equal(await service.setDelivery(id, message.messageId, { state: "failed" }, { attemptId: oldAttempt }), false);
+    assert.equal((await messageDelivery(service, id, message.messageId)).attempts, 2);
+    assert.equal(await service.setDelivery(id, message.messageId, { state: "failed" }, { attemptId: oldAttempt ?? undefined }), false);
     await service.addMessage(id, thread.threadId, { author: "agent", body: "Answered", inReplyTo: message.messageId });
     await Promise.all([first.deliver(...args, { retry: true }), second.deliver(...args, { retry: true })]);
     assert.equal(sends, 2);
-    assert.equal((await service.findMessage(id, message.messageId)).message.delivery.state, "replied");
+    assert.equal((await messageDelivery(service, id, message.messageId)).state, "replied");
 });
 
 test("failed sends can be retried once without coalescing away a later attempt", async (t) => {
@@ -237,14 +253,14 @@ test("failed sends can be retried once without coalescing away a later attempt",
         if (++attempts === 1) throw new Error("transport unavailable");
         return "sm-retry";
     } });
-    const args = [id, thread.threadId, message.messageId, "inst"];
+    const args: [string, string, string, string] = [id, thread.threadId, message.messageId, "inst"];
     const first = delivery.deliver(...args);
     assert.equal(delivery.deliver(...args, { retry: true }), first, "same-provider callers share the in-flight promise");
     assert.deepEqual(await first, { delivered: false, error: "transport unavailable" });
-    assert.equal((await service.findMessage(id, message.messageId)).message.delivery.state, "failed");
+    assert.equal((await messageDelivery(service, id, message.messageId)).state, "failed");
     assert.equal((await delivery.deliver(...args, { retry: true })).delivered, true);
     assert.equal(attempts, 2);
-    assert.equal((await service.findMessage(id, message.messageId)).message.delivery.attempts, 2);
+    assert.equal((await messageDelivery(service, id, message.messageId)).attempts, 2);
 });
 
 test("symlink contents are target text, including broken and external links", async (t) => {
@@ -254,12 +270,13 @@ test("symlink contents are target text, including broken and external links", as
     try {
         await symlink(secret, path.join(repo, "external-link"), "file");
     } catch (err) {
-        if (err.code === "EPERM") { t.skip("File symlink creation requires Windows Developer Mode or administrator rights."); return; }
+        if (hasErrorCode(err, "EPERM")) { t.skip("File symlink creation requires Windows Developer Mode or administrator rights."); return; }
         throw err;
     }
     await symlink(path.join(dir, "missing.txt"), path.join(repo, "broken-link"), "file");
     const snapshot = await captureSnapshot({ repoRoot: repo, base: "main" });
-    assert.equal(snapshot.files.find((f) => f.path === "external-link").hunks[0].rows[0].s, secret);
+    const external = required(snapshot.files.find((f) => f.path === "external-link"));
+    assert.equal(required(external.hunks[0]).rows[0]?.s, secret);
     assert.doesNotMatch(JSON.stringify(snapshot), /must never enter the review/);
     assert.deepEqual(await readWorkingFile(repo, "external-link"), [secret]);
     assert.deepEqual(await readWorkingFile(repo, "broken-link"), [path.join(dir, "missing.txt")]);
@@ -294,7 +311,7 @@ test("diff paths parse the same whatever the diff prefix settings, and a file na
         await git(repo, "config", key, "true");
         const snapshot = await captureSnapshot({ repoRoot: repo, base: "main" });
         assert.deepEqual(snapshot.files.map((f) => f.path).sort(), ["..notes", "a.txt"], key);
-        assert.ok(snapshot.files.find((f) => f.path === "a.txt").hunks.length > 0, key);
+        assert.ok(required(snapshot.files.find((f) => f.path === "a.txt")).hunks.length > 0, key);
     }
 });
 
@@ -311,7 +328,7 @@ test("going idle settles only the comments this conversation was processing", as
     const sentB = await b.deliver(id, theirs.thread.threadId, theirs.message.messageId, "inst");
     await a.onUserMessage({ data: { messageId: sentA.sessionMessageId } });
     await b.onUserMessage({ data: { messageId: sentB.sessionMessageId } });
-    const delivery = async (m) => (await service.findMessage(id, m.message.messageId)).message.delivery;
+    const delivery = async (m: { message: ReviewMessage }) => messageDelivery(service, id, m.message.messageId);
     assert.equal((await delivery(mine)).processedBy, "session-a");
     assert.equal((await delivery(theirs)).processedBy, "session-b");
 
@@ -328,18 +345,18 @@ test("a comment claimed by a provider that stopped can be resent, and live claim
     const id = await stopped.ensureReview({ repoPath: repo, base: "main" });
     const orphan = await stopped.createThread(id, { kind: "overview", body: "Claimed by a provider that crashed" });
     const live = await service.createThread(id, { kind: "overview", body: "Still being sent" });
-    assert.equal(orphan.message.delivery.claimPid, 999999);
-    assert.equal(live.message.delivery.claimPid, process.pid);
+    assert.equal(required(orphan.message.delivery).claimPid, 999999);
+    assert.equal(required(live.message.delivery).claimPid, process.pid);
 
     const checker = new ReviewService({ store: new Store(store.root), pid: 4242, isProcessAlive: (pid) => pid !== 999999 });
     assert.deepEqual(await checker.recoverAbandonedClaims(id), [orphan.message.messageId]);
-    const delivery = async (m) => (await service.findMessage(id, m.message.messageId)).message.delivery;
+    const delivery = async (m: { message: ReviewMessage }) => messageDelivery(service, id, m.message.messageId);
     assert.equal((await delivery(orphan)).state, "failed");
-    assert.match((await delivery(orphan)).error, /Resend it/);
+    assert.match(required((await delivery(orphan)).error), /Resend it/);
     assert.equal((await delivery(live)).state, "saving", "a running provider keeps its claim");
     assert.deepEqual(await service.recoverAbandonedClaims(id), [], "this provider never recovers its own claims");
 
-    const sent = [];
+    const sent: SendOptions[] = [];
     const resend = new Delivery({ service, send: async (options) => { sent.push(options); return "sm-resend"; } });
     assert.equal((await resend.deliver(id, orphan.thread.threadId, orphan.message.messageId, "inst", { retry: true })).delivered, true);
     assert.equal(sent.length, 1);
@@ -351,7 +368,7 @@ test("a comment whose turn ends before send() returns settles instead of staying
     const id = await service.ensureReview({ repoPath: repo, base: "main" });
     const early = await service.createThread(id, { kind: "overview", body: "Answered before send returned" });
     const running = await service.createThread(id, { kind: "overview", body: "Still running when send returned" });
-    const state = async (m) => (await service.findMessage(id, m.message.messageId)).message.delivery.state;
+    const state = async (m: { message: ReviewMessage }) => (await messageDelivery(service, id, m.message.messageId)).state;
     let finishTurn = false;
     const delivery = new Delivery({ service, send: async () => {
         const sessionMessageId = finishTurn ? "sm-early" : "sm-running";
@@ -370,7 +387,9 @@ test("a comment whose turn ends before send() returns settles instead of staying
     assert.equal(await state(running), "processing");
     await delivery.onIdle();
     assert.equal(await state(running), "no-reply");
-    assert.equal(delivery.seenSessionMessageIds.size, 0);
+    const seen = Reflect.get(delivery, "seenSessionMessageIds");
+    assert.ok(seen instanceof Map);
+    assert.equal(seen.size, 0);
 });
 
 test("unquoted diff headers split at the matching side when a path contains ' b/'", async (t) => {
@@ -394,13 +413,13 @@ test("snapshots show a file's real content even when a textconv driver is config
     const { dir, repo } = await fixture(t);
     const script = path.join(dir, "upper.mjs");
     await writeFile(script, 'import { readFileSync } from "node:fs";\nprocess.stdout.write(readFileSync(process.argv[2], "utf8").toUpperCase());\n');
-    const slash = (p) => p.replaceAll("\\", "/");
+    const slash = (p: string) => p.replaceAll("\\", "/");
     await git(repo, "config", "diff.upper.textconv", `"${slash(process.execPath)}" "${slash(script)}"`);
     await writeFile(path.join(repo, ".git", "info", "attributes"), "*.txt diff=upper\n");
     assert.match((await git(repo, "diff", "main")).stdout, /LINE 5 EDITED/, "the driver is active for a plain git diff");
 
     const snapshot = await captureSnapshot({ repoRoot: repo, base: "main" });
-    const rows = snapshot.files.find((f) => f.path === "a.txt").hunks.flatMap((h) => h.rows);
+    const rows = required(snapshot.files.find((f) => f.path === "a.txt")).hunks.flatMap((h) => h.rows);
     assert.ok(rows.some((r) => r.t === "add" && r.s === "line 5 edited"));
     assert.ok(!rows.some((r) => /LINE/.test(r.s)));
 });
@@ -423,14 +442,14 @@ test("quoted and forged delivery markers cannot release drafts or transfer anoth
     const id = await service.ensureReview({ repoPath: repo, base: "main" });
     const draft = await service.createThread(id, { kind: "overview", body: "Private draft", hold: true });
     const sent = await service.createThread(id, { kind: "overview", body: "Submitted comment" });
-    const marker = (m) => `[self-review sr:${id}:${m.message.messageId}]`;
+    const marker = (m: { message: ReviewMessage }) => `[self-review sr:${id}:${m.message.messageId}]`;
     const a = new Delivery({ service, sessionId: () => "a", send: async () => "transport-a" });
     await a.deliver(id, sent.thread.threadId, sent.message.messageId, "inst");
     const b = new Delivery({ service, sessionId: () => "b", send: async () => "transport-b" });
     await a.onUserMessage({ data: { messageId: "quote", content: `Quoted log:\n${marker(draft)}\n${marker(sent)}` } });
     await a.onUserMessage({ data: { messageId: "forged", content: marker(draft) } });
     await b.onUserMessage({ data: { messageId: "transport-a", content: marker(sent) } });
-    const state = async (m) => (await service.findMessage(id, m.message.messageId)).message.delivery;
+    const state = async (m: { message: ReviewMessage }) => messageDelivery(service, id, m.message.messageId);
     assert.equal((await state(draft)).state, "draft");
     assert.equal((await state(sent)).state, "queued");
     assert.doesNotMatch(JSON.stringify(service.summarize(await service.getReview(id))), /Private draft/);
@@ -446,7 +465,7 @@ test("quoted and forged delivery markers cannot release drafts or transfer anoth
     await resumed.onIdle();
     const oldAttempt = (await state(sent)).attemptId;
     await service.claimDelivery(id, sent.thread.threadId, sent.message.messageId, { retry: true, senderSessionId: "a" });
-    assert.equal(await service.processDelivery(id, sent.message.messageId, { attemptId: oldAttempt, sessionMessageId: "transport-a", sessionId: "a" }), false);
+    assert.equal(await service.processDelivery(id, sent.message.messageId, { attemptId: required(oldAttempt), sessionMessageId: "transport-a", sessionId: "a" }), false);
     await resumed.onUserMessage({ data: { messageId: "transport-a", content: marker(sent) } });
     assert.equal((await state(sent)).state, "saving", "an old marker cannot process a new attempt");
 });
@@ -456,14 +475,14 @@ test("legacy queued attempts require their exact transport event to establish th
     const id = await service.ensureReview({ repoPath: repo, base: "main" });
     const { thread, message } = await service.createThread(id, { kind: "overview", body: "Sent before upgrading" });
     const claim = await service.claimDelivery(id, thread.threadId, message.messageId);
-    await service.setDelivery(id, message.messageId, { state: "queued", sessionMessageId: "legacy" }, claim);
+    await service.setDelivery(id, message.messageId, { state: "queued", sessionMessageId: "legacy" }, required(claim));
     const delivery = new Delivery({ service: new ReviewService({ store }), sessionId: () => "owner", send: async () => "unused" });
     const content = `[self-review sr:${id}:${message.messageId}]`;
     await delivery.onUserMessage({ data: { messageId: "quoted", content } });
-    assert.equal((await service.findMessage(id, message.messageId)).message.delivery.state, "queued");
+    assert.equal((await messageDelivery(service, id, message.messageId)).state, "queued");
     await delivery.onUserMessage({ data: { messageId: "legacy", content } });
     await delivery.onIdle();
-    assert.equal((await service.findMessage(id, message.messageId)).message.delivery.state, "no-reply");
+    assert.equal((await messageDelivery(service, id, message.messageId)).state, "no-reply");
 });
 
 test("a provider restarted after the rename recognizes markers sent as manual-review", async (t) => {
@@ -473,7 +492,7 @@ test("a provider restarted after the rename recognizes markers sent as manual-re
     await new Delivery({ service, sessionId: () => "a", send: async () => "transport-a" }).deliver(id, thread.threadId, message.messageId, "inst");
     const resumed = new Delivery({ service: new ReviewService({ store: new Store(store.root) }), sessionId: () => "a", send: async () => "unused" });
     await resumed.onUserMessage({ data: { messageId: "transport-a", content: `[manual-review mr:${id}:${message.messageId}]` } });
-    const delivery = (await service.findMessage(id, message.messageId)).message.delivery;
+    const delivery = required((await service.findMessage(id, message.messageId)).message.delivery);
     assert.equal(delivery.state, "processing");
     assert.equal(delivery.processedBy, "a");
 });
@@ -481,16 +500,17 @@ test("a provider restarted after the rename recognizes markers sent as manual-re
 test("idle waits for every preceding batch processing update, including delayed persistence", async (t) => {
     const { repo, service } = await fixture(t);
     const id = await service.ensureReview({ repoPath: repo, base: "main" });
-    const comments = [];
+    const comments: Array<Awaited<ReturnType<ReviewServiceType["createThread"]>>> = [];
     for (let i = 0; i < 3; i++) comments.push(await service.createThread(id, { kind: "overview", body: `Comment ${i}`, hold: true }));
     const delivery = new Delivery({ service, send: async () => "batch", sessionId: () => "owner" });
     await delivery.submit(id, "inst");
-    let release, reached;
-    const paused = new Promise((resolve) => { reached = resolve; });
-    const gate = new Promise((resolve) => { release = resolve; });
+    let release!: () => void;
+    let reached!: () => void;
+    const paused = new Promise<void>((resolve) => { reached = resolve; });
+    const gate = new Promise<void>((resolve) => { release = resolve; });
     const processDelivery = service.processDelivery.bind(service);
     let calls = 0;
-    service.processDelivery = async (...args) => {
+    service.processDelivery = async (...args: Parameters<typeof service.processDelivery>) => {
         const result = await processDelivery(...args);
         if (++calls === 1) { reached(); await gate; }
         return result;
@@ -501,7 +521,7 @@ test("idle waits for every preceding batch processing update, including delayed 
     release();
     await Promise.all([processing, idle]);
     for (const c of comments) {
-        assert.equal((await service.findMessage(id, c.message.messageId)).message.delivery.state, "no-reply");
+        assert.equal((await messageDelivery(service, id, c.message.messageId)).state, "no-reply");
     }
 });
 
@@ -512,18 +532,21 @@ test("newline-only changes retain the affected row in snapshots, excerpts and fu
     await git(repo, "commit", "-q", "-m", "without newline");
     await writeFile(path.join(repo, "eof.txt"), "same\n");
     const id = await service.ensureReview({ repoPath: repo, base: "main" });
-    const snapshot = await service.store.readSnapshot(id, "r1");
-    const file = snapshot.files.find((f) => f.path === "eof.txt");
+    const snapshot = required(await service.store.readSnapshot(id, "r1"));
+    const file = required(snapshot.files.find((f) => f.path === "eof.txt"));
     assert.deepEqual(file.hunks[0].rows.map((r) => [r.t, r.s, !!r.noNewlineAtEnd]), [["del", "same", true], ["add", "same", false]]);
-    assert.match(hunkExcerpt(file, "new", 1, 1).text, /-same\n\\ No newline at end of file\n\+same/);
-    assert.equal((await service.getFileContent(id, "r1", "eof.txt")).available, true);
+    assert.match(required(hunkExcerpt(file, "new", 1, 1)).text, /-same\n\\ No newline at end of file\n\+same/);
+    const currentContent = await service.getFileContent(id, "r1", "eof.txt");
+    assert.equal(currentContent.available, true);
     await writeFile(path.join(repo, "eof.txt"), "same");
-    assert.equal((await service.getFileContent(id, "r1", "eof.txt")).reason, "stale");
+    const staleContent = await service.getFileContent(id, "r1", "eof.txt");
+    assert.equal(staleContent.available, false);
+    if (!staleContent.available) assert.equal(staleContent.reason, "stale");
     await writeFile(path.join(repo, "eof.txt"), "same\n");
     await git(repo, "add", "eof.txt");
     await git(repo, "commit", "-q", "-m", "with newline");
     await writeFile(path.join(repo, "eof.txt"), "same");
-    const removed = (await captureSnapshot({ repoRoot: repo, scope: "pending" })).files.find((f) => f.path === "eof.txt");
+    const removed = required((await captureSnapshot({ repoRoot: repo, base: null, scope: "pending" })).files.find((f) => f.path === "eof.txt"));
     assert.deepEqual(removed.hunks[0].rows.map((r) => [r.t, !!r.noNewlineAtEnd]), [["del", false], ["add", true]]);
 });
 
@@ -533,22 +556,25 @@ test("file-to-symlink replacement is one navigable file with both sides availabl
     await rm(path.join(repo, "a.txt"));
     await symlink("target.txt", path.join(repo, "a.txt"), "file");
     const id = await service.ensureReview({ repoPath: repo, base: "main" });
-    const snapshot = await service.store.readSnapshot(id, "r1");
+    const snapshot = required(await service.store.readSnapshot(id, "r1"));
     const files = snapshot.files.filter((f) => f.path === "a.txt");
     assert.equal(files.length, 1);
     assert.deepEqual([files[0].oldMode, files[0].newMode, files[0].typeChanged], ["100644", "120000", true]);
-    assert.deepEqual((await service.getFileContent(id, "r1", "a.txt")).lines, ["target.txt"]);
-    for (const side of ["old", "new"]) {
+    const content = await service.getFileContent(id, "r1", "a.txt");
+    assert.equal(content.available, true);
+    if (content.available) assert.deepEqual(content.lines, ["target.txt"]);
+    const sides: DiffSide[] = ["old", "new"];
+    for (const side of sides) {
         const { thread } = await service.createThread(id, { kind: "line", path: "a.txt", side, startLine: 1, body: side });
-        assert.deepEqual(thread.anchor.selectedLines, [side === "old" ? "line 1" : "target.txt"]);
+        assert.deepEqual(required(thread.anchor).selectedLines, [side === "old" ? "line 1" : "target.txt"]);
     }
     await git(repo, "add", "a.txt");
     await git(repo, "commit", "-q", "-m", "symlink");
     await rm(path.join(repo, "a.txt"));
     await writeFile(path.join(repo, "a.txt"), "regular again\n");
-    const reversed = (await captureSnapshot({ repoRoot: repo, scope: "pending" })).files;
+    const reversed = (await captureSnapshot({ repoRoot: repo, base: null, scope: "pending" })).files;
     assert.equal(reversed.length, 1);
-    assert.deepEqual([reversed[0].oldMode, reversed[0].newMode, reversed[0].hunks[0].rows.at(-1).s], ["120000", "100644", "regular again"]);
+    assert.deepEqual([required(reversed[0]).oldMode, required(reversed[0]).newMode, required(required(reversed[0]).hunks[0].rows.at(-1)).s], ["120000", "100644", "regular again"]);
 });
 
 test("mode-only changes preserve old and new permissions and reach file-comment prompts", async (t) => {
@@ -559,29 +585,30 @@ test("mode-only changes preserve old and new permissions and reach file-comment 
     await git(repo, "commit", "-q", "-m", "script");
     await git(repo, "update-index", "--chmod=+x", "run.sh");
     const id = await service.ensureReview({ repoPath: repo, base: "main" });
-    const file = (await service.store.readSnapshot(id, "r1")).files.find((f) => f.path === "run.sh");
+    const snapshot = required(await service.store.readSnapshot(id, "r1"));
+    const file = required(snapshot.files.find((f) => f.path === "run.sh"));
     assert.deepEqual([file.oldMode, file.newMode, file.hunks.length], ["100644", "100755", 0]);
     const { thread } = await service.createThread(id, { kind: "file", path: "run.sh", body: "Why executable?" });
-    assert.equal((await service.promptContext(id, thread.threadId)).excerpt.text, "File mode: 100644 to 100755");
+    assert.equal(required((await service.promptContext(id, thread.threadId)).excerpt).text, "File mode: 100644 to 100755");
 });
 
 test("raw content fingerprints change within binary and oversized classifications and for final newlines", async (t) => {
     const { repo, service } = await fixture(t);
     const target = path.join(repo, "untracked.dat");
-    const fingerprints = [];
-    let id;
+    const fingerprints: string[] = [];
+    let id: string | undefined;
     for (const data of [Buffer.from([0, 1]), Buffer.from([0, 2]), Buffer.alloc(2 * 1024 * 1024 + 1, 65), Buffer.alloc(2 * 1024 * 1024 + 1, 66), "text", "text\n"]) {
         await writeFile(target, data);
         if (!id) id = await service.ensureReview({ repoPath: repo, base: "main" });
         else await service.refresh(id);
         const review = await service.getReview(id);
-        const snapshot = await service.store.readSnapshot(id, review.currentRevisionId);
+        const snapshot = required(await service.store.readSnapshot(id, required(review.currentRevisionId)));
         fingerprints.push(snapshot.fingerprint);
-        const file = snapshot.files.find((f) => f.path === "untracked.dat");
+        const file = required(snapshot.files.find((f) => f.path === "untracked.dat"));
         assert.equal(file.contentHash, createHash("sha256").update(data).digest("hex"));
     }
     assert.equal(new Set(fingerprints).size, 6);
-    assert.equal((await service.getReview(id)).revisions.length, 6);
+    assert.equal((await service.getReview(required(id))).revisions.length, 6);
 });
 
 test("generic SSH home paths keep their user and never share automatic learning with absolute paths", async (t) => {
@@ -593,7 +620,7 @@ test("generic SSH home paths keep their user and never share automatic learning 
     assert.equal(normalizeRemoteUrl("git@github.com:Owner/Repo.git"), normalizeRemoteUrl("ssh://git@github.com/Owner/Repo.git"));
     const { repo, store } = await fixture(t);
     let url = home;
-    const settings = new SettingsService({ store, git: { runGit: async () => ({ ok: true, stdout: url }) } });
+    const settings = new SettingsService({ store, git: { runGit: async () => ({ ok: true, stdout: url, stderr: "" }) } });
     await settings.update(repo, { learning: "auto", delivery: "batch" });
     url = absolute;
     assert.deepEqual([(await settings.get(repo)).learning, (await settings.get(repo)).delivery], ["off", "immediate"]);

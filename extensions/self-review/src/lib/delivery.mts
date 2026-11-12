@@ -3,6 +3,24 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { buildBatchPrompt, buildCommentPrompt } from "./prompt.mjs";
+import type { ReviewService, DraftClaim } from "./review-service.mjs";
+import type { Log } from "../../types/contracts.js";
+
+type CopilotSession = Awaited<ReturnType<typeof import("@github/copilot-sdk/extension").joinSession>>;
+export type SendOptions = Parameters<CopilotSession["send"]>[0];
+export interface DeliveryResult {
+    delivered: boolean;
+    skipped?: boolean;
+    error?: string;
+    sessionMessageId?: string;
+}
+interface DeliveryTarget { reviewId: string; messageId: string; attemptId?: string }
+export interface UserMessageEvent {
+    data?: { messageId?: string; transformedContent?: string; content?: string };
+}
+const errorMessage = (error: unknown) => String(
+    error && typeof error === "object" && "message" in error ? error.message ?? error : error,
+);
 
 // Also accepts markers written before the rename to Self Review Canvas, so in-flight replies still match.
 const MARKER_RE = /^\[(?:self-review sr|manual-review mr):([a-z0-9][a-z0-9._-]{0,100}):(m-[0-9a-f-]{36})\]$/;
@@ -10,6 +28,19 @@ const MARKER_RE = /^\[(?:self-review sr|manual-review mr):([a-z0-9][a-z0-9._-]{0
 const nowIso = () => new Date().toISOString();
 
 export class Delivery extends EventEmitter {
+    readonly service: ReviewService;
+    readonly send: (options: SendOptions) => Promise<string>;
+    readonly log: Log;
+    readonly reviewIds: () => Iterable<string>;
+    readonly learning: (repoRoot: string) => Promise<string>;
+    readonly sessionId: () => string | undefined;
+    readonly fallbackOwner: string;
+    busy: boolean | null;
+    private readonly bySessionMessageId: Map<string, DeliveryTarget[]>;
+    private readonly seenSessionMessageIds: Map<string, { finished: boolean }>;
+    private readonly touched: Set<string>;
+    private readonly inFlight: Map<string, Promise<DeliveryResult>>;
+    private lifecycle: Promise<void>;
     /**
      * @param {object} p
      * @param {import("./review-service.mjs").ReviewService} p.service
@@ -19,7 +50,10 @@ export class Delivery extends EventEmitter {
      * @param {(repoRoot: string) => Promise<string>} [p.learning] guideline-learning mode for a repository; failures fall back to off
      * @param {() => string | undefined} [p.sessionId] conversation that processes the comments this instance sends
      */
-    constructor({ service, send, log = () => {}, reviewIds = () => [], learning = async () => "off", sessionId = () => undefined }) {
+    constructor({ service, send, log = () => {}, reviewIds = () => [], learning = async () => "off", sessionId = () => undefined }: {
+        service: ReviewService; send: (options: SendOptions) => Promise<string>; log?: Log; reviewIds?: () => Iterable<string>;
+        learning?: (repoRoot: string) => Promise<string>; sessionId?: () => string | undefined;
+    }) {
         super();
         this.service = service;
         this.send = send;
@@ -37,16 +71,17 @@ export class Delivery extends EventEmitter {
         this.lifecycle = Promise.resolve();
     }
 
-    deliver(reviewId, threadId, messageId, instanceId, options = {}) {
+    deliver(reviewId: string, threadId: string, messageId: string, instanceId: string, options: { retry?: boolean } = {}): Promise<DeliveryResult> {
         const key = `${reviewId}:${messageId}`;
-        if (this.inFlight.has(key)) return this.inFlight.get(key);
+        const existing = this.inFlight.get(key);
+        if (existing) return existing;
         const pending = this.deliverOnce(reviewId, threadId, messageId, instanceId, options)
             .finally(() => this.inFlight.delete(key));
         this.inFlight.set(key, pending);
         return pending;
     }
 
-    async deliverOnce(reviewId, threadId, messageId, instanceId, { retry = false } = {}) {
+    async deliverOnce(reviewId: string, threadId: string, messageId: string, instanceId: string, { retry = false } = {}): Promise<DeliveryResult> {
         this.touched.add(reviewId);
         const claim = await this.service.claimDelivery(reviewId, threadId, messageId, { retry, senderSessionId: this.owner() });
         if (!claim) return { delivered: false, skipped: true };
@@ -54,7 +89,7 @@ export class Delivery extends EventEmitter {
     }
 
     // Sends every draft of a review as one prompt; drafts are claimed atomically so a review is submitted once.
-    async submit(reviewId, instanceId) {
+    async submit(reviewId: string, instanceId: string): Promise<DeliveryResult & { submitted: number }> {
         this.touched.add(reviewId);
         const claims = await this.service.claimDrafts(reviewId, { senderSessionId: this.owner() });
         if (!claims.length) return { submitted: 0, delivered: false };
@@ -62,17 +97,17 @@ export class Delivery extends EventEmitter {
         return { submitted: claims.length, ...result };
     }
 
-    async repoLearning(repoRoot) {
+    async repoLearning(repoRoot: string) {
         try {
             return await this.learning(repoRoot);
         } catch (err) {
-            this.log(`self-review: could not read the learning setting, using off: ${err?.message ?? err}`, "warning");
+            this.log(`self-review: could not read the learning setting, using off: ${errorMessage(err)}`, "warning");
             return "off";
         }
     }
 
     // Builds and sends the prompt for claimed messages: one comment uses the single-comment prompt, more use the batch prompt.
-    async sendClaimed(reviewId, claims, instanceId) {
+    async sendClaimed(reviewId: string, claims: DraftClaim[], instanceId: string): Promise<DeliveryResult> {
         let sessionMessageId;
         try {
             const threadIds = [...new Set(claims.map((c) => c.threadId))];
@@ -83,6 +118,7 @@ export class Delivery extends EventEmitter {
             if (claims.length === 1) {
                 const ctx = contexts[0];
                 const message = ctx.thread.messages.find((m) => m.messageId === claims[0].messageId);
+                if (!message) throw new Error(`Claimed message ${claims[0].messageId} not found.`);
                 built = buildCommentPrompt({ ...ctx, message, instanceId, learning });
             } else {
                 const ids = new Set(claims.map((c) => c.messageId));
@@ -96,7 +132,7 @@ export class Delivery extends EventEmitter {
             }
             sessionMessageId = await this.send({ prompt: built.prompt, displayPrompt: built.displayPrompt, mode: "enqueue" });
         } catch (err) {
-            const error = String(err?.message ?? err);
+            const error = errorMessage(err);
             this.log(`self-review: failed to deliver ${claims.map((c) => c.messageId).join(", ")}: ${error}`, "warning");
             for (const c of claims) await this.service.setDelivery(reviewId, c.messageId, { state: "failed", error }, c);
             return { delivered: false, error };
@@ -128,27 +164,27 @@ export class Delivery extends EventEmitter {
     }
 
     // The returned promise reports errors to the caller; a failed event must not block later events.
-    enqueueLifecycle(callback) {
+    enqueueLifecycle(callback: () => Promise<void>): Promise<void> {
         const pending = this.lifecycle.then(callback);
         this.lifecycle = pending.catch(() => {});
         return pending;
     }
 
-    processTarget(target, sessionMessageId, finished = false) {
+    processTarget(target: DeliveryTarget, sessionMessageId?: string, finished = false) {
         return this.service.processDelivery(target.reviewId, target.messageId, {
             attemptId: target.attemptId, sessionMessageId, sessionId: this.owner(), finished,
         });
     }
 
-    onUserMessage(event) {
+    onUserMessage(event: UserMessageEvent) {
         return this.enqueueLifecycle(() => this.handleUserMessage(event));
     }
 
-    async handleUserMessage(event) {
+    async handleUserMessage(event: UserMessageEvent) {
         const data = event?.data ?? {};
         let targets = data.messageId ? this.bySessionMessageId.get(data.messageId) : undefined;
         if (!targets) {
-            const seen = new Set();
+            const seen = new Set<string>();
             targets = [];
             for (const text of [data.transformedContent, data.content]) {
                 for (const line of String(text ?? "").split(/\r?\n/)) {
@@ -170,12 +206,13 @@ export class Delivery extends EventEmitter {
         if (!applied) {
             if (data.messageId) {
                 this.seenSessionMessageIds.set(data.messageId, { finished: false });
-                if (this.seenSessionMessageIds.size > 200) this.seenSessionMessageIds.delete(this.seenSessionMessageIds.keys().next().value);
+                const oldest = this.seenSessionMessageIds.keys().next();
+                if (this.seenSessionMessageIds.size > 200 && !oldest.done) this.seenSessionMessageIds.delete(oldest.value);
             }
             return;
         }
     }
-    setBusy(busy) {
+    setBusy(busy: boolean) {
         if (this.busy === busy) return;
         this.busy = busy;
         this.emit("session", { busy });
@@ -194,7 +231,7 @@ export class Delivery extends EventEmitter {
                 await this.service.settleProcessing(reviewId, { sessionId: this.owner() });
                 await this.service.recoverAbandonedClaims(reviewId);
             } catch (err) {
-                this.log(`self-review: settle failed for ${reviewId}: ${err?.message ?? err}`, "warning");
+                this.log(`self-review: settle failed for ${reviewId}: ${errorMessage(err)}`, "warning");
             }
         }
     }

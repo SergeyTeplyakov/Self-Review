@@ -3,12 +3,13 @@ import { copyFileSync, cpSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const extensionRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const repositoryRoot = path.resolve(extensionRoot, "..", "..");
+const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../../");
+const extensionRoot = path.join(repositoryRoot, "extensions", "self-review");
 const distributionRoot = path.join(extensionRoot, "dist");
+const toolsDistributionRoot = path.join(repositoryRoot, ".build", "extensions", "self-review");
 const compiler = path.join(repositoryRoot, "node_modules", "typescript", "bin", "tsc");
 
-function clearDirectory(directory) {
+function clearDirectory(directory: string) {
     mkdirSync(directory, { recursive: true });
     for (const entry of readdirSync(directory)) {
         rmSync(path.join(directory, entry), { recursive: true, force: true });
@@ -33,11 +34,12 @@ for (const project of ["tsconfig.node.build.json", "tsconfig.web.build.json"]) {
 }
 
 mkdirSync(webOutput, { recursive: true });
-const legacyLibrary = path.join(extensionRoot, "src", "lib");
-for (const file of readdirSync(legacyLibrary)) {
-    if (file.endsWith(".mjs")) copyFileSync(path.join(legacyLibrary, file), path.join(distributionRoot, "lib", file));
-}
-for (const asset of ["app.js", "index.html", "styles.css"]) {
+for (const asset of ["index.html", "styles.css"]) {
     copyFileSync(path.join(extensionRoot, "web", asset), path.join(webOutput, asset));
 }
 cpSync(path.join(extensionRoot, "bundled-skills"), path.join(distributionRoot, "bundled-skills"), { recursive: true });
+
+mkdirSync(toolsDistributionRoot, { recursive: true });
+rmSync(path.join(toolsDistributionRoot, "dist"), { recursive: true, force: true });
+copyFileSync(path.join(extensionRoot, "extension.mjs"), path.join(toolsDistributionRoot, "extension.mjs"));
+cpSync(distributionRoot, path.join(toolsDistributionRoot, "dist"), { recursive: true });
