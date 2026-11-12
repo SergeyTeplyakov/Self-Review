@@ -6,30 +6,28 @@ import { createHash, randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { settingsDocument } from "../web/contracts.mjs";
-
+const errorCode = (error) => error && typeof error === "object" && "code" in error ? error.code : undefined;
 const REVIEW_ID = /^[a-z0-9][a-z0-9._-]{0,100}$/;
 const REVISION_ID = /^r[0-9]{1,6}$/;
 const RETRYABLE = new Set(["EPERM", "EBUSY", "EACCES"]);
-
 export function defaultDataRoot() {
     return path.join(os.homedir(), ".copilot", "extension-data", "self-review");
 }
-
 // Where releases named Manual Review Canvas kept their data.
 export function legacyDataRoot() {
     return path.join(os.homedir(), ".copilot", "extension-data", "manual-review");
 }
-
 async function exists(p) {
     try {
         await stat(p);
         return true;
-    } catch (err) {
-        if (err?.code === "ENOENT") return false;
+    }
+    catch (err) {
+        if (errorCode(err) === "ENOENT")
+            return false;
         throw err;
     }
 }
-
 /**
  * Copies data from the pre-rename location once, before the store is first used. The legacy
  * directory is left intact so a still-running older provider keeps working; its later writes are
@@ -37,7 +35,8 @@ async function exists(p) {
  * @returns {Promise<boolean>} whether data was copied
  */
 export async function migrateLegacyDataRoot(root = defaultDataRoot(), legacyRoot = legacyDataRoot()) {
-    if ((await exists(root)) || !(await exists(legacyRoot))) return false;
+    if ((await exists(root)) || !(await exists(legacyRoot)))
+        return false;
     const tmp = `${root}.${process.pid}.${randomUUID()}.tmp`;
     try {
         await mkdir(path.dirname(root), { recursive: true });
@@ -50,80 +49,80 @@ export async function migrateLegacyDataRoot(root = defaultDataRoot(), legacyRoot
         });
         await withRetry(() => rename(tmp, root));
         return true;
-    } catch (err) {
-        await rm(tmp, { recursive: true, force: true }).catch(() => {});
+    }
+    catch (err) {
+        await rm(tmp, { recursive: true, force: true }).catch(() => { });
         // Another provider finished the copy first.
-        if (await exists(root)) return false;
+        if (await exists(root))
+            return false;
         throw err;
     }
 }
-
 export function assertReviewId(reviewId) {
-    if (typeof reviewId !== "string" || !REVIEW_ID.test(reviewId)) throw new Error(`Invalid reviewId: ${reviewId}`);
+    if (typeof reviewId !== "string" || !REVIEW_ID.test(reviewId))
+        throw new Error(`Invalid reviewId: ${reviewId}`);
     return reviewId;
 }
-
 export function assertRevisionId(revisionId) {
-    if (typeof revisionId !== "string" || !REVISION_ID.test(revisionId)) throw new Error(`Invalid revisionId: ${revisionId}`);
+    if (typeof revisionId !== "string" || !REVISION_ID.test(revisionId))
+        throw new Error(`Invalid revisionId: ${revisionId}`);
     return revisionId;
 }
-
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 async function withRetry(fn) {
-    for (let attempt = 0; ; attempt++) {
+    for (let attempt = 0;; attempt++) {
         try {
             return await fn();
-        } catch (err) {
-            if (!RETRYABLE.has(err?.code) || attempt >= 6) throw err;
+        }
+        catch (err) {
+            const code = errorCode(err);
+            if (typeof code !== "string" || !RETRYABLE.has(code) || attempt >= 6)
+                throw err;
             await sleep(25 * 2 ** attempt);
         }
     }
 }
-
 async function writeJsonAtomic(file, value) {
     await mkdir(path.dirname(file), { recursive: true });
     const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
     await writeFile(tmp, JSON.stringify(value, null, 2), "utf8");
     try {
         await withRetry(() => rename(tmp, file));
-    } catch (err) {
-        await unlink(tmp).catch(() => {});
+    }
+    catch (err) {
+        await unlink(tmp).catch(() => { });
         throw err;
     }
 }
-
 async function readJson(file) {
     try {
         return JSON.parse(await withRetry(() => readFile(file, "utf8")));
-    } catch (err) {
-        if (err?.code === "ENOENT") return null;
+    }
+    catch (err) {
+        if (errorCode(err) === "ENOENT")
+            return null;
         throw err;
     }
 }
-
 export class Store {
+    root;
+    locks;
     constructor(root = defaultDataRoot()) {
         this.root = root;
         this.locks = new Map();
     }
-
     reviewDir(reviewId) {
         return path.join(this.root, "reviews", assertReviewId(reviewId));
     }
-
     reviewFile(reviewId) {
         return path.join(this.reviewDir(reviewId), "review.json");
     }
-
     snapshotFile(reviewId, revisionId) {
         return path.join(this.reviewDir(reviewId), "snapshots", `${assertRevisionId(revisionId)}.json`);
     }
-
     settingsFile() {
         return path.join(this.root, "settings.json");
     }
-
     // The exclusive file covers the entire transaction across provider processes.
     // Never steal an old lock: a slow or suspended owner may still be writing.
     async fileLock(key, fn) {
@@ -135,8 +134,10 @@ export class Store {
         while (!handle) {
             try {
                 handle = await open(file, "wx", 0o600);
-            } catch (err) {
-                if (err?.code !== "EEXIST") throw err;
+            }
+            catch (err) {
+                if (errorCode(err) !== "EEXIST")
+                    throw err;
                 if (Date.now() >= deadline) {
                     throw new Error(`Timed out waiting for store lock ${file}. If a provider crashed, stop all self-review providers before removing this lock.`);
                 }
@@ -146,12 +147,12 @@ export class Store {
         try {
             await handle.writeFile(JSON.stringify({ pid: process.pid, key, createdAt: new Date().toISOString() }));
             return await fn();
-        } finally {
+        }
+        finally {
             await handle.close();
             await withRetry(() => unlink(file));
         }
     }
-
     // Serializes async work per key; the callback always sees the latest committed state.
     async lock(key, fn) {
         const prev = this.locks.get(key) ?? Promise.resolve();
@@ -162,16 +163,16 @@ export class Store {
         await prev;
         try {
             return await this.fileLock(key, fn);
-        } finally {
+        }
+        finally {
             release();
-            if (this.locks.get(key) === chained) this.locks.delete(key);
+            if (this.locks.get(key) === chained)
+                this.locks.delete(key);
         }
     }
-
     async readReview(reviewId) {
-        return readJson(this.reviewFile(reviewId));
+        return await readJson(this.reviewFile(reviewId));
     }
-
     // Read-modify-write under the review lock.
     // mutate(current | null) => { review?, value?, write? = true }
     async updateReview(reviewId, mutate) {
@@ -185,20 +186,16 @@ export class Store {
             return value;
         });
     }
-
     async writeSnapshot(reviewId, revisionId, snapshot) {
         await writeJsonAtomic(this.snapshotFile(reviewId, revisionId), snapshot);
     }
-
     async readSnapshot(reviewId, revisionId) {
-        return readJson(this.snapshotFile(reviewId, revisionId));
+        return await readJson(this.snapshotFile(reviewId, revisionId));
     }
-
     async appendLesson(lesson) {
         await mkdir(this.root, { recursive: true });
         await this.lock("lessons", () => withRetry(() => appendFile(path.join(this.root, "lessons.jsonl"), JSON.stringify(lesson) + "\n", "utf8")));
     }
-
     // lessons.jsonl is append-only; a lesson updated in place (proposed -> saved) is appended again and the last record wins.
     async readLessons() {
         try {
@@ -208,21 +205,22 @@ export class Store {
                 try {
                     const lesson = JSON.parse(line);
                     byId.set(lesson.lessonId ?? line, lesson);
-                } catch {
+                }
+                catch {
                     // A torn or hand-edited line is skipped rather than failing the whole read.
                 }
             }
             return [...byId.values()];
-        } catch (err) {
-            if (err?.code === "ENOENT") return [];
+        }
+        catch (err) {
+            if (errorCode(err) === "ENOENT")
+                return [];
             throw err;
         }
     }
-
     async readSettings() {
         return settingsDocument(await readJson(this.settingsFile()));
     }
-
     // Read-modify-write of the per-user settings file. mutate(settings) edits it in place and may return a value.
     /**
      * @template T
@@ -232,33 +230,34 @@ export class Store {
     async updateSettings(mutate) {
         return this.lock("settings", async () => {
             const settings = await this.readSettings();
-            if (!settings.repos || typeof settings.repos !== "object") settings.repos = {};
+            if (!settings.repos || typeof settings.repos !== "object")
+                settings.repos = {};
             const value = await mutate(settings);
             await writeJsonAtomic(this.settingsFile(), settings);
             return value;
         });
     }
-
     async getInstanceReview(instanceId) {
         return (await this.getInstanceContext(instanceId))?.reviewId ?? null;
     }
-
     async getInstanceContext(instanceId) {
-        const map = (await readJson(path.join(this.root, "instances.json"))) ?? {};
+        const map = await readJson(path.join(this.root, "instances.json")) ?? {};
         const entry = map[instanceId];
-        if (entry == null) return null;
-        if (typeof entry === "string") return { reviewId: assertReviewId(entry), returnReviewId: null };
+        if (entry == null)
+            return null;
+        if (typeof entry === "string")
+            return { reviewId: assertReviewId(entry), returnReviewId: null };
         return {
             reviewId: assertReviewId(entry.reviewId),
             returnReviewId: entry.returnReviewId == null ? null : assertReviewId(entry.returnReviewId),
         };
     }
-
     async setInstanceReview(instanceId, reviewId) {
         await this.lock("instances", async () => {
             const file = path.join(this.root, "instances.json");
-            const map = (await readJson(file)) ?? {};
-            if (map[instanceId] === reviewId) return;
+            const map = await readJson(file) ?? {};
+            if (map[instanceId] === reviewId)
+                return;
             map[instanceId] = reviewId;
             await writeJsonAtomic(file, map);
         });

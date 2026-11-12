@@ -15,26 +15,23 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { chromium } from "playwright-core";
-import { runGit } from "../../extensions/self-review/dist/lib/git.mjs";
-import { Store } from "../../extensions/self-review/dist/lib/store.mjs";
-import { ReviewService } from "../../extensions/self-review/dist/lib/review-service.mjs";
-import { Delivery } from "../../extensions/self-review/dist/lib/delivery.mjs";
-import { startReviewServer } from "../../extensions/self-review/dist/lib/server.mjs";
-import { SettingsService } from "../../extensions/self-review/dist/lib/settings.mjs";
-import { AgentReview } from "../../extensions/self-review/dist/lib/agent-review.mjs";
-import { ReviewSkills } from "../../extensions/self-review/dist/lib/review-skills.mjs";
+import { chromium, type Browser, type Page } from "playwright-core";
+import type { ReviewService as ReviewServiceContract } from "../../extensions/self-review/src/lib/review-service.mjs";
+import {
+    AgentReview, Delivery, ReviewService, ReviewSkills, SettingsService, Store, runGit, startReviewServer,
+} from "../../extensions/self-review/test/modules.mjs";
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
+const REPOSITORY_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+const HERE = path.join(REPOSITORY_ROOT, "docs", "screenshots");
 const WEB_ROOT = path.join(HERE, "..", "..", "extensions", "self-review", "dist", "web");
 const OUT = path.join(HERE, "..", "images");
 const KEEP = process.argv.includes("--keep");
 const WIDTH = 1320;
-const THEMES = ["light", "dark"];
+const THEMES: Array<"light" | "dark"> = ["light", "dark"];
 
 // ---------- Demo repository ----------
 
-const file = (text) => text.replace(/^\n/, "");
+const file = (text: string) => text.replace(/^\n/, "");
 
 const MAIN = {
     "package.json": file(`
@@ -364,7 +361,7 @@ const R3 = {
 `)),
 };
 
-const DESCRIPTION = (clamped) => [
+const DESCRIPTION = (clamped: boolean) => [
     "Transient failures from the orders backend (throttling, deployments, dropped connections) currently fail the request on the first attempt. This adds a retry policy to `HttpClient`.",
     "",
     "### Behavior",
@@ -382,11 +379,11 @@ const DESCRIPTION = (clamped) => [
     "- Non-idempotent requests are retried too; see the open thread on `withRetry`.",
 ].join("\n");
 
-const git = (cwd, ...args) => runGit(cwd, [
+const git = (cwd: string, ...args: string[]) => runGit(cwd, [
     "-c", "user.name=Demo", "-c", "user.email=demo@example.com",
     "-c", "core.autocrlf=false", "-c", "commit.gpgsign=false", ...args]);
 
-async function writeFiles(repo, files) {
+async function writeFiles(repo: string, files: Record<string, string | null>) {
     for (const [rel, text] of Object.entries(files)) {
         const full = path.join(repo, ...rel.split("/"));
         if (text === null) {
@@ -398,7 +395,7 @@ async function writeFiles(repo, files) {
     }
 }
 
-function lineOf(text, needle) {
+function lineOf(text: string, needle: string) {
     const index = text.split("\n").findIndex((l) => l.includes(needle));
     if (index < 0) throw new Error(`Demo anchor not found: ${needle}`);
     return index + 1;
@@ -406,7 +403,7 @@ function lineOf(text, needle) {
 
 // ---------- Seed the review ----------
 
-async function seed(tmp) {
+async function seed(tmp: string) {
     const repo = path.join(tmp, "orders-api");
     const origin = path.join(tmp, "orders-api.git");
     await runGit(tmp, ["init", "-q", "--bare", "-b", "main", origin]);
@@ -423,31 +420,42 @@ async function seed(tmp) {
     await git(repo, "push", "-q", "-u", "origin", "feature/retry-policy");
 
     const store = new Store(path.join(tmp, "data"));
-    const service = new ReviewService({ store });
-    let reviewId;
-    const delivery = new Delivery({ service, send: async () => "demo", reviewIds: () => [reviewId] });
+    const service: ReviewServiceContract = new ReviewService({ store });
+    let reviewId = "";
+    const delivery = new Delivery({
+        service,
+        send: async () => "demo",
+        log: () => {},
+        reviewIds: () => [reviewId],
+    });
     reviewId = await service.ensureReview({ repoPath: repo, base: "main", title: "Retry transient failures in HttpClient" });
 
     // Backdate everything afterwards so the UI shows a plausible timeline instead of "just now".
     const minutesAgo = new Map();
-    const revision = async (minutes) => {
+    const revision = async (minutes: number) => {
         const { currentRevisionId } = await service.getReview(reviewId);
         minutesAgo.set(currentRevisionId, minutes);
     };
-    const comment = async (minutes, input) => {
+    const comment = async (minutes: number, input: Parameters<ReviewServiceContract["createThread"]>[1]) => {
         const { thread, message } = await service.createThread(reviewId, input);
         minutesAgo.set(message.messageId, minutes);
         return { threadId: thread.threadId, messageId: message.messageId };
     };
-    const onLine = (minutes, files, filePath, needle, body) => {
-        const line = lineOf(files[filePath], needle);
+    const onLine = (minutes: number, files: Record<string, string | null>, filePath: string, needle: string, body: string) => {
+        const text = files[filePath];
+        if (text === null || text === undefined) throw new Error(`Demo file is missing: ${filePath}`);
+        const line = lineOf(text, needle);
         return comment(minutes, { kind: "line", path: filePath, side: "new", startLine: line, endLine: line, body });
     };
-    const reply = async (minutes, threadId, input) => {
+    const reply = async (
+        minutes: number,
+        threadId: string,
+        input: Parameters<ReviewServiceContract["addMessage"]>[2],
+    ) => {
         const { message } = await service.addMessage(reviewId, threadId, { author: "agent", ...input });
         minutesAgo.set(message.messageId, minutes);
     };
-    const nextRevision = async (files, minutes) => {
+    const nextRevision = async (files: Record<string, string | null>, minutes: number) => {
         await writeFiles(repo, files);
         await service.refresh(reviewId);
         await revision(minutes);
@@ -500,9 +508,11 @@ async function seed(tmp) {
     delivery.setBusy(true);
 
     await store.updateReview(reviewId, (review) => {
-        const iso = (minutes) => new Date(Date.now() - minutes * 60_000).toISOString();
-        const stamp = (item, id) => {
-            if (minutesAgo.has(id)) item.createdAt = iso(minutesAgo.get(id));
+        if (!review) throw new Error("Demo review disappeared before its timestamps were updated.");
+        const iso = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
+        const stamp = (item: { createdAt: string }, id: string) => {
+            const offset = minutesAgo.get(id);
+            if (offset !== undefined) item.createdAt = iso(offset);
         };
         for (const rev of review.revisions) stamp(rev, rev.revisionId);
         for (const thread of review.threads) {
@@ -516,15 +526,17 @@ async function seed(tmp) {
         return { review };
     });
 
-    const outdated = (await service.getReview(reviewId)).threads.find((t) => t.threadId === jitter.threadId);
-    if (outdated.location?.state !== "outdated") throw new Error("Expected the jitter thread to be outdated after revision 2.");
+    const outdated = (await service.getReview(reviewId)).threads.find((thread) => thread.threadId === jitter.threadId);
+    if (!outdated || outdated.location?.state !== "outdated") {
+        throw new Error("Expected the jitter thread to be outdated after revision 2.");
+    }
 
     return { reviewId, service, delivery, store, threads: { clamp: clamp.threadId, idempotent: idempotent.threadId } };
 }
 
 // ---------- Capture ----------
 
-async function launchBrowser() {
+async function launchBrowser(): Promise<Browser> {
     const channels = [...new Set([process.env.MR_BROWSER_CHANNEL, "msedge", "chrome"].filter(Boolean)), undefined];
     let lastError;
     for (const channel of channels) {
@@ -537,22 +549,27 @@ async function launchBrowser() {
     throw lastError;
 }
 
-async function nav(page, view, filePath) {
+async function nav(page: Page, view: string, filePath?: string) {
     const pathSelector = filePath ? `[data-path="${filePath}"]` : "";
     await page.locator(`#side [data-action="nav"][data-view="${view}"]${pathSelector}`).first().click();
     if (view === "file") {
         await page.locator(`.file-section[data-file="${filePath}"] .diff`).waitFor();
-        await page.waitForFunction(() => ![...document.querySelectorAll(".full-note")].some((n) => n.textContent.startsWith("Loading")));
+        await page.waitForFunction(() => ![...document.querySelectorAll(".full-note")].some((n) => n.textContent?.startsWith("Loading")));
     }
-    await page.evaluate(() => document.querySelector("#main").scrollTo(0, 0));
+    await page.evaluate(() => {
+        const main = document.querySelector("#main");
+        if (!(main instanceof HTMLElement)) throw new Error("Main content pane is missing.");
+        main.scrollTo(0, 0);
+    });
     await page.waitForTimeout(250);
 }
 
 // Sizes the viewport to the content of both panes (up to maxHeight) so the shot has no scrolling
 // and no trailing whitespace. scrollHeight is unusable here: it never drops below the pane height.
-async function fitHeight(page, maxHeight) {
+async function fitHeight(page: Page, maxHeight: number) {
     const needed = await page.evaluate(() => {
         const main = document.querySelector("#main");
+        if (!(main instanceof HTMLElement)) throw new Error("Main content pane is missing.");
         const bottoms = [...main.children].map((el) => el.getBoundingClientRect().bottom + main.scrollTop);
         bottoms.push(...[...document.querySelectorAll("#side .nav-item")].map((el) => el.getBoundingClientRect().bottom));
         return Math.ceil(Math.max(...bottoms) + 16);
@@ -561,13 +578,18 @@ async function fitHeight(page, maxHeight) {
     await page.waitForTimeout(250);
 }
 
-async function capture(browser, url, theme, resetLearning) {
+async function capture(
+    browser: Browser,
+    url: string,
+    theme: "light" | "dark",
+    resetLearning: () => Promise<void>,
+) {
     await resetLearning();
     const context = await browser.newContext({ viewport: { width: WIDTH, height: 900 }, deviceScaleFactor: 2, colorScheme: theme });
     const page = await context.newPage();
     await page.goto(url);
     await page.locator("#side .nav-item").first().waitFor();
-    const shot = async (name, clip) => {
+    const shot = async (name: string, clip?: { x: number; y: number; width: number; height: number }) => {
         const target = path.join(OUT, `${name}-${theme}.png`);
         await page.screenshot({ path: target, clip });
         console.log(`  ${path.relative(process.cwd(), target)}`);
@@ -576,6 +598,7 @@ async function capture(browser, url, theme, resetLearning) {
     // A repository with no learning setting opens with a notice. Choosing Suggest from it dismisses the notice for good.
     await page.locator("#banner:not([hidden])").waitFor();
     const banner = await page.locator("#banner").boundingBox();
+    if (!banner) throw new Error("Learning banner is not visible.");
     await shot("banner", { x: 0, y: 0, width: WIDTH, height: Math.ceil(banner.y + banner.height) });
     await page.locator('#banner [data-action="learning-set"][data-mode="suggest"]').click();
     await page.locator("#banner").waitFor({ state: "hidden" });
@@ -638,6 +661,7 @@ async function capture(browser, url, theme, resetLearning) {
         throw new Error("Skill defaults must remain an explicit opt-in.");
     }
     const skills = await page.locator("#dialog .review-skills-section").boundingBox();
+    if (!skills) throw new Error("Bundled skills section is not visible.");
     await shot("review-skills", { x: Math.max(0, skills.x - 16), y: Math.max(0, skills.y - 16), width: Math.ceil(skills.width + 32), height: Math.ceil(skills.height + 32) });
     await page.locator('#dialog [data-action="dialog-cancel"]').click();
     await page.locator("#dialog .modal").waitFor({ state: "detached" });
@@ -647,6 +671,7 @@ async function capture(browser, url, theme, resetLearning) {
     await page.locator('#top [data-action="configure"]').click();
     await page.locator("#dialog .modal").waitFor();
     const modal = await page.locator("#dialog .modal").boundingBox();
+    if (!modal) throw new Error("Repository settings dialog is not visible.");
     await page.setViewportSize({ width: WIDTH, height: Math.ceil(modal.height + 64) });
     await page.waitForTimeout(250);
     await page.locator('#dialog input[name="delivery"][value="batch"]').check();
@@ -657,7 +682,7 @@ async function capture(browser, url, theme, resetLearning) {
 
     // In batch mode comments wait as drafts until Submit review sends them in one message.
     await nav(page, "file", "test/client.test.ts");
-    const composeOn = async (needle, body) => {
+    const composeOn = async (needle: string, body: string) => {
         await page.locator("tr.row", { hasText: needle }).first().locator("td.ln").nth(1).hover();
         await page.mouse.down();
         await page.mouse.up();
@@ -691,15 +716,15 @@ async function capture(browser, url, theme, resetLearning) {
 }
 
 const tmp = await mkdtemp(path.join(os.tmpdir(), "mr-shots-"));
-let server;
-let browser;
+let server: Awaited<ReturnType<typeof startReviewServer>> | undefined;
+let browser: Browser | undefined;
 try {
     const seeded = await seed(tmp);
     const { service, delivery } = seeded;
     let reviewId = seeded.reviewId;
     const settings = new SettingsService({ store: seeded.store });
     const reviewSkills = new ReviewSkills({ store: seeded.store });
-    const agentReview = new AgentReview({ service, settings, reviewSkills, send: async () => {
+    const agentReview = new AgentReview({ service, settings, reviewSkills, sessionId: () => undefined, send: async () => {
         throw new Error("The screenshot fixture cannot dispatch agent reviews.");
     } });
     // Every theme starts like a first run: the repository has no learning setting yet.
@@ -707,7 +732,7 @@ try {
     server = await startReviewServer({
         instanceId: "screenshots",
         getReviewId: () => reviewId,
-        onReviewChange: (id) => {
+        onReviewChange: (id: string) => {
             reviewId = id;
         },
         service,

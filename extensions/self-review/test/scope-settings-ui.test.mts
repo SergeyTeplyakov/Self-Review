@@ -2,57 +2,175 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
-import { parseUnifiedDiff } from "../dist/lib/diff.mjs";
-import { loadApp as runApp } from "./load-app.mjs";
+import { parseUnifiedDiff } from "./modules.mjs";
+import { loadApp as runApp, MockElement } from "./load-app.mjs";
 
 // Loads the page script into a bare vm context. Elements are created on demand and remembered per selector,
 // so a test can render one piece of the page and read its markup back.
-async function loadApp(globals = {}) {
-    const nodes = new Map();
-    const focused = [];
-    const node = (selector) => {
-        if (!nodes.has(selector)) nodes.set(selector, { innerHTML: "", textContent: "", className: "", hidden: false, scrollTop: 0, focus: () => focused.push(selector) });
-        return nodes.get(selector);
+interface MockNode {
+    innerHTML: string;
+    textContent: string;
+    className: string;
+    hidden: boolean;
+    inert?: boolean;
+    scrollTop: number;
+    focus: () => number | void;
+    tagName?: string;
+    dataset?: Record<string, string>;
+    closest?: (selector: string) => MockNode | null;
+    contains?: (node: MockNode | null) => boolean;
+    classList?: { toggle: (name: string, force?: boolean) => boolean };
+}
+
+interface DialogState {
+    type?: string;
+    models?: string;
+    skillNames?: string[];
+    saveSkillDefaults?: boolean;
+    saveDefaults?: boolean;
+    skipDialog?: boolean;
+    intent?: string;
+    focus?: string;
+    saving?: boolean;
+    error?: string;
+    learning?: string;
+    delivery?: string;
+    revisionId?: string;
+    model?: string;
+}
+
+interface RuntimeState {
+    [key: string]: unknown;
+    review: Record<string, unknown> & { reviewId: string; scope?: string };
+    dialog: DialogState | null;
+    settings: Record<string, unknown> & { learning: string; delivery: string; configured: boolean; repoName?: string } | null | undefined;
+    skillOverrides: Map<string, Set<string>>;
+    open: Set<string>;
+    focusedComposer: string | null;
+    approving: Set<string>;
+    agentReviewAvailable: boolean;
+    agentReviewSettingsAvailable: boolean;
+    reviewSkillsAvailable: boolean;
+    agentReviewSettings: { models: string[]; focus: string; intent?: string; skipDialog: boolean } | null;
+    agentReviewSettingsError?: string;
+    agentReviewSuggestedModels?: string[];
+    busy?: boolean | null;
+    startingReview?: boolean;
+    switching?: boolean;
+    submitting?: boolean;
+    snapshot?: { revisionId?: string; files?: unknown[] };
+    view?: { type?: string };
+}
+
+type MockFetch = (url: string, options?: { method?: string; body?: string }) => Promise<unknown>;
+type CapturedPost = [string, ...unknown[]];
+type MockFocusable = { focus?: MockNode["focus"]; checked?: boolean };
+
+interface LoadedApp {
+    document: {
+        addEventListener: () => void;
+        querySelector: (selector: string) => MockNode;
+        querySelectorAll: (selector: string) => MockFocusable[];
+        activeElement: MockFocusable | null;
     };
-    const storage = () => {
-        const items = new Map();
-        return { items, getItem: (key) => items.get(key) ?? null, setItem: (key, value) => items.set(key, String(value)), removeItem: (key) => items.delete(key) };
+    sessionStorage: ReturnType<typeof mockStorage>;
+    focused: string[];
+    node: (selector: string) => MockNode;
+    state: RuntimeState;
+    run: {
+        (code: "onClick" | "onInput" | "onChange" | "onKeyDown" | "trapTab"): (event: unknown) => unknown;
+        <T = string>(code: string): T;
     };
-    const document = { addEventListener() {}, querySelector: node, querySelectorAll: () => [], activeElement: null };
-    const sessionStorage = storage();
+    read: <T = unknown,>(expression: string) => T;
+}
+
+function mockStorage() {
+    const items = new Map<string, string>();
+    return {
+        items,
+        getItem: (key: string) => items.get(key) ?? null,
+        setItem: (key: string, value: string) => items.set(key, String(value)),
+        removeItem: (key: string) => items.delete(key),
+    };
+}
+
+async function loadApp(globals: Record<string, unknown> & { fetch?: MockFetch } = {}): Promise<LoadedApp> {
+    const nodes = new Map<string, MockNode>();
+    const focused: string[] = [];
+    const node = (selector: string): MockNode => {
+        if (!nodes.has(selector)) {
+            const element = Object.assign(new MockElement(), {
+                innerHTML: "", textContent: "", className: "", hidden: false, inert: false, scrollTop: 0,
+                focus: () => focused.push(selector),
+            });
+            nodes.set(selector, element);
+        }
+        const found = nodes.get(selector);
+        if (!found) throw new Error(`Missing mock node: ${selector}`);
+        return found;
+    };
+    const document = { addEventListener() {}, querySelector: node, querySelectorAll: (_selector: string) => [] as MockFocusable[], activeElement: null as MockFocusable | null };
+    const sessionStorage = mockStorage();
     const context = vm.createContext({
-        URLSearchParams, location: { search: "" }, document, localStorage: storage(), sessionStorage,
-        setInterval() {}, setTimeout: () => 0, clearTimeout() {}, ...globals,
+        URLSearchParams, location: { search: "" }, document, localStorage: mockStorage(), sessionStorage,
+        window: { setTimeout: () => 0 }, setInterval() {}, setTimeout: () => 0, clearTimeout() {}, ...globals,
     });
     await runApp(context);
     return {
         document, sessionStorage, focused, node,
-        state: vm.runInContext("state", context),
-        run: (code) => vm.runInContext(code, context),
-        read: (expression) => JSON.parse(vm.runInContext(`JSON.stringify(${expression})`, context)),
+        state: vm.runInContext("state", context) as RuntimeState,
+            run: Object.assign((code: string) => vm.runInContext(code, context) as unknown, {}) as LoadedApp["run"],
+        read: <T = unknown,>(expression: string) => JSON.parse(vm.runInContext(`JSON.stringify(${expression})`, context)) as T,
     };
 }
 
-const reviewFixture = (overrides = {}) => ({
-    reviewId: "r", title: "Feature work", base: "main", branch: "feature", scope: "all", currentRevisionId: "r1",
+const reviewFixture = (overrides: Record<string, unknown> = {}) => ({
+    reviewId: "r", title: "Feature work", repoRoot: "C:\\repo", base: "main", branch: "feature", scope: "all", currentRevisionId: "r1",
     revisions: [{ revisionId: "r1", files: 2, additions: 3, deletions: 1, createdAt: "2026-01-01T00:00:00Z" }],
     git: { branch: "feature", headCommit: "abc", baseCommit: "def", upstream: { name: "origin/feature", ahead: 1, behind: 2 }, uncommittedFiles: 3 },
     threads: [], lessons: [],
     ...overrides,
 });
-const settingsFixture = (overrides = {}) => ({ repoName: "repo", learning: "off", delivery: "immediate", configured: false, dismissed: false, ...overrides });
-const jsonResponse = (data, status = 200) => ({ ok: status < 400, status, statusText: status < 400 ? "OK" : "Error", json: async () => data });
-const clicker = (app) => (action, dataset = {}) => {
-    const target = { tagName: "BUTTON", dataset: { action, ...dataset } };
+const settingsFixture = (overrides: Record<string, unknown> = {}) => ({ repoName: "repo", learning: "off", delivery: "immediate", configured: false, dismissed: false, ...overrides });
+const jsonResponse = (data: unknown, status = 200) => ({ ok: status < 400, status, statusText: status < 400 ? "OK" : "Error", json: async () => data });
+const clicker = (app: LoadedApp) => (action: string, dataset: Record<string, string> = {}) => {
+    const target = Object.assign(new MockElement("BUTTON"), { dataset: { action, ...dataset } });
     target.closest = () => target;
     return app.run("onClick")({ target });
 };
 
-const settle = () => new Promise((resolve) => setImmediate(resolve));
-const skillsApp = async (catalog, { fail = () => false, defaults } = {}) => {
-    const posts = [];
-    const app = await loadApp({ fetch: async (url, options) => {
-        if (options?.method === "POST") { posts.push([url, JSON.parse(options.body)]); return jsonResponse(url.includes("review-skills") ? catalog : JSON.parse(options.body).defaults ?? {}); }
+function required<T>(value: T | null | undefined): T {
+    assert.ok(value);
+    return value;
+}
+
+const dialog = (app: LoadedApp): DialogState => required(app.state.dialog);
+
+function requestBody(options: { method?: string; body?: string } | undefined): Record<string, unknown> {
+    const body: unknown = JSON.parse(options?.body ?? "{}");
+    assert.ok(typeof body === "object" && body !== null && !Array.isArray(body));
+    return body as Record<string, unknown>;
+}
+
+function capturedBody(posts: CapturedPost[], index = -1): Record<string, unknown> {
+    const post = required(posts.at(index));
+    const body = post.at(-1);
+    assert.ok(typeof body === "object" && body !== null && !Array.isArray(body));
+    return body as Record<string, unknown>;
+}
+
+const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
+const skillsApp = async (
+    catalog: unknown,
+    { fail = () => false, defaults }: { fail?: () => boolean; defaults?: RuntimeState["agentReviewSettings"] } = {},
+) => {
+    const posts: Array<[string, unknown]> = [];
+    const app = await loadApp({ fetch: async (url: string, options?: { method?: string; body?: string }) => {
+        if (options?.method === "POST") {
+            const body: unknown = JSON.parse(options.body ?? "{}");
+            posts.push([url, body]);
+            return jsonResponse(url.includes("review-skills") ? catalog : typeof body === "object" && body !== null && "defaults" in body ? body.defaults : {});
+        }
         if (fail()) throw new Error("Host discovery failed");
         return jsonResponse(catalog);
     } });
@@ -100,7 +218,7 @@ test("Agent review settings has a heading, General and Review skills tabs, no Ru
     assert.match(html, /Apache-2.0/);
     assert.doesNotMatch(html, /Refresh from host|Agent Finder|Install|review-skills-refresh/);
     assert.deepEqual(app.read("state.dialog.skillNames"), NAMES);
-    assert.equal(app.state.dialog.models, "my-reviewer", "switching tabs keeps unsaved General choices");
+    assert.equal(dialog(app).models, "my-reviewer", "switching tabs keeps unsaved General choices");
     assert.equal(posts.length, 0, "opening settings never saves or starts work");
 });
 
@@ -115,7 +233,7 @@ test("bundled skill loading failures keep unsaved choices and can be retried", a
     await click("review-skills-refresh");
     assert.doesNotMatch(app.node("#dialog").innerHTML, /Host discovery failed|review-skills-refresh/);
     assert.deepEqual(app.read("state.dialog.skillNames"), ["ponytail-review"], "saved skill defaults preselect");
-    assert.equal(app.state.dialog.models, "my-reviewer");
+    assert.equal(dialog(app).models, "my-reviewer");
     assert.equal(posts.length, 0);
 });
 
@@ -124,7 +242,7 @@ test("skill defaults require explicit opt-in; Save defaults never starts a revie
     const { app, posts, click } = await skillsApp(bundledCatalog(), { defaults });
     await click("agent-review-configure");
     await settle();
-    assert.equal(app.state.dialog.saveSkillDefaults, false);
+    assert.equal(dialog(app).saveSkillDefaults, false);
     await app.run("onChange")({ target: { name: "review-skill", value: "code-simplification", checked: false } });
     await app.run("onChange")({ target: { name: "review-save-defaults", checked: false } });
     assert.match(app.node("#dialog").innerHTML, /data-action="agent-review-save-defaults" disabled/, "nothing to save without an opt-in");
@@ -136,8 +254,8 @@ test("skill defaults require explicit opt-in; Save defaults never starts a revie
     assert.match(app.node("#toast").textContent, /No review was started/);
     await click("agent-review");
     assert.equal(posts[1][0], "/api/agent-reviews");
-    assert.deepEqual(posts[1][1].skillNames, ["code-review-and-quality", "ponytail-review"]);
-    assert.equal(posts[1][1].useDefaults, true);
+    assert.deepEqual(capturedBody(posts, 1).skillNames, ["code-review-and-quality", "ponytail-review"]);
+    assert.equal(capturedBody(posts, 1).useDefaults, true);
 });
 
 test("Apply for this review stores a per-review skill choice on a fresh profile without saving defaults or starting a review", async () => {
@@ -151,14 +269,14 @@ test("Apply for this review stores a per-review skill choice on a fresh profile 
     await click("agent-review-apply-skills");
     assert.equal(posts.length, 0, "applying never saves defaults or starts a review");
     assert.equal(app.state.dialog, null);
-    assert.deepEqual([...app.state.skillOverrides.get("r")], ["code-review-and-quality", "ponytail-review"]);
+    assert.deepEqual([...required(app.state.skillOverrides.get("r"))], ["code-review-and-quality", "ponytail-review"]);
     assert.match(app.node("#toast").textContent, /this review only.*no review was started/i);
     await click("agent-review");
     await settle();
     assert.deepEqual(app.read("state.dialog.skillNames"), ["code-review-and-quality", "ponytail-review"], "the run dialog reuses the applied choice");
     await click("agent-review-start");
     assert.deepEqual(posts.map(([url]) => url), ["/api/agent-reviews"]);
-    assert.deepEqual(posts[0][1].skillNames, ["code-review-and-quality", "ponytail-review"]);
+    assert.deepEqual(capturedBody(posts, 0).skillNames, ["code-review-and-quality", "ponytail-review"]);
 });
 
 test("Run review sends this review's skill opt-outs without saving skill defaults", async () => {
@@ -171,9 +289,9 @@ test("Run review sends this review's skill opt-outs without saving skill default
     await app.run("onChange")({ target: { name: "review-skill", value: "ponytail-review", checked: true } });
     await click("agent-review-start");
     assert.deepEqual(posts.map(([url]) => url), ["/api/agent-reviews"]);
-    assert.deepEqual(posts[0][1].skillNames, ["ponytail-review"]);
-    assert.deepEqual(posts[0][1].models, ["my-reviewer"]);
-    assert.deepEqual([...app.state.skillOverrides.get("r")], ["ponytail-review"]);
+    assert.deepEqual(capturedBody(posts, 0).skillNames, ["ponytail-review"]);
+    assert.deepEqual(capturedBody(posts, 0).models, ["my-reviewer"]);
+    assert.deepEqual([...required(app.state.skillOverrides.get("r"))], ["ponytail-review"]);
 });
 
 test("the page provides every container the scope and learning controls render into", async () => {
@@ -191,7 +309,7 @@ test("agent review is opt-in and its dialog collects models, focus, and guidance
     assert.match(app.node("#top").innerHTML, /data-action="agent-review"/);
     const click = clicker(app);
     await click("agent-review");
-    const d = app.state.dialog;
+    const d = required(app.state.dialog);
     assert.equal(d.type, "agent-review");
     assert.equal(d.models, "", "no paid model is implicitly selected");
     assert.equal(d.intent, "");
@@ -215,26 +333,26 @@ test("agent review is opt-in and its dialog collects models, focus, and guidance
 });
 
 test("built-in reviewer suggestions prefill only without saved or previous choices and never skip the dialog", async () => {
-    const posts = [];
-    const app = await loadApp({ fetch: async (url) => { posts.push(url); return jsonResponse({}); } });
+    const posts: string[] = [];
+    const app = await loadApp({ fetch: async (url: string) => { posts.push(url); return jsonResponse({}); } });
     app.state.review = reviewFixture();
     app.state.agentReviewAvailable = true;
     app.state.agentReviewSuggestedModels = ["gpt-6-astra", "gpt-6.1-sol", "copilot-fusion"];
     const click = clicker(app);
     await click("agent-review");
-    assert.equal(app.state.dialog.models, "gpt-6-astra, gpt-6.1-sol, copilot-fusion");
-    assert.equal(app.state.dialog.saveDefaults, false, "suggestions are not saved choices");
-    assert.equal(app.state.dialog.skipDialog, false);
+    assert.equal(dialog(app).models, "gpt-6-astra, gpt-6.1-sol, copilot-fusion");
+    assert.equal(dialog(app).saveDefaults, false, "suggestions are not saved choices");
+    assert.equal(dialog(app).skipDialog, false);
     assert.match(app.node("#dialog").innerHTML, /copilot-fusion to run Copilot Fusion in a child session/);
     assert.equal(posts.length, 0, "suggestions never start a review");
     await click("dialog-cancel");
     app.state.review = reviewFixture({ agentReviews: [{ runId: "ar-last", state: "completed", focus: "simplify", models: ["model-last"], results: [] }] });
     await click("agent-review");
-    assert.equal(app.state.dialog.models, "model-last", "the previous run wins over suggestions");
+    assert.equal(dialog(app).models, "model-last", "the previous run wins over suggestions");
     await click("dialog-cancel");
     app.state.agentReviewSettings = { models: ["model-saved"], focus: "both", intent: "", skipDialog: false };
     await click("agent-review");
-    assert.equal(app.state.dialog.models, "model-saved", "saved defaults win over the previous run");
+    assert.equal(dialog(app).models, "model-saved", "saved defaults win over the previous run");
     await click("dialog-cancel");
     app.state.review = reviewFixture({ agentReviews: [{ runId: "ar-fusion", state: "running", focus: "both", revisionId: "r1", models: ["model-a", "copilot-fusion"], results: [] }] });
     const html = app.run("agentReviewsHtml()");
@@ -245,7 +363,7 @@ test("built-in reviewer suggestions prefill only without saved or previous choic
 
 test("the prominent review action and agent-comment counts include findings, not human threads or replies", async () => {
     const app = await loadApp();
-    const thread = (id, status, revisionId) => ({
+    const thread = (id: string, status: string, revisionId: string) => ({
         threadId: id, kind: "overview", status,
         agentReview: { runId: "ar-one", model: "model-a", revisionId, assessment: "unverified" },
         messages: [{ messageId: id, author: "agent", body: "Finding", createdAt: "2026-01-01" },
@@ -271,7 +389,7 @@ test("the prominent review action and agent-comment counts include findings, not
     assert.match(app.run("agentCommentsView()"), /1 active, 1 closed or resolved; 1 from older revisions/);
     assert.doesNotMatch(app.run("agentCommentsView()"), /Reply to human feedback/);
     await clicker(app)("nav", { view: "agent-comments" });
-    assert.equal(app.state.view.type, "agent-comments");
+    assert.equal(required(app.state.view).type, "agent-comments");
     assert.match(app.node("#main").innerHTML, /<h2>Agent reviews<\/h2>.*Agent comments \(<span aria-live="polite">2<\/span>\)/);
     app.state.review = reviewFixture({ agentReviews: [{ state: "running" }] });
     app.run("renderTop()");
@@ -280,12 +398,12 @@ test("the prominent review action and agent-comment counts include findings, not
 });
 
 test("saved user choices prefill configuration and save-only never starts a review", async () => {
-    const posts = [];
+    const posts: CapturedPost[] = [];
     const defaults = { models: ["model-a"], focus: "both", intent: "Check contracts.", skipDialog: true };
     const app = await loadApp({
-        fetch: async (url, opts) => {
-            posts.push([url, JSON.parse(opts.body)]);
-            return jsonResponse(JSON.parse(opts.body).defaults);
+        fetch: async (url: string, opts?: { method?: string; body?: string }) => {
+            posts.push([url, requestBody(opts)]);
+            return jsonResponse(requestBody(opts).defaults);
         },
     });
     app.run("loadState = async () => {}");
@@ -294,25 +412,25 @@ test("saved user choices prefill configuration and save-only never starts a revi
     app.state.agentReviewSettingsAvailable = true;
     app.state.agentReviewSettings = defaults;
     await clicker(app)("agent-review-configure");
-    assert.equal(app.state.dialog.models, "model-a");
-    assert.equal(app.state.dialog.intent, "Check contracts.");
-    assert.equal(app.state.dialog.skipDialog, true);
+    assert.equal(dialog(app).models, "model-a");
+    assert.equal(dialog(app).intent, "Check contracts.");
+    assert.equal(dialog(app).skipDialog, true);
     assert.match(app.node("#dialog").innerHTML, /User defaults for all repositories/);
     await app.run("onChange")({ target: { name: "review-skip-dialog", checked: false } });
     await clicker(app)("agent-review-save-defaults");
     assert.deepEqual(posts, [["/api/agent-review-settings", { defaults: { ...defaults, skipDialog: false } }]]);
     assert.equal(app.state.dialog, null);
-    assert.equal(app.state.agentReviewSettings.skipDialog, false);
+    assert.equal(required(app.state.agentReviewSettings).skipDialog, false);
     await clicker(app)("agent-review");
-    assert.equal(app.state.dialog.type, "agent-review", "disabling one-click brings back the dialog");
+    assert.equal(dialog(app).type, "agent-review", "disabling one-click brings back the dialog");
     assert.equal(posts.length, 1, "opening configuration never launches work");
 });
 
 test("one-click run skips the dialog, uses the current revision, and guards repeated clicks", async () => {
-    let finish;
-    const posts = [];
-    const app = await loadApp({ fetch: async (url, opts) => {
-        posts.push([url, JSON.parse(opts.body)]);
+    let finish: (() => void) | undefined;
+    const posts: CapturedPost[] = [];
+    const app = await loadApp({ fetch: async (url: string, opts?: { method?: string; body?: string }) => {
+        posts.push([url, requestBody(opts)]);
         return new Promise((resolve) => { finish = () => resolve(jsonResponse({ state: "queued" })); });
     } });
     app.run("loadState = async () => {}");
@@ -324,7 +442,7 @@ test("one-click run skips the dialog, uses the current revision, and guards repe
     assert.equal(app.state.dialog, null);
     assert.equal(app.state.startingReview, true);
     assert.deepEqual(posts, [["/api/agent-reviews", { useDefaults: true, oneClick: true, revisionId: "r1" }]]);
-    finish();
+    required(finish)();
     await first;
     assert.equal(app.state.startingReview, false);
 });
@@ -337,7 +455,7 @@ test("one-click run reloads defaults and requires the same scope and revision", 
     app.state.agentReviewSettings = { models: ["stale-model"], focus: "both", skipDialog: true };
     await clicker(app)("agent-review");
     assert.equal(app.state.dialog?.type, "agent-review");
-    assert.equal(app.state.dialog.models, "updated-model");
+    assert.equal(dialog(app).models, "updated-model");
     assert.equal(app.state.startingReview, false);
 
     app.state.dialog = null;
@@ -362,10 +480,10 @@ test("saving defaults during a scope or revision change does not start an unconf
         { reviewId: "other-scope", currentRevisionId: "other-r1" },
         { reviewId: "r", currentRevisionId: "r2" },
     ]) {
-        let app;
-        const posts = [];
-        app = await loadApp({ fetch: async (url, opts) => {
-            posts.push([url, JSON.parse(opts.body)]);
+        let app: LoadedApp;
+        const posts: CapturedPost[] = [];
+        app = await loadApp({ fetch: async (url: string, opts?: { method?: string; body?: string }) => {
+            posts.push([url, requestBody(opts)]);
             app.state.review = reviewFixture(change);
             return jsonResponse({ models: ["model-a"], focus: "both", intent: "", skipDialog: true });
         } });
@@ -374,12 +492,12 @@ test("saving defaults during a scope or revision change does not start an unconf
         app.state.agentReviewAvailable = true;
         app.state.agentReviewSettingsAvailable = true;
         app.run("openAgentReview()");
-        app.state.dialog.models = "model-a";
-        app.state.dialog.saveDefaults = true;
+        dialog(app).models = "model-a";
+        dialog(app).saveDefaults = true;
         await app.run("startAgentReview()");
         assert.deepEqual(posts.map(([url]) => url), ["/api/agent-review-settings"]);
-        assert.match(app.state.dialog.error, /scope changed or revision is stale/);
-        assert.equal(app.state.dialog.saving, false);
+        assert.match(required(dialog(app).error), /scope changed or revision is stale/);
+        assert.equal(dialog(app).saving, false);
     }
 });
 
@@ -388,9 +506,9 @@ test("saving user defaults remains available after the review scope or revision 
         { reviewId: "other-scope", currentRevisionId: "other-r1" },
         { reviewId: "r", currentRevisionId: "r2" },
     ]) {
-        const posts = [];
-        const app = await loadApp({ fetch: async (url, opts) => {
-            posts.push([url, JSON.parse(opts.body)]);
+        const posts: CapturedPost[] = [];
+        const app = await loadApp({ fetch: async (url: string, opts?: { method?: string; body?: string }) => {
+            posts.push([url, requestBody(opts)]);
             return jsonResponse({ models: ["model-a"], focus: "both", intent: "", skipDialog: false });
         } });
         app.run("loadState = async () => {}");
@@ -398,8 +516,8 @@ test("saving user defaults remains available after the review scope or revision 
         app.state.agentReviewAvailable = true;
         app.state.agentReviewSettingsAvailable = true;
         app.run("openAgentReview()");
-        app.state.dialog.models = "model-a";
-        app.state.dialog.saveDefaults = true;
+        dialog(app).models = "model-a";
+        dialog(app).saveDefaults = true;
         app.state.review = reviewFixture(change);
         await app.run("startAgentReview(true)");
         assert.deepEqual(posts, [["/api/agent-review-settings", {
@@ -428,8 +546,8 @@ test("one-click failures surface errors and release the button even if reloading
 });
 
 test("failed settings saves stay visible and never start a review", async () => {
-    const posts = [];
-    const app = await loadApp({ fetch: async (url) => {
+    const posts: string[] = [];
+    const app = await loadApp({ fetch: async (url: string) => {
         posts.push(url);
         return jsonResponse({ error: { message: "Disk is read-only" } }, 500);
     } });
@@ -438,12 +556,12 @@ test("failed settings saves stay visible and never start a review", async () => 
     app.state.agentReviewAvailable = true;
     app.state.agentReviewSettingsAvailable = true;
     app.run("openAgentReview()");
-    app.state.dialog.models = "model-a";
-    app.state.dialog.saveDefaults = true;
+    dialog(app).models = "model-a";
+    dialog(app).saveDefaults = true;
     await app.run("startAgentReview()");
     assert.deepEqual(posts, ["/api/agent-review-settings"]);
     assert.match(app.node("#dialog").innerHTML, /role="alert">Disk is read-only/);
-    assert.equal(app.state.dialog.saving, false);
+    assert.equal(dialog(app).saving, false);
 });
 
 test("an unreadable profile exposes its error instead of silently running different choices", async () => {
@@ -453,24 +571,24 @@ test("an unreadable profile exposes its error instead of silently running differ
     app.state.agentReviewSettingsError = "Could not read agent review defaults: invalid JSON";
     await clicker(app)("agent-review");
     assert.match(app.node("#dialog").innerHTML, /role="alert">Could not read agent review defaults/);
-    assert.equal(app.state.dialog.models, "");
+    assert.equal(dialog(app).models, "");
 });
 
 test("agent review traps keyboard focus including guidance and the optional skill link while queuing", async () => {
     const app = await loadApp();
     app.state.dialog = { type: "agent-review", saving: false };
-    const focus = [];
+    const focus: string[] = [];
     const input = { focus: () => focus.push("models") };
     const guidance = { focus: () => focus.push("guidance") };
     const link = { focus: () => focus.push("skills") };
     const button = { focus: () => focus.push("run") };
-    app.document.querySelectorAll = (selector) => {
+    app.document.querySelectorAll = (selector: string) => {
         assert.match(selector, /#dialog textarea:not\(\[disabled\]\)/);
         assert.match(selector, /#dialog a\[href\]/);
-        return app.state.dialog.saving ? [link] : [input, guidance, link, button];
+        return dialog(app).saving ? [link] : [input, guidance, link, button];
     };
     let prevented = 0;
-    const press = (shiftKey) => app.run("trapTab")({ shiftKey, preventDefault: () => prevented++ });
+    const press = (shiftKey: boolean) => app.run("trapTab")({ shiftKey, preventDefault: () => prevented++ });
     app.document.activeElement = input;
     press(true);
     app.document.activeElement = button;
@@ -479,7 +597,7 @@ test("agent review traps keyboard focus including guidance and the optional skil
     press(false);
     assert.deepEqual(focus, ["run", "models"]);
     assert.equal(prevented, 2);
-    app.state.dialog.saving = true;
+    dialog(app).saving = true;
     app.document.activeElement = link;
     press(false);
     press(true);
@@ -488,11 +606,11 @@ test("agent review traps keyboard focus including guidance and the optional skil
 });
 
 test("agent review start sends selected models and pinned revision and preserves errors in the dialog", async () => {
-    const posts = [];
+    const posts: CapturedPost[] = [];
     const app = await loadApp({
-        fetch: async (url, opts) => {
-            if (opts.method === "POST") {
-                posts.push([url, JSON.parse(opts.body)]);
+        fetch: async (url: string, opts?: { method?: string; body?: string }) => {
+            if (opts?.method === "POST") {
+                posts.push([url, requestBody(opts)]);
                 return jsonResponse({ error: { message: "Selected model unavailable" } }, 400);
             }
             return jsonResponse({ review: reviewFixture(), agentReviewAvailable: true });
@@ -502,17 +620,17 @@ test("agent review start sends selected models and pinned revision and preserves
     app.state.review = reviewFixture();
     app.state.agentReviewAvailable = true;
     app.run("openAgentReview()");
-    app.state.dialog.models = "model-a, model-b";
-    app.state.dialog.focus = "both";
-    app.state.dialog.intent = "Use Addy's skills if installed.";
+    dialog(app).models = "model-a, model-b";
+    dialog(app).focus = "both";
+    dialog(app).intent = "Use Addy's skills if installed.";
     await app.run("startAgentReview()");
     assert.deepEqual(posts, [["/api/agent-reviews", { models: ["model-a", "model-b"], focus: "both", intent: "Use Addy's skills if installed.", revisionId: "r1" }]]);
-    assert.equal(app.state.dialog.saving, false);
+    assert.equal(dialog(app).saving, false);
     assert.match(app.node("#dialog").innerHTML, /role="alert">Selected model unavailable/);
     app.state.review.reviewId = "different-scope";
     await app.run("startAgentReview()");
     assert.equal(posts.length, 1, "an old dialog must not launch into the newly selected scope");
-    assert.match(app.state.dialog.error, /scope changed/);
+    assert.match(required(dialog(app).error), /scope changed/);
 });
 
 test("agent review results distinguish findings, assessments, limits, and missing or failed model outcomes", async () => {
@@ -551,7 +669,21 @@ test("agent review results distinguish findings, assessments, limits, and missin
 test("model findings have Approve and Discuss controls; stale, closed, and approved findings cannot be approved again", async () => {
     const app = await loadApp();
     app.state.review = reviewFixture();
-    const thread = {
+    const thread: {
+        threadId: string;
+        kind: string;
+        status: string;
+        messages: Array<{ messageId: string; author: string; body: string; createdAt: string }>;
+        agentReview?: {
+            model: string;
+            category: string;
+            revisionId: string;
+            assessment: string | undefined;
+            severity: string;
+            evidence: { source: string; baseline: string; validation: string };
+            approvalMessageId?: string;
+        };
+    } = {
         threadId: "t-model", kind: "overview", status: "active", messages: [{ messageId: "m", author: "agent", body: "A suggestion", createdAt: new Date().toISOString() }],
         agentReview: {
             model: "<model>", category: "simplification", revisionId: "r1", assessment: "confirmed", severity: "optional",
@@ -559,6 +691,7 @@ test("model findings have Approve and Discuss controls; stale, closed, and appro
         },
     };
     const html = () => app.run(`threadHtml(${JSON.stringify(thread)})`);
+    const finding = required(thread.agentReview);
     assert.match(html(), /&lt;model&gt; \/ simplification/);
     assert.match(html(), /data-action="approve-finding"[^>]*>Approve/);
     assert.match(html(), /data-action="discuss-finding"/);
@@ -569,23 +702,23 @@ test("model findings have Approve and Discuss controls; stale, closed, and appro
     assert.match(html(), /source &lt;unsafe&gt;/);
     assert.doesNotMatch(html(), /<unsafe>/);
     for (const assessment of ["pre-existing", "rejected", "unverified", undefined]) {
-        thread.agentReview.assessment = assessment;
+        finding.assessment = assessment;
         assert.match(html(), /data-action="approve-finding"[^>]*disabled/, `${assessment} is not approvable`);
         assert.match(html(), /data-action="discuss-finding"/);
     }
-    thread.agentReview.assessment = "confirmed";
-    thread.agentReview.severity = "fyi";
+    finding.assessment = "confirmed";
+    finding.severity = "fyi";
     assert.match(html(), /data-action="approve-finding"[^>]*disabled/);
-    thread.agentReview.severity = "optional";
-    thread.agentReview.evidence.baseline = "";
+    finding.severity = "optional";
+    finding.evidence.baseline = "";
     assert.match(html(), /data-action="approve-finding"[^>]*disabled/);
-    thread.agentReview.evidence.baseline = "Compared both sides.";
-    thread.agentReview.revisionId = "r0";
+    finding.evidence.baseline = "Compared both sides.";
+    finding.revisionId = "r0";
     assert.match(html(), /data-action="approve-finding"[^>]*disabled/);
-    thread.agentReview.revisionId = "r1";
-    thread.agentReview.approvalMessageId = "approved";
+    finding.revisionId = "r1";
+    finding.approvalMessageId = "approved";
     assert.match(html(), /disabled>Approved/);
-    delete thread.agentReview.approvalMessageId;
+    delete finding.approvalMessageId;
     thread.status = "closed";
     assert.match(html(), /data-action="approve-finding"[^>]*disabled/);
     delete thread.agentReview;
@@ -593,10 +726,10 @@ test("model findings have Approve and Discuss controls; stale, closed, and appro
 });
 
 test("Discuss only opens a composer; Approve explicitly sends the finding and reports delivery failure", async () => {
-    const posts = [];
+    const posts: CapturedPost[] = [];
     const app = await loadApp({
-        fetch: async (url, opts) => {
-            posts.push([url, JSON.parse(opts.body)]);
+        fetch: async (url: string, opts?: { method?: string; body?: string }) => {
+            posts.push([url, requestBody(opts)]);
             return jsonResponse({ error: "transport unavailable" });
         },
     });
@@ -623,7 +756,7 @@ test("file views show mode changes and side-specific EOF notes without selectabl
     assert.match(html, /File mode: 100644 to 100755/);
     assert.match(html, /class="eof-note".*No newline at end of file \(old side\)/);
     assert.equal((html.match(/<tr class="row /g) ?? []).length, 2);
-    const note = html.match(/<tr class="eof-note">.*?<\/tr>/)[0];
+    const note = required(html.match(/<tr class="eof-note">.*?<\/tr>/))[0];
     assert.doesNotMatch(note, /data-h=|data-i=/, "EOF metadata does not change source row indices or selection");
     file.hunks[0].rows[0].noNewlineAtEnd = false;
     file.hunks[0].rows[1].noNewlineAtEnd = true;
@@ -632,13 +765,44 @@ test("file views show mode changes and side-specific EOF notes without selectabl
     assert.match(app.run(`fileView(${JSON.stringify(file)}, { stacked: true })`), /File mode: 100644 to 100755/);
 });
 
+test("loads nullable values from review state and labels unavailable upstream counts", async () => {
+    let review: unknown = reviewFixture({
+        scope: "pending",
+        base: null,
+        currentRevisionId: null,
+        revisions: [],
+        git: { branch: "feature", headCommit: "abc", baseCommit: null, upstream: { name: "origin/feature", ahead: null, behind: null }, uncommittedFiles: 0 },
+        description: { version: 1, revisionId: null, body: "Draft" },
+    });
+    const app = await loadApp({
+        fetch: async (url: string) => {
+            if (url === "/api/state") return jsonResponse({ review, session: { busy: null }, settings: settingsFixture() });
+            if (url === "/api/snapshot/r1") return jsonResponse({ revisionId: "r1", files: [] });
+            throw new Error(`unexpected request ${url}`);
+        },
+    });
+    app.run("render = () => {}");
+
+    await app.run("loadState()");
+    assert.equal(app.state.review.base, null);
+    assert.equal(app.state.busy, null);
+    assert.deepEqual(app.state.review.description, { version: 1, revisionId: null, body: "Draft" });
+
+    review = reviewFixture({
+        git: { branch: "feature", headCommit: "abc", baseCommit: "def", upstream: { name: "origin/feature", ahead: null, behind: null }, uncommittedFiles: 0 },
+    });
+    await app.run("loadState()");
+    app.run("renderTop()");
+    assert.match(app.node("#top").innerHTML, /↑\? ↓\?/);
+});
+
 test("the top bar shows the review scope, and the learning controls only when the settings are known", async () => {
     const app = await loadApp();
     const top = () => {
         app.run("renderTop()");
         return app.node("#top").innerHTML;
     };
-    const toggle = (html) => html.match(/<span class="seg"[^>]*>.*?<\/span>/)[0];
+    const toggle = (html: string) => required(html.match(/<span class="seg"[^>]*>.*?<\/span>/))[0];
     app.state.settings = settingsFixture({ configured: true });
 
     app.state.review = reviewFixture();
@@ -669,7 +833,7 @@ test("the top bar shows the review scope, and the learning controls only when th
     assert.doesNotMatch(html, />vs<|merge-base|↑|no upstream|\d+ uncommitted|<img/, "pending changes have no base, upstream or uncommitted count to show");
 
     app.state.switching = true;
-    assert.equal(toggle(top()).match(/ disabled/g).length, 2, "both scope buttons are disabled while a switch is in flight");
+    assert.equal(required(toggle(top()).match(/ disabled/g)).length, 2, "both scope buttons are disabled while a switch is in flight");
     app.state.switching = false;
 
     for (const [learning, pill] of [["off", "Off"], ["suggest", "Suggest"], ["auto", "Auto-save"], ["unexpected", "Off"]]) {
@@ -685,7 +849,7 @@ test("the top bar shows the review scope, and the learning controls only when th
 
 test("the first-use banner offers Suggest or Save automatically, never Off, and only while the repository is undecided", async () => {
     const app = await loadApp();
-    const banner = (settings) => {
+    const banner = (settings: RuntimeState["settings"]) => {
         app.state.settings = settings;
         app.run("renderBanner()");
         return app.node("#banner");
@@ -742,7 +906,7 @@ test("the Configure dialog is an accessible modal that preselects the draft mode
 test("the Configure dialog opens on the saved mode, keeps the page inert behind it, traps Tab, and closes on Escape", async () => {
     const app = await loadApp();
     let prevented = 0;
-    const press = (event) => app.run("onKeyDown")({ preventDefault: () => prevented++, ...event });
+    const press = (event: { key?: string; shiftKey?: boolean }) => app.run("onKeyDown")({ preventDefault: () => prevented++, ...event });
     app.state.review = reviewFixture();
 
     app.state.settings = null;
@@ -751,7 +915,7 @@ test("the Configure dialog opens on the saved mode, keeps the page inert behind 
     app.state.settings = settingsFixture({ learning: "auto", configured: true });
 
     app.run("openConfigure()");
-    assert.equal(app.state.dialog.learning, "auto");
+    assert.equal(dialog(app).learning, "auto");
     assert.match(app.node("#dialog").innerHTML, /value="auto" checked/);
     for (const id of ["#top", "#banner", "#layout"]) assert.equal(app.node(id).inert, true, id);
     assert.equal(app.focused.at(-1), '#dialog input[name="learning"]:checked');
@@ -760,13 +924,20 @@ test("the Configure dialog opens on the saved mode, keeps the page inert behind 
     assert.equal(app.state.dialog, opened, "opening twice keeps the first dialog");
 
     await app.run("onChange")({ target: { name: "learning", value: "off" } });
-    assert.equal(app.state.dialog.learning, "off");
+    assert.equal(dialog(app).learning, "off");
     assert.equal(app.state.settings.learning, "auto", "the choice is only a draft until Save");
 
-    const focus = [];
-    const radios = [{ checked: false }, { checked: true, focus: () => focus.push("radio") }, { checked: false }];
-    const buttons = [{ focus: () => focus.push("cancel") }, { focus: () => focus.push("save") }];
-    app.document.querySelectorAll = (selector) => (selector.startsWith("#dialog input") ? radios : buttons);
+    const focus: string[] = [];
+    const radios: MockFocusable[] = [
+        Object.assign(new MockElement("INPUT"), { checked: false, name: "learning" }),
+        Object.assign(new MockElement("INPUT"), { checked: true, name: "learning", focus: () => focus.push("radio") }),
+        Object.assign(new MockElement("INPUT"), { checked: false, name: "learning" }),
+    ];
+    const buttons: MockFocusable[] = [
+        Object.assign(new MockElement("BUTTON"), { focus: () => focus.push("cancel") }),
+        Object.assign(new MockElement("BUTTON"), { focus: () => focus.push("save") }),
+    ];
+    app.document.querySelectorAll = (selector: string) => (selector.startsWith("#dialog input") ? radios : buttons);
     app.document.activeElement = buttons[1];
     press({ key: "Tab", shiftKey: false });
     app.document.activeElement = radios[1];
@@ -784,20 +955,25 @@ test("the Configure dialog opens on the saved mode, keeps the page inert behind 
     assert.equal(app.focused.at(-1), '[data-action="configure"]', "focus returns to the button that opened the dialog");
 
     app.run("openConfigure()");
-    app.state.dialog.saving = true;
+    dialog(app).saving = true;
     press({ key: "Escape" });
     assert.notEqual(app.state.dialog, null, "a save in flight cannot be dismissed");
 });
 
 test("choosing a mode from the banner or the Configure dialog saves it, updates the controls, and reports a failed save", async () => {
-    const posts = [];
-    let settings = settingsFixture();
-    let failure = null;
-    const fetch = async (url, init) => {
-        const body = JSON.parse(init.body);
-        posts.push([init.method, url, body]);
+    const posts: CapturedPost[] = [];
+    let settings: ReturnType<typeof settingsFixture> | undefined = settingsFixture();
+    let failure: string | null = null;
+    const fetch = async (url: string, init?: { method?: string; body?: string }) => {
+        const body = requestBody(init);
+        posts.push([init?.method ?? "", url, body]);
         if (failure) return jsonResponse({ error: { message: failure } }, 500);
-        settings = { ...settings, ...(body.learning ? { learning: body.learning, configured: true } : {}), ...(body.delivery ? { delivery: body.delivery } : {}), ...(body.dismissed ? { dismissed: true } : {}) };
+        settings = {
+            ...(settings ?? settingsFixture()),
+            ...(typeof body.learning === "string" ? { learning: body.learning, configured: true } : {}),
+            ...(typeof body.delivery === "string" ? { delivery: body.delivery } : {}),
+            ...(body.dismissed === true ? { dismissed: true } : {}),
+        };
         return jsonResponse(settings);
     };
     const app = await loadApp({ fetch });
@@ -823,8 +999,8 @@ test("choosing a mode from the banner or the Configure dialog saves it, updates 
     assert.match(app.node("#top").innerHTML, /Learning: Off/);
 
     await click("configure");
-    assert.equal(app.state.dialog.learning, "off");
-    assert.equal(app.state.dialog.delivery, "immediate");
+    assert.equal(dialog(app).learning, "off");
+    assert.equal(dialog(app).delivery, "immediate");
     await app.run("onChange")({ target: { name: "learning", value: "auto" } });
     await app.run("onChange")({ target: { name: "delivery", value: "batch" } });
     await click("dialog-save");
@@ -841,8 +1017,8 @@ test("choosing a mode from the banner or the Configure dialog saves it, updates 
     failure = "disk full";
     await app.run("onChange")({ target: { name: "learning", value: "off" } });
     await click("dialog-save");
-    assert.equal(app.state.dialog.saving, false);
-    assert.equal(app.state.dialog.error, "disk full");
+    assert.equal(dialog(app).saving, false);
+    assert.equal(dialog(app).error, "disk full");
     assert.equal(app.state.settings.learning, "auto", "a failed save changes nothing");
     assert.match(app.node("#dialog").innerHTML, /role="alert">disk full</);
     assert.equal(app.focused.at(-1), '#dialog [data-action="dialog-save"]');
@@ -865,7 +1041,7 @@ test("the Configure dialog closes from Cancel or a click on the backdrop, but no
     app.state.settings = settingsFixture({ configured: true });
 
     await click("configure");
-    const backdrop = { tagName: "DIV", dataset: { action: "dialog-backdrop" } };
+    const backdrop = Object.assign(new MockElement("DIV"), { dataset: { action: "dialog-backdrop" } });
     backdrop.closest = () => backdrop;
     await app.run("onClick")({ target: { closest: () => backdrop } });
     assert.notEqual(app.state.dialog, null, "a click that landed inside the dialog does not close it");
@@ -873,10 +1049,10 @@ test("the Configure dialog closes from Cancel or a click on the backdrop, but no
     assert.equal(app.state.dialog, null);
 
     await click("configure");
-    app.state.dialog.saving = true;
+    dialog(app).saving = true;
     await click("dialog-cancel");
     assert.notEqual(app.state.dialog, null);
-    app.state.dialog.saving = false;
+    dialog(app).saving = false;
     await click("dialog-cancel");
     assert.equal(app.state.dialog, null);
 });
@@ -891,12 +1067,12 @@ test("lessons show their status next to each rule in the thread and in the Lesso
             { lessonId: "l-4", threadId: "t2", scope: "repo", rule: "Unknown status", status: "bogus", savedTo: null, createdAt: "2026-01-04T00:00:00Z" },
         ],
     });
-    const message = (lessonIds) => app.run(`messageHtml(${JSON.stringify({ messageId: "m", author: "agent", body: "Done", outcome: "fixed", createdAt: "2026-01-02T00:00:00Z", lessonIds })})`);
+    const message = (lessonIds: string[]) => app.run(`messageHtml(${JSON.stringify({ messageId: "m", author: "agent", body: "Done", outcome: "fixed", createdAt: "2026-01-02T00:00:00Z", lessonIds })})`);
 
     const html = message(["l-1", "l-2", "missing"]);
     assert.match(html, /<li><span class="badge">repo<\/span> <span class="badge lesson-saved"[^>]*>saved<\/span> Prefer <code>ILogger<\/code> <span class="muted mono">→ AGENTS\.md<\/span><\/li>/, "a lesson recorded before statuses existed was saved");
     assert.match(html, /<li><span class="badge">personal<\/span> <span class="badge lesson-proposed"[^>]*>proposed<\/span> Keep &lt;b&gt;short&lt;\/b&gt;<\/li>/, "a proposed lesson is not saved anywhere yet");
-    assert.equal(html.match(/<li>/g).length, 2, "an unknown lesson id is skipped");
+    assert.equal(required(html.match(/<li>/g)).length, 2, "an unknown lesson id is skipped");
     assert.doesNotMatch(message([]), /Guidelines:/);
 
     const table = app.run("lessonsView()");
@@ -910,7 +1086,7 @@ test("lessons show their status next to each rule in the thread and in the Lesso
 test("the empty Lessons learned view explains what the current learning mode does", async () => {
     const app = await loadApp();
     app.state.review = reviewFixture();
-    const empty = (settings) => {
+    const empty = (settings: RuntimeState["settings"]) => {
         app.state.settings = settings;
         return app.run("lessonsView()");
     };
@@ -946,24 +1122,24 @@ test("an empty diff explains itself per scope, and only the pending scope offers
 });
 
 test("switching scope loads the other review, remembers each review's own view, and never sticks in the switching state", async () => {
-    const calls = [];
-    const reviews = {
+    const calls: string[] = [];
+    const reviews: Record<string, ReturnType<typeof reviewFixture>> = {
         a: reviewFixture({ reviewId: "a", currentRevisionId: "ra" }),
         b: reviewFixture({ reviewId: "b", currentRevisionId: "rb", scope: "pending" }),
     };
     let current = "a";
-    let failure = null;
-    let settings = settingsFixture({ configured: true });
-    const fetch = async (url, init) => {
-        calls.push(`${init.method} ${url}`);
+    let failure: string | null = null;
+    let settings: ReturnType<typeof settingsFixture> | undefined = settingsFixture({ configured: true });
+    const fetch = async (url: string, init?: { method?: string; body?: string }) => {
+        calls.push(`${init?.method ?? "GET"} ${url}`);
         if (url === "/api/state") return jsonResponse({ review: reviews[current], session: { busy: false }, settings });
         if (url.startsWith("/api/snapshot/")) return jsonResponse({ revisionId: url.split("/").pop(), files: [] });
         if (url === "/api/scope") {
             if (failure) return jsonResponse({ error: { message: failure } }, 500);
-            current = JSON.parse(init.body).scope === "pending" ? "b" : "a";
+            current = requestBody(init).scope === "pending" ? "b" : "a";
             return jsonResponse({ reviewId: current });
         }
-        throw new Error(`unexpected request ${init.method} ${url}`);
+        throw new Error(`unexpected request ${init?.method ?? "GET"} ${url}`);
     };
     const app = await loadApp({ fetch });
     const click = clicker(app);
@@ -971,7 +1147,7 @@ test("switching scope loads the other review, remembers each review's own view, 
 
     await app.run("loadState()");
     assert.equal(app.state.review.reviewId, "a");
-    assert.equal(app.state.snapshot.revisionId, "ra");
+    assert.equal(required(app.state.snapshot).revisionId, "ra");
 
     app.run('navigate({ type: "file", path: "src/a.cs" })');
     app.run('state.open.add("line:src/a.cs:new:5-5"); state.expanded.add("t1"); state.fileFold.set("src/a.cs", true); state.content.set("ra:src/a.cs", {}); state.pendingJump = "t1"; collapsedDirs();');
@@ -980,7 +1156,7 @@ test("switching scope loads the other review, remembers each review's own view, 
     await click("scope", { scope: "pending" });
     assert.deepEqual(calls.slice(-3), ["POST /api/scope", "GET /api/state", "GET /api/snapshot/rb"]);
     assert.equal(app.state.review.reviewId, "b");
-    assert.equal(app.state.snapshot.revisionId, "rb");
+    assert.equal(required(app.state.snapshot).revisionId, "rb");
     assert.deepEqual(app.read("state.view"), { type: "lessons" }, "the other review restores its own view instead of inheriting this one");
     assert.deepEqual(app.read("[state.open.size, state.pending.size, state.expanded.size, state.fileFold.size, state.content.size]"), [0, 0, 0, 0, 0]);
     assert.equal(app.read("state.collapsedDirs"), null);
@@ -1012,10 +1188,10 @@ test("switching scope loads the other review, remembers each review's own view, 
     assert.equal(app.state.settings, null, "a server without settings hides the learning controls");
 });
 
-const userMessage = (messageId, state) => ({ messageId, author: "user", body: messageId, delivery: { state } });
+const userMessage = (messageId: string, state: string) => ({ messageId, author: "user", body: messageId, createdAt: "2026-01-01", delivery: { state } });
 const draftThreads = () => [
-    { threadId: "t1", status: "active", messages: [userMessage("m1", "draft"), { messageId: "a1", author: "agent", body: "ok" }, userMessage("m2", "draft")] },
-    { threadId: "t2", status: "active", messages: [userMessage("m3", "queued")] },
+    { threadId: "t1", kind: "overview", status: "active", messages: [userMessage("m1", "draft"), { messageId: "a1", author: "agent", body: "ok", createdAt: "2026-01-01" }, userMessage("m2", "draft")] },
+    { threadId: "t2", kind: "overview", status: "active", messages: [userMessage("m3", "queued")] },
 ];
 
 test("the top bar offers Submit review while drafts wait, and shows how comments reach Copilot", async () => {
@@ -1060,9 +1236,10 @@ test("the top bar offers Submit review while drafts wait, and shows how comments
 
 test("an ask-mode review asks how to send comments until the reviewer chooses", async () => {
     const app = await loadApp();
-    const banner = (settings, review) => {
+    const banner = (settings: RuntimeState["settings"], review: RuntimeState["review"] | null) => {
         app.state.settings = settings;
-        app.state.review = review;
+        if (review) app.state.review = review;
+        else app.run("state.review = null");
         app.run("renderBanner()");
         return app.node("#banner");
     };
@@ -1084,25 +1261,26 @@ test("an ask-mode review asks how to send comments until the reviewer chooses", 
     assert.equal(banner(ask, null).hidden, true);
 
     const both = banner(settingsFixture({ delivery: "ask" }), reviewFixture());
-    assert.equal(both.innerHTML.match(/class="banner-row"/g).length, 2, "the learning and delivery questions can show together");
+    assert.equal(required(both.innerHTML.match(/class="banner-row"/g)).length, 2, "the learning and delivery questions can show together");
 });
 
 test("the composer and the draft badge follow the delivery mode", async () => {
     const app = await loadApp();
     const composer = () => app.run(`composerHtml("file:a.cs", { kind: "file", path: "a.cs" })`);
-    const setMode = (delivery, deliveryMode) => {
+    const setMode = (delivery: string | null, deliveryMode?: string) => {
         app.state.settings = delivery ? settingsFixture({ configured: true, delivery }) : null;
         app.state.review = reviewFixture({ deliveryMode });
     };
 
-    for (const [delivery, deliveryMode, batching, defaultDraft] of [
+    const composerModes: Array<[string | null, string | undefined, boolean, boolean | null]> = [
         [null, undefined, false, null],
         ["immediate", undefined, false, null],
         ["ask", "immediate", false, null],
         ["batch", undefined, true, true],
         ["ask", undefined, true, true],
         ["ask", "batch", true, true],
-    ]) {
+    ];
+    for (const [delivery, deliveryMode, batching, defaultDraft] of composerModes) {
         const label = `${delivery}/${deliveryMode}`;
         setMode(delivery, deliveryMode);
         const html = composer();
@@ -1129,18 +1307,18 @@ test("the composer and the draft badge follow the delivery mode", async () => {
 });
 
 test("posting a comment sends the draft flag the clicked button chose, or lets the server decide", async () => {
-    const posts = [];
+    const posts: CapturedPost[] = [];
     let settings = settingsFixture({ configured: true, delivery: "batch" });
-    const fetch = async (url, init) => {
+    const fetch = async (url: string, init?: { method?: string; body?: string }) => {
         if (url === "/api/state") return jsonResponse({ review: reviewFixture(), session: { busy: false }, settings });
         if (url.startsWith("/api/snapshot/")) return jsonResponse({ revisionId: "r1", files: [] });
-        posts.push([url, JSON.parse(init.body)]);
+        posts.push([url, requestBody(init)]);
         return jsonResponse({ threadId: "t9", messageId: "m9", duplicate: false, draft: true });
     };
-    const app = await loadApp({ fetch, CSS: { escape: (s) => s } });
+    const app = await loadApp({ fetch, CSS: { escape: (s: string) => s } });
     const click = clicker(app);
     app.run("render = () => {};");
-    const box = (key, dataset) => {
+    const box = (key: string, dataset: Record<string, string>) => {
         Object.assign(app.node(`.composer[data-key="${key}"]`), { dataset, querySelector: () => ({ value: " Rename this ", focus() {} }) });
     };
     box("file:a.cs", { kind: "file", path: "a.cs" });
@@ -1148,9 +1326,10 @@ test("posting a comment sends the draft flag the clicked button chose, or lets t
     Object.assign(app.node('[data-thread-id="t9"]'), { classList: { add() {}, remove() {} } });
     await app.run("loadState()");
 
-    const sent = async (dataset) => {
+    const sent = async (dataset: Record<string, string>) => {
         await click("submit", dataset);
-        const [url, body] = posts.at(-1);
+        const [url] = required(posts.at(-1));
+        const body = capturedBody(posts);
         return [url, body.body, Object.hasOwn(body, "draft") ? body.draft : "server decides"];
     };
     assert.deepEqual(await sent({ key: "file:a.cs", draft: "1" }), ["/api/threads", "Rename this", true]);
@@ -1165,24 +1344,24 @@ test("posting a comment sends the draft flag the clicked button chose, or lets t
 });
 
 test("Send now, Discard, Submit review and the delivery question call the server and report the outcome", async () => {
-    const calls = [];
+    const calls: string[] = [];
     const replies = new Map();
-    const fetch = async (url, init) => {
+    const fetch = async (url: string, init?: { method?: string; body?: string }) => {
         if (url === "/api/state") {
             calls.push("GET /api/state");
             return jsonResponse({ review: reviewFixture({ threads: draftThreads() }), session: { busy: false }, settings: settingsFixture({ configured: true, delivery: "ask" }) });
         }
         if (url.startsWith("/api/snapshot/")) return jsonResponse({ revisionId: "r1", files: [] });
-        calls.push(`${init.method} ${url} ${init.body}`);
+        calls.push(`${init?.method ?? "GET"} ${url} ${init?.body ?? ""}`);
         const reply = replies.get(url);
-        if (!reply) throw new Error(`unexpected request ${init.method} ${url}`);
+        if (!reply) throw new Error(`unexpected request ${init?.method ?? "GET"} ${url}`);
         return typeof reply === "function" ? reply() : reply;
     };
     const app = await loadApp({ fetch });
     const click = clicker(app);
     app.run("render = () => {}; var submittingSeen = []; renderTop = () => { submittingSeen.push(state.submitting); };");
     const toast = () => [app.node("#toast").textContent, app.node("#toast").className === "error"];
-    const act = async (action, dataset) => {
+    const act = async (action: string, dataset: Record<string, string> = {}) => {
         const before = calls.length;
         await click(action, dataset);
         return calls.slice(before);
@@ -1217,12 +1396,13 @@ test("Send now, Discard, Submit review and the delivery question call the server
     assert.deepEqual(await act("submit-review"), [], "a second click while submitting does nothing");
     app.state.submitting = false;
 
-    for (const [mode, submitted, text] of [
+    const deliveryOutcomes: Array<[string, number, string]> = [
         ["immediate", 2, "Sending each comment now. Sent 2 waiting drafts."],
         ["immediate", 1, "Sending each comment now. Sent 1 waiting draft."],
         ["immediate", 0, "Sending each comment now"],
         ["batch", 0, "Batching comments. Submit the review when you are done."],
-    ]) {
+    ];
+    for (const [mode, submitted, text] of deliveryOutcomes) {
         replies.set("/api/delivery", jsonResponse({ mode, submitted }));
         assert.deepEqual(await act("delivery-choose", { mode }), [`POST /api/delivery {"mode":"${mode}"}`, "GET /api/state"]);
         assert.deepEqual(toast(), [text, false], `${mode} ${submitted}`);

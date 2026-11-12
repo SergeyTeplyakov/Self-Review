@@ -6,19 +6,21 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { runGit } from "../dist/lib/git.mjs";
-import { Store } from "../dist/lib/store.mjs";
-import { ReviewService, computeReviewId, scopeOf } from "../dist/lib/review-service.mjs";
-import { Delivery } from "../dist/lib/delivery.mjs";
-import { startReviewServer } from "../dist/lib/server.mjs";
-import { SettingsService, normalizeRemoteUrl, pathKey, repoIdentity } from "../dist/lib/settings.mjs";
+import {
+    Delivery, ReviewService, SettingsService, Store, computeReviewId, normalizeRemoteUrl, pathKey,
+    repoIdentity, runGit, scopeOf, startReviewServer,
+} from "./modules.mjs";
+import type { Review, ReviewService as ReviewServiceType, ReviewThread } from "../src/lib/review-service.mjs";
+import type { Delivery as DeliveryType, SendOptions } from "../src/lib/delivery.mjs";
+import type { Store as StoreType } from "../src/lib/store.mjs";
+import type { LearningMode, Log, ReviewScope } from "../types/contracts.js";
 
 const WEB_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "dist", "web");
-const lines = (n, f = (i) => `line ${i}`) => Array.from({ length: n }, (_, i) => f(i + 1)).join("\n") + "\n";
-const git = (cwd, ...args) => runGit(cwd, ["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "core.autocrlf=false", ...args]);
+const lines = (n: number, f: (i: number) => string = (i) => `line ${i}`) => Array.from({ length: n }, (_, i) => f(i + 1)).join("\n") + "\n";
+const git = (cwd: string, ...args: string[]) => runGit(cwd, ["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "core.autocrlf=false", ...args]);
 
-let tmp;
-let repo;
+let tmp: string;
+let repo: string;
 let seq = 0;
 
 // Fixture: feature is one commit ahead of main, with a staged file, an unstaged edit, and an untracked file on top.
@@ -46,12 +48,12 @@ after(async () => {
 });
 
 // Every test gets its own store so reviews, lessons, and settings never leak between tests.
-function fresh() {
+function fresh(): { store: StoreType; service: ReviewServiceType } {
     const store = new Store(path.join(tmp, `data-${++seq}`));
     return { store, service: new ReviewService({ store }) };
 }
 
-async function waitFor(predicate, label, timeoutMs = 5000) {
+async function waitFor<T>(predicate: () => T | Promise<T>, label: string, timeoutMs = 5000): Promise<Awaited<T>> {
     const start = Date.now();
     for (;;) {
         const value = await predicate();
@@ -61,36 +63,76 @@ async function waitFor(predicate, label, timeoutMs = 5000) {
     }
 }
 
-function request(port, { method = "GET", pathName, headers = {}, body }) {
-    return new Promise((resolve, reject) => {
+interface HttpJson extends Record<string, unknown> {
+    review?: { reviewId: string; currentRevisionId: string; scope?: string };
+    error?: { code: string; message: string };
+    settings?: { repoName: string; learning: string; delivery: string; configured: boolean; dismissed: boolean } | null;
+    scope?: string;
+    reviewId?: string;
+    [key: string]: unknown;
+}
+
+interface HttpResponse {
+    status: number;
+    text: string;
+    json: HttpJson | null;
+}
+
+function request(
+    port: number,
+    { method = "GET", pathName, headers = {}, body }: {
+        method?: string;
+        pathName: string;
+        headers?: http.OutgoingHttpHeaders;
+        body?: unknown;
+    },
+): Promise<HttpResponse> {
+    return new Promise<HttpResponse>((resolve, reject) => {
         const req = http.request({ host: "127.0.0.1", port, method, path: pathName, headers }, (res) => {
-            const chunks = [];
-            res.on("data", (c) => chunks.push(c));
+            const chunks: Buffer[] = [];
+            res.on("data", (chunk: Buffer | string) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
             res.on("end", () => {
                 const text = Buffer.concat(chunks).toString("utf8");
-                let json = null;
+                let json: HttpJson | null = null;
                 try {
-                    json = JSON.parse(text);
+                    const parsed: unknown = JSON.parse(text);
+                    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) json = parsed as HttpJson;
                 } catch {}
+                if (res.statusCode === undefined) {
+                    reject(new Error("HTTP response has no status code."));
+                    return;
+                }
                 resolve({ status: res.statusCode, text, json });
             });
         });
         req.on("error", reject);
-        if (body !== undefined) req.write(typeof body === "string" ? body : JSON.stringify(body));
+        if (body !== undefined) {
+            const serialized = typeof body === "string" ? body : JSON.stringify(body);
+            if (serialized !== undefined) req.write(serialized);
+        }
         req.end();
     });
 }
 
-async function withServer(options, fn) {
-    const server = await startReviewServer({ webRoot: WEB_ROOT, ...options });
+interface ServerContext {
+    headers: http.OutgoingHttpHeaders;
+    state: () => Promise<HttpJson>;
+    post: (pathName: string, body: unknown, extraHeaders?: http.OutgoingHttpHeaders) => Promise<HttpResponse>;
+}
+
+async function withServer<T>(
+    options: Omit<Parameters<typeof startReviewServer>[0], "webRoot">,
+    fn: (context: ServerContext) => Promise<T>,
+): Promise<T> {
+    const server = await startReviewServer({ ...options, webRoot: WEB_ROOT });
     try {
         const url = new URL(server.url);
         const port = Number(url.port);
-        const token = url.searchParams.get("t");
-        const headers = { "Content-Type": "application/json", "X-MR-Token": token };
+        const token = required(url.searchParams.get("t"));
+        const headers: http.OutgoingHttpHeaders = { "Content-Type": "application/json", "X-MR-Token": token };
         return await fn({
             headers,
-            state: async () => (await request(port, { pathName: `/api/state?t=${token}` })).json,
+            state: async () => required((await request(port, { pathName: `/api/state?t=${token}` })).json),
             post: (pathName, body, extraHeaders = headers) => request(port, { method: "POST", pathName, headers: extraHeaders, body }),
         });
     } finally {
@@ -98,13 +140,27 @@ async function withServer(options, fn) {
     }
 }
 
-async function commentThread(service, body = "Prefer early returns") {
+async function commentThread(service: ReviewServiceType, body = "Prefer early returns") {
     const reviewId = await service.ensureReview({ repoPath: repo, base: "main" });
     const { thread, message } = await service.createThread(reviewId, { kind: "file", path: "a.cs", body, author: "user" });
     return { reviewId, thread, message };
 }
 
-const agentReply = (service, reviewId, thread, extra) => service.addMessage(reviewId, thread.threadId, { author: "agent", body: "Reply", ...extra });
+const agentReply = (
+    service: ReviewServiceType,
+    reviewId: string,
+    thread: ReviewThread,
+    extra: Parameters<ReviewServiceType["addMessage"]>[2],
+) => service.addMessage(reviewId, thread.threadId, { author: "agent", body: "Reply", ...extra });
+
+function required<T>(value: T | null | undefined): T {
+    assert.ok(value);
+    return value;
+}
+
+function errorHasCode(error: unknown, code: string): boolean {
+    return error instanceof Error && "code" in error && error.code === code;
+}
 
 test("each scope diffs against its own base and gets its own review", async () => {
     const { service } = fresh();
@@ -119,11 +175,12 @@ test("each scope diffs against its own base and gets its own review", async () =
     const pending = await service.getReview(pendingId);
     assert.deepEqual([all.scope, pending.scope], ["all", "pending"]);
     assert.deepEqual([all.title, pending.title], ["feature vs main", "feature (pending changes)"]);
-    assert.equal(all.git.baseCommit, mainCommit);
-    assert.deepEqual([pending.git.baseCommit, pending.git.headCommit], [head, head], "pending compares the working tree with HEAD");
-    assert.deepEqual([all.git.uncommittedFiles, pending.git.uncommittedFiles], [3, 3]);
+    assert.equal(required(all.git).baseCommit, mainCommit);
+    assert.deepEqual([required(pending.git).baseCommit, required(pending.git).headCommit], [head, head], "pending compares the working tree with HEAD");
+    assert.deepEqual([required(all.git).uncommittedFiles, required(pending.git).uncommittedFiles], [3, 3]);
 
-    const summary = (snapshot) => snapshot.files.map((f) => [f.path, f.status, f.untracked, f.additions, f.deletions]);
+    const summary = (snapshot: Awaited<ReturnType<ReviewServiceType["getSnapshot"]>>) =>
+        snapshot.files.map((file) => [file.path, file.status, file.untracked, file.additions, file.deletions]);
     const allSnapshot = await service.getSnapshot(allId);
     const pendingSnapshot = await service.getSnapshot(pendingId);
     assert.deepEqual(summary(allSnapshot), [
@@ -137,7 +194,8 @@ test("each scope diffs against its own base and gets its own review", async () =
         ["staged.txt", "added", false, 1, 0],
         ["untracked.txt", "added", true, 1, 0],
     ]);
-    const rowsOf = (snapshot) => snapshot.files.find((f) => f.path === "a.cs").hunks.flatMap((h) => h.rows.map((r) => r.s));
+    const rowsOf = (snapshot: Awaited<ReturnType<ReviewServiceType["getSnapshot"]>>) =>
+        required(snapshot.files.find((file) => file.path === "a.cs")).hunks.flatMap((hunk) => hunk.rows.map((row) => row.s));
     assert.ok(rowsOf(allSnapshot).includes("line 5 COMMITTED") && rowsOf(allSnapshot).includes("line 15 PENDING"));
     assert.ok(rowsOf(pendingSnapshot).includes("line 15 PENDING"));
     assert.ok(!rowsOf(pendingSnapshot).includes("line 5 COMMITTED"), "committed edits are not pending");
@@ -228,18 +286,20 @@ test("ensureReview with a reviewId switches scope instead of refreshing when the
 test("an invalid scope is rejected wherever it can be supplied", async () => {
     const { service } = fresh();
     const allId = await service.ensureReview({ repoPath: repo, base: "main" });
-    const invalid = (fn) => assert.rejects(fn, (e) => e.code === "invalid_input");
+    const invalid = (fn: () => Promise<unknown>) => assert.rejects(fn, (error) =>
+        error instanceof Error && "code" in error && error.code === "invalid_input");
     await invalid(() => service.ensureReview({ repoPath: repo, base: "main", scope: "everything" }));
     await invalid(() => service.ensureReview({ repoPath: repo, base: "main", scope: "" }));
     await invalid(() => service.ensureReview({ reviewId: allId, scope: "everything" }));
-    await invalid(() => service.openSibling(allId, "everything"));
-    await invalid(() => service.openSibling(allId, ""));
+    await invalid(() => service.openSibling(allId, "everything" as unknown as ReviewScope));
+    await invalid(() => service.openSibling(allId, "" as unknown as ReviewScope));
 });
 
 test("a review saved before scopes existed behaves as an all-scope review", async () => {
     const { store, service } = fresh();
     const allId = await service.ensureReview({ repoPath: repo, base: "main" });
-    await store.updateReview(allId, (r) => {
+    await store.updateReview(allId, (current) => {
+        const r = required(current);
         delete r.scope;
         delete r.originBranch;
         return { review: r };
@@ -268,7 +328,7 @@ test("committing pending work empties the pending review while the all review ke
     const { service } = fresh();
     const pendingId = await service.ensureReview({ repoPath: work, base: "main", scope: "pending" });
     const allId = await service.openSibling(pendingId, "all");
-    const fileCount = async (id) => (await service.getSnapshot(id)).files.length;
+    const fileCount = async (id: string) => (await service.getSnapshot(id)).files.length;
     assert.deepEqual([await fileCount(pendingId), await fileCount(allId)], [1, 1]);
 
     await git(work, "commit", "-q", "-am", "work");
@@ -276,8 +336,8 @@ test("committing pending work empties the pending review while the all review ke
     assert.equal((await service.refresh(allId)).created, false, "committing does not change the diff against the merge-base");
     assert.deepEqual([await fileCount(pendingId), await fileCount(allId)], [0, 1]);
     const pending = await service.getReview(pendingId);
-    assert.equal(pending.git.uncommittedFiles, 0);
-    assert.equal(pending.git.baseCommit, pending.git.headCommit);
+    assert.equal(required(pending.git).uncommittedFiles, 0);
+    assert.equal(required(pending.git).baseCommit, required(pending.git).headCommit);
 });
 
 test("a proposed guideline is settled in place when it is saved or declined", async () => {
@@ -320,10 +380,11 @@ test("lessons recorded before statuses existed read as saved", async () => {
         inReplyTo: message.messageId,
         lessons: [{ rule: "Explain renames", scope: "personal", savedTo: "~/.copilot/copilot-instructions.md" }],
     });
-    const created = (await service.getReview(reviewId)).lessons[0];
+    const created = required((await service.getReview(reviewId)).lessons[0]);
     assert.deepEqual([created.status, created.scope, created.savedTo], ["saved", "personal", "~/.copilot/copilot-instructions.md"], "a lesson without a status is saved");
 
-    await store.updateReview(reviewId, (r) => {
+    await store.updateReview(reviewId, (current) => {
+        const r = required(current);
         delete r.lessons[0].status;
         return { review: r };
     });
@@ -337,10 +398,15 @@ test("lesson updates are validated before anything is written", async () => {
     const { reviewId, thread } = await commentThread(service);
     const other = await service.createThread(reviewId, { kind: "file", path: "keep.txt", body: "Another thread", author: "user" });
     await agentReply(service, reviewId, thread, { lessons: [{ rule: "Keep methods short.", status: "proposed" }] });
-    const [lesson] = (await service.getReview(reviewId)).lessons;
+    const lesson = required((await service.getReview(reviewId)).lessons[0]);
     const snapshot = JSON.stringify(await service.getReview(reviewId));
 
-    const rejects = (target, lessons, code) => assert.rejects(() => agentReply(service, reviewId, target, { lessons }), (e) => e.code === code, JSON.stringify(lessons));
+    const rejects = (target: ReviewThread, lessons: unknown[], code: string) =>
+        assert.rejects(
+            () => agentReply(service, reviewId, target, { lessons }),
+            (error) => error instanceof Error && "code" in error && error.code === code,
+            JSON.stringify(lessons),
+        );
     await rejects(thread, [{ rule: "Valid rule", status: "maybe" }], "invalid_input");
     await rejects(thread, [{ rule: "Valid rule", scope: "team" }], "invalid_input");
     await rejects(thread, [{ rule: "   " }], "invalid_input");
@@ -395,7 +461,7 @@ test("pathKey folds case only where the file system usually does", () => {
 });
 
 test("repoIdentity resolves a local-path origin against its repository", async () => {
-    const init = async (dir) => {
+    const init = async (dir: string) => {
         await mkdir(dir, { recursive: true });
         await runGit(tmp, ["init", "-q", "-b", "main", dir]);
         return dir;
@@ -479,7 +545,7 @@ test("SettingsService rejects invalid updates without writing anything", async (
     const { store } = fresh();
     const settings = new SettingsService({ store });
     for (const patch of [undefined, {}, { learning: "sometimes" }, { learning: null }, { learning: 1 }, { dismissed: "yes" }, { dismissed: 1 }, { dismissed: null }, { learning: "auto", dismissed: "no" }, { delivery: "later" }, { delivery: null }, { delivery: 1 }, { learning: "auto", delivery: "later" }]) {
-        await assert.rejects(() => settings.update(repo, patch), (e) => e.code === "invalid_input", JSON.stringify(patch));
+        await assert.rejects(() => settings.update(repo, patch), (error) => errorHasCode(error, "invalid_input"), JSON.stringify(patch));
     }
     assert.deepEqual(await settings.get(repo), { repoName: "proj", learning: "off", delivery: "immediate", configured: false, dismissed: false });
     await assert.rejects(() => access(store.settingsFile()), { code: "ENOENT" });
@@ -489,7 +555,7 @@ test("an unreadable or hand-edited settings file never blocks reading the effect
     const { store } = fresh();
     await mkdir(store.root, { recursive: true });
     await writeFile(store.settingsFile(), "{ not json");
-    const logs = [];
+    const logs: string[] = [];
     const settings = new SettingsService({ store, log: (m) => logs.push(m) });
     assert.deepEqual(await settings.get(repo), { repoName: "proj", learning: "off", delivery: "immediate", configured: false, dismissed: false });
     assert.equal(logs.length, 1);
@@ -505,10 +571,10 @@ test("Delivery hands the repository's learning mode to the prompt and falls back
     const { reviewId, thread } = await commentThread(service);
     const { repoRoot } = await service.getReview(reviewId);
 
-    const deliver = async (learning) => {
+    const deliver = async (learning?: (root: string) => Promise<string>) => {
         const { message } = await service.addMessage(reviewId, thread.threadId, { body: "Check this preference", author: "user" });
-        const sent = [];
-        const logs = [];
+        const sent: SendOptions[] = [];
+        const logs: Array<{ text: string; level?: string }> = [];
         const delivery = new Delivery({
             service,
             send: async (opts) => {
@@ -519,13 +585,13 @@ test("Delivery hands the repository's learning mode to the prompt and falls back
             ...(learning ? { learning } : {}),
         });
         await delivery.deliver(reviewId, thread.threadId, message.messageId, "inst");
-        return { prompt: sent[0].prompt, logs };
+        return { prompt: required(sent[0]).prompt, logs };
     };
     const off = /Guideline learning is off for this repository/;
 
     assert.match((await deliver()).prompt, off, "no provider means off");
-    const asked = [];
-    assert.match((await deliver(async (root) => (asked.push(root), "suggest"))).prompt, /Guideline learning is in suggest mode/);
+    const asked: string[] = [];
+    assert.match((await deliver(async (root: string) => (asked.push(root), "suggest"))).prompt, /Guideline learning is in suggest mode/);
     assert.deepEqual(asked, [repoRoot]);
     assert.match((await deliver(async () => "auto")).prompt, /Treat every review comment as coding-guideline input/);
     assert.match((await deliver(async () => "bogus")).prompt, off, "an unknown mode is treated as off");
@@ -541,7 +607,7 @@ test("Delivery hands the repository's learning mode to the prompt and falls back
 test("the settings API stores the learning mode per repository and the next comment is delivered with it", async () => {
     const { store, service } = fresh();
     const settings = new SettingsService({ store });
-    const sent = [];
+    const sent: SendOptions[] = [];
     const delivery = new Delivery({
         service,
         send: async (opts) => {
@@ -555,7 +621,7 @@ test("the settings API stores the learning mode per repository and the next comm
     await withServer({ instanceId: "inst-settings", getReviewId: () => reviewId, service, delivery, settings }, async ({ headers, state, post }) => {
         const initial = await state();
         assert.deepEqual(initial.settings, { repoName: "proj", learning: "off", delivery: "immediate", configured: false, dismissed: false });
-        assert.equal(initial.review.scope, "all");
+        assert.equal(required(initial.review).scope, "all");
 
         const chosen = await post("/api/settings", { learning: "suggest" });
         assert.equal(chosen.status, 200);
@@ -566,17 +632,17 @@ test("the settings API stores the learning mode per repository and the next comm
         for (const body of [{}, { learning: "loud" }, { learning: null }, { dismissed: "yes" }, { delivery: "later" }]) {
             const rejected = await post("/api/settings", body);
             assert.equal(rejected.status, 400, JSON.stringify(body));
-            assert.equal(rejected.json.error.code, "invalid_input");
+            assert.equal(required(required(rejected.json).error).code, "invalid_input");
         }
         assert.equal((await post("/api/settings", { learning: "auto" }, { "Content-Type": "application/json" })).status, 403, "the token header is required");
         assert.equal((await post("/api/settings", { learning: "auto" }, { ...headers, "Content-Type": "text/plain" })).status, 415);
         assert.equal((await post("/api/settings", { learning: "auto" }, { ...headers, Origin: "http://evil.example" })).status, 403);
-        assert.equal((await state()).settings.learning, "suggest", "rejected requests change nothing");
+        assert.equal(required((await state()).settings).learning, "suggest", "rejected requests change nothing");
 
         assert.equal((await post("/api/settings", { learning: "auto" })).status, 200);
         assert.equal((await post("/api/threads", { kind: "file", path: "a.cs", body: "Prefer early returns" })).status, 200);
         await waitFor(() => sent.length === 1, "the comment to be delivered");
-        assert.match(sent[0].prompt, /Treat every review comment as coding-guideline input/);
+        assert.match(required(sent[0]).prompt, /Treat every review comment as coding-guideline input/);
     });
 });
 
@@ -586,8 +652,8 @@ test("the scope API switches the served review and keeps the repository setting"
     const delivery = new Delivery({ service, send: async () => "sm-1" });
     const allId = await service.ensureReview({ repoPath: repo, base: "main" });
     let currentId = allId;
-    const events = [];
-    service.on("changed", (e) => events.push(e));
+    const events: Array<{ reviewId: string; reason: string }> = [];
+    service.on("changed", (event: { reviewId: string; reason: string }) => events.push(event));
 
     await withServer(
         { instanceId: "inst-scope", getReviewId: () => currentId, service, delivery, settings, onReviewChange: (id) => { currentId = id; } },
@@ -596,7 +662,7 @@ test("the scope API switches the served review and keeps the repository setting"
             for (const body of [{}, { scope: "bogus" }, { scope: null }, { scope: ["all"] }]) {
                 const rejected = await post("/api/scope", body);
                 assert.equal(rejected.status, 400, JSON.stringify(body));
-                assert.equal(rejected.json.error.code, "invalid_input");
+                assert.equal(required(required(rejected.json).error).code, "invalid_input");
             }
             assert.equal(currentId, allId);
 
@@ -606,17 +672,18 @@ test("the scope API switches the served review and keeps the repository setting"
 
             const switched = await post("/api/scope", { scope: "pending" });
             assert.equal(switched.status, 200);
-            assert.equal(switched.json.scope, "pending");
-            assert.match(switched.json.reviewId, /^proj-feature-pending-/);
-            assert.equal(currentId, switched.json.reviewId);
-            assert.deepEqual(events.filter((e) => e.reason === "scope"), [{ reviewId: switched.json.reviewId, reason: "scope" }]);
+            assert.equal(required(switched.json).scope, "pending");
+            const switchedId = required(required(switched.json).reviewId);
+            assert.match(switchedId, /^proj-feature-pending-/);
+            assert.equal(currentId, switchedId);
+            assert.deepEqual(events.filter((event) => event.reason === "scope"), [{ reviewId: switchedId, reason: "scope" }]);
 
             const view = await state();
-            assert.deepEqual([view.review.reviewId, view.review.scope], [switched.json.reviewId, "pending"]);
-            assert.equal(view.settings.learning, "suggest", "the learning mode belongs to the repository, not the scope");
+            assert.deepEqual([required(view.review).reviewId, required(view.review).scope], [switchedId, "pending"]);
+            assert.equal(required(view.settings).learning, "suggest", "the learning mode belongs to the repository, not the scope");
 
             assert.deepEqual((await post("/api/scope", { scope: "all" })).json, { reviewId: allId, scope: "all" });
-            assert.equal((await state()).review.reviewId, allId);
+            assert.equal(required((await state()).review).reviewId, allId);
         },
     );
 });
@@ -632,13 +699,13 @@ test("after a scope switch, a write from a page still showing the previous revie
         { instanceId: "inst-stale", getReviewId: () => currentId, service, delivery, settings, onReviewChange: (id) => { currentId = id; } },
         async ({ headers, post }) => {
             const switched = await post("/api/scope", { scope: "pending" }, { ...headers, "X-MR-Review": allId });
-            const pendingId = switched.json.reviewId;
+            const pendingId = required(required(switched.json).reviewId);
             assert.notEqual(pendingId, allId);
 
             const comment = { kind: "file", path: "a.cs", body: "Meant for the all review", clientRequestId: "c-stale" };
             const stale = await post("/api/threads", comment, { ...headers, "X-MR-Review": allId });
             assert.equal(stale.status, 409);
-            assert.equal(stale.json.error.code, "conflict");
+            assert.equal(required(required(stale.json).error).code, "conflict");
             assert.equal((await service.getReview(allId)).threads.length, 0);
             assert.equal((await service.getReview(pendingId)).threads.length, 0, "nothing lands in the review that replaced it");
 
@@ -658,7 +725,7 @@ test("the settings and scope endpoints say so when the host does not provide the
         assert.equal((await state()).settings, null);
         const settings = await post("/api/settings", { learning: "auto" });
         assert.equal(settings.status, 501);
-        assert.equal(settings.json.error.code, "unsupported");
+        assert.equal(required(required(settings.json).error).code, "unsupported");
         assert.equal((await post("/api/scope", { scope: "bogus" })).status, 400, "validation comes first");
         assert.equal((await post("/api/scope", { scope: "pending" })).status, 501);
     });
@@ -668,18 +735,18 @@ test("a failing settings read leaves the review usable", async () => {
     const { service } = fresh();
     const delivery = new Delivery({ service, send: async () => "sm-1" });
     const reviewId = await service.ensureReview({ repoPath: repo, base: "main" });
-    const logs = [];
-    const settings = {
-        get: async () => {
+    const logs: Array<{ m: string; level?: string }> = [];
+    const settings = new SettingsService({ store: service.store });
+    Object.defineProperty(settings, "get", {
+        value: async () => {
             throw new Error("settings disk error");
         },
-        update: async () => ({}),
-    };
+    });
 
     await withServer({ instanceId: "inst-failing", getReviewId: () => reviewId, service, delivery, settings, log: (m, level) => logs.push({ m, level }) }, async ({ state }) => {
         const view = await state();
         assert.equal(view.settings, null);
-        assert.equal(view.review.reviewId, reviewId);
+        assert.equal(required(view.review).reviewId, reviewId);
     });
     assert.ok(logs.some(({ m, level }) => level === "warning" && /could not read settings: settings disk error/.test(m)));
 });
@@ -687,9 +754,14 @@ test("a failing settings read leaves the review usable", async () => {
 test("retired historical commit reviews stay on disk but are never reopened, refreshed, or written as All/Pending reviews", async () => {
     const { store, service } = fresh();
     const { reviewId, thread } = await commentThread(service, "Old local note");
-    await store.updateReview(reviewId, (review) => ({ review: { ...review, scope: "commit", commit: review.git.headCommit } }));
+    await store.updateReview(reviewId, (current) => {
+        const review = required(current);
+        const retired = { ...review, scope: "commit", commit: required(review.git).headCommit } as Review & { commit: string };
+        return { review: retired };
+    });
     const retired = /historical single-commit review.*local notes remain stored/;
-    const rejects = (promise) => assert.rejects(promise, (error) => error.code === "unsupported" && retired.test(error.message));
+    const rejects = (promise: Promise<unknown>) => assert.rejects(promise, (error) =>
+        errorHasCode(error, "unsupported") && error instanceof Error && retired.test(error.message));
     await rejects(service.ensureReview({ reviewId }));
     await rejects(service.refresh(reviewId));
     await rejects(service.openSibling(reviewId, "pending"));
@@ -699,7 +771,7 @@ test("retired historical commit reviews stay on disk but are never reopened, ref
     await rejects(service.updateDescription(reviewId, { body: "New description", expectedVersion: 0 }));
     assert.equal(scopeOf(await service.getReview(reviewId)), "all", "the UI scope helper never presents commit as a selectable scope");
 
-    const stored = await store.readReview(reviewId);
+    const stored = required(await store.readReview(reviewId)) as Review & { commit: string };
     assert.equal(stored.scope, "commit");
     assert.deepEqual(stored.threads.map((t) => t.messages.map((m) => m.body)), [["Old local note"]], "retired notes are preserved untouched");
     assert.deepEqual(stored.threads.map((t) => t.status), [thread.status], "retired thread statuses are unchanged");
@@ -711,6 +783,6 @@ test("retired historical commit reviews stay on disk but are never reopened, ref
     await withServer({ instanceId: "inst-retired", getReviewId: () => allId, service: other.service, delivery }, async ({ post }) => {
         const commit = await post("/api/scope", { scope: "commit", commit: stored.commit });
         assert.equal(commit.status, 400);
-        assert.match(commit.json.error.message, /scope must be one of all, pending/);
+        assert.match(required(required(commit.json).error).message, /scope must be one of all, pending/);
     });
 });

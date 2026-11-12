@@ -5,20 +5,30 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { runGit } from "../dist/lib/git.mjs";
-import { Store } from "../dist/lib/store.mjs";
-import { ReviewService } from "../dist/lib/review-service.mjs";
-import { Delivery } from "../dist/lib/delivery.mjs";
-import { startReviewServer } from "../dist/lib/server.mjs";
-import { DEFAULT_DELIVERY, DELIVERY_MODES, SettingsService, resolveDelivery } from "../dist/lib/settings.mjs";
+import {
+    DEFAULT_DELIVERY, DELIVERY_MODES, Delivery, ReviewService, SettingsService, Store, runGit, startReviewServer, resolveDelivery,
+} from "./modules.mjs";
+import type { MessageDelivery, ReviewService as ReviewServiceType } from "../src/lib/review-service.mjs";
+import type { SendOptions } from "../src/lib/delivery.mjs";
+import type { Delivery as DeliveryType } from "../src/lib/delivery.mjs";
+import type { SettingsService as SettingsServiceType } from "../src/lib/settings.mjs";
 
 const WEB_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "dist", "web");
-const lines = (n, f = (i) => `line ${i}`) => Array.from({ length: n }, (_, i) => f(i + 1)).join("\n") + "\n";
-const git = (cwd, ...args) => runGit(cwd, ["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "core.autocrlf=false", ...args]);
+const lines = (n: number, f: (i: number) => string = (i) => `line ${i}`) => Array.from({ length: n }, (_, i) => f(i + 1)).join("\n") + "\n";
+const git = (cwd: string, ...args: string[]) => runGit(cwd, ["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "core.autocrlf=false", ...args]);
 
-let tmp;
-let repo;
+let tmp!: string;
+let repo!: string;
 let seq = 0;
+
+function required<T>(value: T | null | undefined): T {
+    assert.ok(value);
+    return value;
+}
+
+function hasErrorCode(value: unknown, code: string): boolean {
+    return typeof value === "object" && value !== null && "code" in value && value.code === code;
+}
 
 // Fixture: feature changes a.cs and b.cs relative to main.
 before(async () => {
@@ -40,7 +50,7 @@ after(async () => {
     await rm(tmp, { recursive: true, force: true });
 });
 
-function fresh() {
+function fresh(): { store: InstanceType<typeof Store>; service: ReviewServiceType } {
     const store = new Store(path.join(tmp, `data-${++seq}`));
     return { store, service: new ReviewService({ store }) };
 }
@@ -54,8 +64,8 @@ test("Delivery busy starts unknown until session activity is observed", () => {
 });
 
 // A Delivery whose session records every prompt; set control.fail to make sending throw.
-function recorder(service, control = {}) {
-    const sent = [];
+function recorder(service: ReviewServiceType, control: { fail?: boolean } = {}) {
+    const sent: SendOptions[] = [];
     const delivery = new Delivery({
         service,
         send: async (opts) => {
@@ -67,7 +77,7 @@ function recorder(service, control = {}) {
     return { sent, delivery };
 }
 
-async function waitFor(predicate, label, timeoutMs = 5000) {
+async function waitFor<T>(predicate: () => T | Promise<T>, label: string, timeoutMs = 5000): Promise<T> {
     const start = Date.now();
     for (;;) {
         const value = await predicate();
@@ -77,11 +87,48 @@ async function waitFor(predicate, label, timeoutMs = 5000) {
     }
 }
 
-function request(port, { method = "GET", pathName, headers = {}, body }) {
+interface HttpResult {
+    status: number | undefined;
+    text: string;
+    json: Record<string, unknown> & {
+        draft?: boolean;
+        threadId?: string;
+        messageId?: string;
+        mode?: string | null;
+        submitted?: number;
+        delivered?: boolean;
+        sessionMessageId?: string;
+        settings?: { delivery?: string };
+        review?: { deliveryMode?: string };
+        error?: { code?: string; message?: string };
+    };
+}
+
+interface ServerState {
+    settings: { delivery: string };
+    review: { deliveryMode?: string };
+}
+
+interface ServerApi {
+    state: () => Promise<ServerState>;
+    post: (pathName: string, body: unknown) => Promise<HttpResult>;
+}
+
+interface ServerOptions {
+    instanceId: string;
+    getReviewId: () => string;
+    service: ReviewServiceType;
+    delivery: DeliveryType;
+    settings?: SettingsServiceType;
+}
+
+function request(port: number, { method = "GET", pathName, headers = {}, body }: {
+    method?: string; pathName: string; headers?: http.OutgoingHttpHeaders; body?: unknown;
+}): Promise<HttpResult> {
     return new Promise((resolve, reject) => {
         const req = http.request({ host: "127.0.0.1", port, method, path: pathName, headers }, (res) => {
-            const chunks = [];
-            res.on("data", (c) => chunks.push(c));
+            const chunks: Buffer[] = [];
+            res.on("data", (c: Buffer) => chunks.push(c));
             res.on("end", () => {
                 const text = Buffer.concat(chunks).toString("utf8");
                 let json = null;
@@ -97,26 +144,26 @@ function request(port, { method = "GET", pathName, headers = {}, body }) {
     });
 }
 
-async function withServer(options, fn) {
+async function withServer<T>(options: ServerOptions, fn: (api: ServerApi) => Promise<T>): Promise<T> {
     const server = await startReviewServer({ webRoot: WEB_ROOT, ...options });
     try {
         const url = new URL(server.url);
         const port = Number(url.port);
-        const token = url.searchParams.get("t");
+        const token = required(url.searchParams.get("t"));
         const headers = { "Content-Type": "application/json", "X-MR-Token": token };
         return await fn({
-            state: async () => (await request(port, { pathName: `/api/state?t=${token}` })).json,
-            post: (pathName, body) => request(port, { method: "POST", pathName, headers, body }),
+            state: async () => (await request(port, { pathName: `/api/state?t=${token}` })).json as unknown as ServerState,
+            post: (pathName: string, body: unknown) => request(port, { method: "POST", pathName, headers, body }),
         });
     } finally {
         await server.close();
     }
 }
 
-const openReview = (service) => service.ensureReview({ repoPath: repo, base: "main" });
-const draftThread = (service, reviewId, filePath, body) => service.createThread(reviewId, { kind: "file", path: filePath, body, author: "user", hold: true });
-const draftReply = (service, reviewId, threadId, body) => service.addMessage(reviewId, threadId, { body, author: "user", hold: true });
-const stateOf = async (service, reviewId, messageId) => (await service.findMessage(reviewId, messageId)).message.delivery.state;
+const openReview = (service: ReviewServiceType) => service.ensureReview({ repoPath: repo, base: "main" });
+const draftThread = (service: ReviewServiceType, reviewId: string, filePath: string, body: string) => service.createThread(reviewId, { kind: "file", path: filePath, body, author: "user", hold: true });
+const draftReply = (service: ReviewServiceType, reviewId: string, threadId: string, body: string) => service.addMessage(reviewId, threadId, { body, author: "user", hold: true });
+const stateOf = async (service: ReviewServiceType, reviewId: string, messageId: string) => required((await service.findMessage(reviewId, messageId)).message.delivery).state;
 const MARKER_LINE = /^\[self-review sr:[^:]+:(m-[0-9a-f-]+)\]$/gm;
 
 test("resolveDelivery uses the repository mode and lets an ask-mode review decide for itself", () => {
@@ -150,7 +197,7 @@ test("held comments stay drafts until the review is submitted, then are claimed 
     const other = await draftThread(service, reviewId, "b.cs", "Why is this needed?");
     const direct = await service.createThread(reviewId, { kind: "file", path: "b.cs", body: "Sent right away", author: "user" });
     for (const m of [first.message, second.message, other.message]) assert.deepEqual(m.delivery, { state: "draft", attempts: 0 });
-    assert.equal(direct.message.delivery.state, "saving");
+    assert.equal(required(direct.message.delivery).state, "saving");
     assert.equal(service.summarize(await service.getReview(reviewId)).counts.drafts, 3);
 
     const claims = await service.claimDrafts(reviewId);
@@ -159,10 +206,10 @@ test("held comments stay drafts until the review is submitted, then are claimed 
         [first.thread.threadId, second.message.messageId, 1],
         [other.thread.threadId, other.message.messageId, 1],
     ]);
-    const deliveries = [];
-    for (const c of claims) deliveries.push((await service.findMessage(reviewId, c.messageId)).message.delivery);
+    const deliveries: MessageDelivery[] = [];
+    for (const c of claims) deliveries.push(required((await service.findMessage(reviewId, c.messageId)).message.delivery));
     assert.ok(deliveries.every((d) => d.state === "saving" && d.batchId && d.batchId === deliveries[0].batchId), "one batch id ties the submitted comments together");
-    assert.equal((await service.findMessage(reviewId, direct.message.messageId)).message.delivery.batchId, undefined, "a comment that was not held is not part of the batch");
+    assert.equal(required((await service.findMessage(reviewId, direct.message.messageId)).message.delivery).batchId, undefined, "a comment that was not held is not part of the batch");
     assert.equal(service.summarize(await service.getReview(reviewId)).counts.drafts, 0);
     assert.deepEqual(await service.claimDrafts(reviewId), [], "a review is submitted once");
 });
@@ -190,7 +237,7 @@ test("an agent reply answers every comment its thread received in the same submi
 
     await assert.rejects(
         () => service.addMessage(reviewId, first.thread.threadId, { author: "agent", body: "Done", inReplyTo: second.message.messageId }),
-        (e) => e.code === "conflict",
+        (e: unknown) => hasErrorCode(e, "conflict"),
         "the agent cannot answer a comment it was never sent",
     );
 
@@ -219,8 +266,8 @@ test("discarding a draft removes it, and its thread when nothing else is left", 
     const review = await service.getReview(reviewId);
     assert.deepEqual(review.threads.map((t) => [t.threadId, t.messages.length]), [[kept.thread.threadId, 1]]);
 
-    await assert.rejects(() => service.discardDraft(reviewId, kept.message.messageId), (e) => e.code === "conflict", "a comment the agent may have seen stays");
-    await assert.rejects(() => service.discardDraft(reviewId, reply.message.messageId), (e) => e.code === "not_found");
+    await assert.rejects(() => service.discardDraft(reviewId, kept.message.messageId), (e: unknown) => hasErrorCode(e, "conflict"), "a comment the agent may have seen stays");
+    await assert.rejects(() => service.discardDraft(reviewId, reply.message.messageId), (e: unknown) => hasErrorCode(e, "not_found"));
 });
 
 test("an ask-mode review records the reviewer's choice and can ask again", async () => {
@@ -230,10 +277,10 @@ test("an ask-mode review records the reviewer's choice and can ask again", async
     assert.equal(await service.setDeliveryChoice(reviewId, "batch"), "batch");
     assert.equal((await service.getReview(reviewId)).deliveryMode, "batch");
     for (const mode of ["ask", "later", undefined, 1]) {
-        await assert.rejects(() => service.setDeliveryChoice(reviewId, mode), (e) => e.code === "invalid_input", String(mode));
+        await assert.rejects(() => Reflect.apply(service.setDeliveryChoice, service, [reviewId, mode]), (e: unknown) => hasErrorCode(e, "invalid_input"), String(mode));
     }
     assert.equal((await service.getReview(reviewId)).deliveryMode, "batch", "a rejected choice changes nothing");
-    assert.equal(await service.setDeliveryChoice(reviewId, null), null);
+    assert.equal(await Reflect.apply(service.setDeliveryChoice, service, [reviewId, null]), null);
     assert.equal("deliveryMode" in (await service.getReview(reviewId)), false);
 });
 
@@ -318,7 +365,7 @@ test("in batch mode the API holds comments as drafts until the review is submitt
         const a = await post("/api/threads", { kind: "file", path: "a.cs", body: "Rename this" });
         assert.equal(a.status, 200);
         assert.equal(a.json.draft, true);
-        const a2 = await post(`/api/threads/${a.json.threadId}/messages`, { body: "And add a test" });
+        const a2 = await post(`/api/threads/${required(a.json.threadId)}/messages`, { body: "And add a test" });
         assert.equal(a2.json.draft, true);
         const b = await post("/api/threads", { kind: "file", path: "b.cs", body: "Why is this needed?" });
         const c = await post("/api/threads", { kind: "file", path: "b.cs", body: "Typo here" });
@@ -327,22 +374,22 @@ test("in batch mode the API holds comments as drafts until the review is submitt
         const urgent = await post("/api/threads", { kind: "file", path: "b.cs", body: "This breaks the build", draft: false });
         assert.equal(urgent.json.draft, false, "an explicit draft flag overrides the mode");
         await waitFor(() => sent.length === 1, "the urgent comment to be delivered");
-        assert.ok(sent[0].prompt.includes(urgent.json.messageId));
+        assert.ok(sent[0].prompt.includes(required(urgent.json.messageId)));
         const invalid = await post("/api/threads", { kind: "file", path: "a.cs", body: "Never stored", draft: "yes" });
         assert.equal(invalid.status, 400);
-        assert.equal(invalid.json.error.code, "invalid_input");
+        assert.equal(required(invalid.json.error).code, "invalid_input");
 
-        assert.deepEqual((await post(`/api/messages/${b.json.messageId}/discard`, {})).json, { threadId: b.json.threadId, threadRemoved: true });
+        assert.deepEqual((await post(`/api/messages/${required(b.json.messageId)}/discard`, {})).json, { threadId: b.json.threadId, threadRemoved: true });
         for (const action of ["send", "discard"]) {
-            const rejected = await post(`/api/messages/${urgent.json.messageId}/${action}`, {});
+            const rejected = await post(`/api/messages/${required(urgent.json.messageId)}/${action}`, {});
             assert.equal(rejected.status, 409, action);
-            assert.equal(rejected.json.error.code, "conflict");
+            assert.equal(required(rejected.json.error).code, "conflict");
         }
 
-        const single = await post(`/api/messages/${c.json.messageId}/send`, {});
+        const single = await post(`/api/messages/${required(c.json.messageId)}/send`, {});
         assert.equal(single.status, 200);
         assert.deepEqual(single.json, { delivered: true, sessionMessageId: "sm-2" });
-        assert.ok(sent[1].prompt.includes(c.json.messageId) && !sent[1].prompt.includes("Rename this"), "sending one draft leaves the others held");
+        assert.ok(sent[1].prompt.includes(required(c.json.messageId)) && !sent[1].prompt.includes("Rename this"), "sending one draft leaves the others held");
 
         const submitted = await post("/api/submit", {});
         assert.equal(submitted.status, 200);
@@ -367,12 +414,12 @@ test("in ask mode comments wait as drafts until the reviewer chooses how this re
         for (const mode of ["ask", "later", undefined]) {
             const rejected = await post("/api/delivery", { mode });
             assert.equal(rejected.status, 400, String(mode));
-            assert.equal(rejected.json.error.code, "invalid_input");
+            assert.equal(required(rejected.json.error).code, "invalid_input");
         }
 
         assert.deepEqual((await post("/api/delivery", { mode: "batch" })).json, { mode: "batch", submitted: 0 });
         assert.equal((await state()).review.deliveryMode, "batch");
-        assert.equal((await post(`/api/threads/${held.json.threadId}/messages`, { body: "Still batching" })).json.draft, true);
+        assert.equal((await post(`/api/threads/${required(held.json.threadId)}/messages`, { body: "Still batching" })).json.draft, true);
         assert.equal(sent.length, 0);
 
         assert.deepEqual((await post("/api/delivery", { mode: "immediate" })).json, { mode: "immediate", submitted: 2 }, "switching to immediate sends what was held");
@@ -401,7 +448,7 @@ test("choosing immediate reports held drafts that could not be sent", async () =
         assert.equal(chosen.status, 200, "the mode is saved even though sending failed");
         assert.deepEqual(chosen.json, { mode: "immediate", submitted: 1, error: "session closed" });
         assert.equal(sent.length, 0);
-        assert.equal(await stateOf(service, reviewId, held.json.messageId), "failed", "the draft can be resent");
+        assert.equal(await stateOf(service, reviewId, required(held.json.messageId)), "failed", "the draft can be resent");
     });
 });
 

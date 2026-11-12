@@ -7,15 +7,42 @@ import { constants } from "node:fs";
 import { lstat, open, readlink, realpath } from "node:fs/promises";
 import path from "node:path";
 import { parseUnifiedDiff, synthesizeAddedFile } from "./diff.mjs";
+import type { DiffFile } from "./diff.mjs";
+import type { ReviewScope } from "../../types/contracts.js";
+
+export interface CaptureOptions {
+    repoRoot: string;
+    base: string | null;
+    paths?: string[];
+    exclude?: string[];
+    includeUntracked?: boolean;
+    contextLines?: number;
+    scope?: ReviewScope;
+}
+
+export interface Snapshot {
+    revisionId?: string;
+    base: string | null;
+    baseCommit: string;
+    headCommit: string;
+    branch: string;
+    upstream: { name: string; ahead: number | null; behind: number | null } | null;
+    uncommittedFiles: string[];
+    fingerprint: string;
+    files: DiffFile[];
+}
+
+type RepoFile = { tooLarge?: false; buffer: Buffer; contentHash?: string } | { tooLarge: true; contentHash: string };
+const errorCode = (error: unknown) => error && typeof error === "object" && "code" in error ? error.code : undefined;
 
 const MAX_UNTRACKED_BYTES = 2 * 1024 * 1024;
 
-export async function resolveRepoRoot(repoPath) {
+export async function resolveRepoRoot(repoPath: string) {
     const { stdout } = await runGit(repoPath, ["rev-parse", "--show-toplevel"]);
     return path.resolve(stdout.trim());
 }
 
-export async function defaultBase(repoRoot) {
+export async function defaultBase(repoRoot: string) {
     const head = await runGit(repoRoot, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], { allowFail: true });
     if (head.ok && head.stdout.trim()) return head.stdout.trim();
     for (const candidate of ["origin/main", "origin/master", "main", "master"]) {
@@ -25,7 +52,7 @@ export async function defaultBase(repoRoot) {
     throw new Error("Could not determine a base ref; pass input.base explicitly.");
 }
 
-export function buildPathspec(paths, exclude) {
+export function buildPathspec(paths?: string[], exclude?: string[]) {
     const spec = [];
     if (paths && paths.length) spec.push(...paths);
     else spec.push(".");
@@ -34,7 +61,7 @@ export function buildPathspec(paths, exclude) {
 }
 
 // Resolves a repo-relative path and refuses anything that escapes the repository.
-export function safeJoin(repoRoot, relPath) {
+export function safeJoin(repoRoot: string, relPath: string) {
     const full = path.resolve(repoRoot, relPath);
     const rel = path.relative(repoRoot, full);
     // Only a whole ".." component escapes; names such as "..notes" stay inside the repository.
@@ -42,13 +69,13 @@ export function safeJoin(repoRoot, relPath) {
     return full;
 }
 
-function isBinary(buffer) {
+function isBinary(buffer: Buffer) {
     const len = Math.min(buffer.length, 8000);
     for (let i = 0; i < len; i++) if (buffer[i] === 0) return true;
     return false;
 }
 
-async function readUntracked(repoRoot, relPath) {
+async function readUntracked(repoRoot: string, relPath: string): Promise<DiffFile | null> {
     const result = await readRepoFile(repoRoot, relPath, MAX_UNTRACKED_BYTES);
     if (!result) return null;
     if (result.tooLarge) {
@@ -63,7 +90,7 @@ async function readUntracked(repoRoot, relPath) {
 
 // Read symlinks as Git does (their target text), never as the target's contents.
 // Resolve and check the parent too, so junctions/directory symlinks cannot escape.
-async function readRepoFile(repoRoot, relPath, maxBytes = Infinity) {
+async function readRepoFile(repoRoot: string, relPath: string, maxBytes = Infinity): Promise<RepoFile | null> {
     const full = safeJoin(repoRoot, relPath);
     const root = await realpath(repoRoot);
     const parent = await realpath(path.dirname(full));
@@ -80,7 +107,7 @@ async function readRepoFile(repoRoot, relPath, maxBytes = Infinity) {
     try {
         if (!Number.isFinite(maxBytes)) return { buffer: await handle.readFile() };
         const hash = createHash("sha256");
-        const chunks = [];
+        const chunks: Buffer[] = [];
         let size = 0;
         // Hash every byte from the same safe handle; retain only display-sized files in memory.
         for await (const chunk of handle.createReadStream({ autoClose: false })) {
@@ -98,15 +125,15 @@ async function readRepoFile(repoRoot, relPath, maxBytes = Infinity) {
 
 // scope "all" diffs the working tree against the merge-base with `base` (the whole branch or PR);
 // scope "pending" diffs it against HEAD, so committed work is left out.
-export async function captureSnapshot({ repoRoot, base, paths, exclude, includeUntracked = true, contextLines = 5, scope = "all" }) {
+export async function captureSnapshot({ repoRoot, base, paths, exclude, includeUntracked = true, contextLines = 5, scope = "all" }: CaptureOptions): Promise<Snapshot> {
     const head = (await runGit(repoRoot, ["rev-parse", "HEAD"])).stdout.trim();
     const branch = (await runGit(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])).stdout.trim();
     let baseCommit = head;
     if (scope !== "pending") {
-        const mergeBase = await runGit(repoRoot, ["merge-base", base, "HEAD"], { allowFail: true });
+        const mergeBase = await runGit(repoRoot, ["merge-base", base!, "HEAD"], { allowFail: true });
         baseCommit = mergeBase.ok && mergeBase.stdout.trim()
             ? mergeBase.stdout.trim()
-            : (await runGit(repoRoot, ["rev-parse", "--verify", base])).stdout.trim();
+            : (await runGit(repoRoot, ["rev-parse", "--verify", base!])).stdout.trim();
     }
     const pathspec = buildPathspec(paths, exclude);
 
@@ -123,7 +150,7 @@ export async function captureSnapshot({ repoRoot, base, paths, exclude, includeU
         const untracked = list.stdout.split("\0").filter(Boolean).sort();
         for (const rel of untracked) {
             const entry = await readUntracked(repoRoot, rel).catch((err) => {
-                if (err?.code === "ENOENT") return null;
+                if (errorCode(err) === "ENOENT") return null;
                 throw err;
             });
             if (!entry) continue;
@@ -139,11 +166,11 @@ export async function captureSnapshot({ repoRoot, base, paths, exclude, includeU
         ? uncommitted.stdout.split("\0").filter((e) => /^.. /.test(e)).map((e) => e.slice(3))
         : [];
 
-    let upstream = null;
+    let upstream: Snapshot["upstream"] = null;
     const up = await runGit(repoRoot, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], { allowFail: true });
     if (up.ok && up.stdout.trim()) {
         const counts = await runGit(repoRoot, ["rev-list", "--left-right", "--count", "@{u}...HEAD"], { allowFail: true });
-        const [behind, ahead] = counts.ok ? counts.stdout.trim().split(/\s+/).map(Number) : [null, null];
+        const [behind = null, ahead = null] = counts.ok ? counts.stdout.trim().split(/\s+/).map(Number) : [null, null];
         upstream = { name: up.stdout.trim(), ahead, behind };
     }
 
@@ -159,17 +186,17 @@ export async function captureSnapshot({ repoRoot, base, paths, exclude, includeU
     };
 }
 
-export async function readWorkingFile(repoRoot, relPath) {
+export async function readWorkingFile(repoRoot: string, relPath: string) {
     try {
         const result = await readRepoFile(repoRoot, relPath);
-        return result ? result.buffer.toString("utf8").split("\n").map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l)) : null;
+        return result && !result.tooLarge ? result.buffer.toString("utf8").split("\n").map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l)) : null;
     } catch (err) {
-        if (err?.code === "ENOENT" || err?.code === "ENOTDIR") return null;
+        if (errorCode(err) === "ENOENT" || errorCode(err) === "ENOTDIR") return null;
         throw err;
     }
 }
 
-export async function readCommitFile(repoRoot, commit, relPath) {
+export async function readCommitFile(repoRoot: string, commit: string, relPath: string) {
     const r = await runGit(repoRoot, ["show", `${commit}:${relPath}`], { allowFail: true });
     if (!r.ok) return null;
     return r.stdout.split("\n").map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l));

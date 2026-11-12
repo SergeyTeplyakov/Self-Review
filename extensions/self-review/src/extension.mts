@@ -155,6 +155,8 @@ async function ensureServer(instanceId: string, reviewId: string): Promise<Insta
 
 async function openReview(ctx: OpenContext): Promise<Awaited<ReturnType<Canvas["open"]>>> {
     const input = inputOf(ctx);
+    if (input.title !== undefined && typeof input.title !== "string") throw new CanvasError("invalid_input", "title must be a string.");
+    const title = input.title;
     const cwd = ctx.session?.workingDirectory || process.cwd();
     const hasRepoFields = REPO_FIELDS.some((k) => input[k] !== undefined);
     let reviewId: string;
@@ -165,7 +167,7 @@ async function openReview(ctx: OpenContext): Promise<Awaited<ReturnType<Canvas["
         const previous = instances.get(ctx.instanceId)?.reviewId ?? mapped?.reviewId;
         if (previous) {
             try {
-                reviewId = await service.ensureReview({ reviewId: previous, title: input.title, scope: input.scope }, { cwd });
+                reviewId = await service.ensureReview({ reviewId: previous, title, scope: input.scope }, { cwd });
             } catch (error) {
                 if (!(error instanceof ReviewError) || (error.code !== "not_found" && error.code !== "unsupported")) throw error;
                 if (error.code === "unsupported") {
@@ -174,7 +176,7 @@ async function openReview(ctx: OpenContext): Promise<Awaited<ReturnType<Canvas["
                     const origin = mapped?.reviewId === previous ? mapped.returnReviewId : null;
                     if (origin) {
                         try {
-                            reviewId = await service.ensureReview({ reviewId: origin, title: input.title, scope: input.scope }, { cwd });
+                            reviewId = await service.ensureReview({ reviewId: origin, title, scope: input.scope }, { cwd });
                         } catch (originError) {
                             if (!(originError instanceof ReviewError) || originError.code !== "not_found") throw originError;
                         }

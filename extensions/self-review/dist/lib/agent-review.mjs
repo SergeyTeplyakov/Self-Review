@@ -2,9 +2,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { ReviewError, isRetiredCommitReview, retiredCommitError } from "./review-service.mjs";
 import { selectedLines } from "./diff.mjs";
-import { reviewOptions, REVIEW_FOCUSES, FUSION_REVIEWER, SUGGESTED_REVIEWERS } from "../web/contracts.mjs";
+import { reviewOptions, FUSION_REVIEWER, isRecord } from "../web/contracts.mjs";
 export { reviewOptions, REVIEW_FOCUSES, FUSION_REVIEWER, SUGGESTED_REVIEWERS } from "../web/contracts.mjs";
-
+const errorMessage = (error) => String(error && typeof error === "object" && "message" in error ? error.message ?? error : error);
 export const ACTIVE_RUN_STATES = ["sending", "queued", "running"];
 export const FINDING_ASSESSMENTS = ["confirmed", "pre-existing", "rejected", "unverified"];
 export const FINDING_SEVERITIES = ["critical", "required", "optional", "nit", "fyi"];
@@ -15,45 +15,38 @@ const invalid = (message) => new ReviewError("invalid_input", message);
 const conflict = (message) => new ReviewError("conflict", message);
 const runIn = (review, runId) => {
     const run = review?.agentReviews?.find((r) => r.runId === runId);
-    if (!run) throw new ReviewError("not_found", `Agent review ${runId} not found.`);
+    if (!run)
+        throw new ReviewError("not_found", `Agent review ${runId} not found.`);
     return run;
 };
-
 function requiredText(value, name, maxLength) {
     if (typeof value !== "string" || !value.trim() || value.length > maxLength) {
         throw invalid(`${name} must be non-empty text (up to ${maxLength} characters).`);
     }
     return value.trim();
 }
-
 function evidenceOf(value) {
-    if (!value || typeof value !== "object" || Array.isArray(value)) throw invalid("Finding evidence is required.");
-    return Object.fromEntries(EVIDENCE_FIELDS.map((key) => [key, requiredText(value[key], `evidence.${key}`, 2000)]));
+    if (!value || typeof value !== "object" || Array.isArray(value))
+        throw invalid("Finding evidence is required.");
+    const fields = value;
+    return {
+        source: requiredText(fields.source, "evidence.source", 2000),
+        baseline: requiredText(fields.baseline, "evidence.baseline", 2000),
+        validation: requiredText(fields.validation, "evidence.validation", 2000),
+    };
 }
-
 export function buildAgentReviewPrompt(review, run, instanceId, skillContent = []) {
     const address = JSON.stringify({ instanceId, reviewId: review.reviewId, runId: run.runId });
     const fusion = run.models.includes(FUSION_REVIEWER);
     const subagentModels = run.models.filter((model) => model !== FUSION_REVIEWER);
     const dispatch = [];
     if (subagentModels.length > 0) {
-        dispatch.push(
-            fusion
-                ? `Launch one independent read-only subagent per selected model except ${FUSION_REVIEWER} (${JSON.stringify(subagentModels)}), with the exact model ID explicitly selected. These model choices are user-directed.`
-                : "Launch one independent read-only subagent per selected model, with the exact model ID explicitly selected. These model choices are user-directed.",
-            "Give each subagent the pinned diff, goal/spec, repository standards, repository path, scope, and these instructions. Read relevant callers, guards, and tests as needed, but distinguish live surrounding context from the pinned diff.",
-            "Run those reviewers in parallel when supported. Do not substitute models, simulate their responses, or label your own review as theirs.",
-        );
+        dispatch.push(fusion
+            ? `Launch one independent read-only subagent per selected model except ${FUSION_REVIEWER} (${JSON.stringify(subagentModels)}), with the exact model ID explicitly selected. These model choices are user-directed.`
+            : "Launch one independent read-only subagent per selected model, with the exact model ID explicitly selected. These model choices are user-directed.", "Give each subagent the pinned diff, goal/spec, repository standards, repository path, scope, and these instructions. Read relevant callers, guards, and tests as needed, but distinguish live surrounding context from the pinned diff.", "Run those reviewers in parallel when supported. Do not substitute models, simulate their responses, or label your own review as theirs.");
     }
     if (fusion) {
-        dispatch.push(
-            `${FUSION_REVIEWER} is not a subagent model ID. It selects Copilot Fusion: the Auto model with a Fusion routing tier. Run it in exactly one coordinated child session; never emulate it with a subagent, switch this conversation's model, or label another model's output as ${FUSION_REVIEWER}.`,
-            `Create that child with create_session: session_kind "chat", coordinate_with_creator true, notify_on_idle "once", and kickoff {mode: "interactive", model: "auto", auto_tier: the Copilot Fusion tier the host lists, for example "hydrafusion" for High}. If create_session, Auto, or a Fusion tier is unavailable, immediately report an error for ${FUSION_REVIEWER}.`,
-            "The kickoff prompt must be standalone: include every pinned hunk, the base/head commits, repository path, scope, focus, goal/spec, repository standards, finding schema, and these read-only rules. The child may read repository files but must not edit, format, commit, build, create PRs or sessions, or dispatch other reviewers, and returns at most 20 candidates.",
-            "Tell the child to send exactly one send_session_message reply to its creator with its candidate findings and summary, or an error, and then stop. Start the child before waiting on subagents so they run in parallel.",
-            "Treat child messages as provisional until its idle notification or a confirmed terminal state. Do not finalize on the first message: Fusion can send intermediate replies before finishing. Once it finishes, reconcile all received candidates and summaries, preserving meaningful disagreements and verification limits.",
-            `Then validate its candidates exactly like other reviewers and call report_agent_review once with model ${FUSION_REVIEWER}; reports are immutable. If the child finishes without a usable result, report an error for ${FUSION_REVIEWER}.`,
-        );
+        dispatch.push(`${FUSION_REVIEWER} is not a subagent model ID. It selects Copilot Fusion: the Auto model with a Fusion routing tier. Run it in exactly one coordinated child session; never emulate it with a subagent, switch this conversation's model, or label another model's output as ${FUSION_REVIEWER}.`, `Create that child with create_session: session_kind "chat", coordinate_with_creator true, notify_on_idle "once", and kickoff {mode: "interactive", model: "auto", auto_tier: the Copilot Fusion tier the host lists, for example "hydrafusion" for High}. If create_session, Auto, or a Fusion tier is unavailable, immediately report an error for ${FUSION_REVIEWER}.`, "The kickoff prompt must be standalone: include every pinned hunk, the base/head commits, repository path, scope, focus, goal/spec, repository standards, finding schema, and these read-only rules. The child may read repository files but must not edit, format, commit, build, create PRs or sessions, or dispatch other reviewers, and returns at most 20 candidates.", "Tell the child to send exactly one send_session_message reply to its creator with its candidate findings and summary, or an error, and then stop. Start the child before waiting on subagents so they run in parallel.", "Treat child messages as provisional until its idle notification or a confirmed terminal state. Do not finalize on the first message: Fusion can send intermediate replies before finishing. Once it finishes, reconcile all received candidates and summaries, preserving meaningful disagreements and verification limits.", `Then validate its candidates exactly like other reviewers and call report_agent_review once with model ${FUSION_REVIEWER}; reports are immutable. If the child finishes without a usable result, report an error for ${FUSION_REVIEWER}.`);
     }
     dispatch.push("If a selected model or multi-model dispatch is unavailable, report an error for that model instead of claiming it reviewed the change.");
     const wait = fusion
@@ -113,9 +106,15 @@ export function buildAgentReviewPrompt(review, run, instanceId, skillContent = [
         ].join("\n"),
     };
 }
-
 export class AgentReview {
-    constructor({ service, send, sessionId, settings, reviewSkills, log = () => {} }) {
+    service;
+    store;
+    send;
+    sessionId;
+    settings;
+    reviewSkills;
+    log;
+    constructor({ service, send, sessionId, settings, reviewSkills, log = () => { } }) {
         this.service = service;
         this.store = service.store;
         this.send = send;
@@ -124,41 +123,50 @@ export class AgentReview {
         this.settings = settings;
         this.reviewSkills = reviewSkills;
     }
-
     owner() {
         const owner = this.sessionId();
-        if (!owner) throw conflict("No owning conversation is available.");
+        if (!owner)
+            throw conflict("No owning conversation is available.");
         return owner;
     }
-
     async start(reviewId, input, instanceId) {
         const review = await this.service.getReview(reviewId);
-        if (isRetiredCommitReview(review)) throw retiredCommitError(review);
-        if (typeof input.revisionId !== "string") throw invalid("revisionId is required.");
+        if (isRetiredCommitReview(review))
+            throw retiredCommitError(review);
+        if (typeof input.revisionId !== "string")
+            throw invalid("revisionId is required.");
+        const revisionId = input.revisionId;
         let selected = input;
         if (input.useDefaults !== undefined) {
-            if (input.useDefaults !== true || ["models", "focus", "intent"].some((key) => input[key] !== undefined)) {
+            if (input.useDefaults !== true || [input.models, input.focus, input.intent].some((value) => value !== undefined)) {
                 throw invalid("Use saved defaults or explicit models, focus, and intent, not both.");
             }
             selected = await this.settings?.getAgentReview();
-            if (!selected) throw invalid("No agent review defaults are saved. Configure them before running with defaults.");
-            if (input.skillNames !== undefined) selected = { ...selected, skillNames: input.skillNames };
+            if (!selected)
+                throw invalid("No agent review defaults are saved. Configure them before running with defaults.");
+            if (input.skillNames !== undefined)
+                selected = { ...selected, skillNames: input.skillNames };
         }
         const options = reviewOptions(selected);
-        if (options.skillNames?.length && !this.reviewSkills) throw invalid("Bundled review skills are unavailable.");
+        if (options.skillNames?.length && !this.reviewSkills)
+            throw invalid("Bundled review skills are unavailable.");
         // Content goes into the prompt only; the run records provenance, not the skill text.
         const skillContent = await this.reviewSkills?.forRun(options.skillNames) ?? [];
         const skills = skillContent.map(({ content, ...metadata }) => metadata);
         const owner = this.owner();
         await this.service.refresh(reviewId);
         const run = await this.store.updateReview(reviewId, async (review) => {
-            if (!review) throw new ReviewError("not_found", "Review not found.");
-            if (review.currentRevisionId !== input.revisionId) throw conflict("The diff changed. Refresh and check it before starting a review.");
-            if (review.agentReviews?.some((r) => ACTIVE_RUN_STATES.includes(r.state))) throw conflict("This review already has an active agent review.");
-            const snapshot = await this.service.getSnapshot(reviewId, input.revisionId);
-            if (!snapshot.files.length) throw invalid("There are no changes to review.");
+            if (!review)
+                throw new ReviewError("not_found", "Review not found.");
+            if (review.currentRevisionId !== revisionId)
+                throw conflict("The diff changed. Refresh and check it before starting a review.");
+            if (review.agentReviews?.some((r) => ACTIVE_RUN_STATES.includes(r.state)))
+                throw conflict("This review already has an active agent review.");
+            const snapshot = await this.service.getSnapshot(reviewId, revisionId);
+            if (!snapshot.files.length)
+                throw invalid("There are no changes to review.");
             const run = {
-                runId: `ar-${randomUUID()}`, ...options, skills, revisionId: input.revisionId,
+                runId: `ar-${randomUUID()}`, ...options, skills, revisionId,
                 owner, state: "sending", createdAt: now(), results: [], claimPid: this.service.pid,
             };
             (review.agentReviews ??= []).push(run);
@@ -168,75 +176,90 @@ export class AgentReview {
         try {
             const review = await this.service.getReview(reviewId);
             const transportId = await this.send(buildAgentReviewPrompt(review, run, instanceId, skillContent));
-            if (typeof transportId !== "string" || !transportId) throw new Error("The runtime did not acknowledge the review request.");
+            if (typeof transportId !== "string" || !transportId)
+                throw new Error("The runtime did not acknowledge the review request.");
             await this.store.updateReview(reviewId, (review) => {
                 const current = runIn(review, run.runId);
                 // Input/results can arrive before send resolves. Never regress their state.
-                if (current.state === "sending") current.state = "queued";
+                if (current.state === "sending")
+                    current.state = "queued";
                 current.transportId = transportId;
                 return { review };
             });
-        } catch (err) {
+        }
+        catch (err) {
             await this.store.updateReview(reviewId, (review) => {
                 const current = runIn(review, run.runId);
                 if (ACTIVE_RUN_STATES.includes(current.state)) {
                     current.state = "failed";
-                    current.error = String(err?.message ?? err);
+                    current.error = errorMessage(err);
                     current.finishedAt = now();
                 }
                 return { review };
             });
-            this.log(`self-review: could not send agent review ${run.runId}: ${err?.message ?? err}`, "warning");
+            this.log(`self-review: could not send agent review ${run.runId}: ${errorMessage(err)}`, "warning");
             throw err;
-        } finally {
+        }
+        finally {
             this.service.changed(reviewId, "agent-review");
         }
         return runIn(await this.service.getReview(reviewId), run.runId);
     }
-
     async input(reviewId, { runId, path: filePath, hunkIndex, side, startLine }) {
         const owner = this.owner();
         const review = await this.service.getReview(reviewId);
         const run = runIn(review, runId);
-        if (run.owner !== owner) throw conflict("This review belongs to another conversation.");
-        if ((hunkIndex !== undefined || side !== undefined || startLine !== undefined) && filePath === undefined) throw invalid("path is required for file input.");
-        if (startLine !== undefined && side === undefined) throw invalid("side is required for full-file content.");
-        if (side !== undefined && (!["old", "new"].includes(side) || hunkIndex !== undefined)) throw invalid("Choose either a hunkIndex or side old/new.");
+        if (run.owner !== owner)
+            throw conflict("This review belongs to another conversation.");
+        if ((hunkIndex !== undefined || side !== undefined || startLine !== undefined) && filePath === undefined)
+            throw invalid("path is required for file input.");
+        if (startLine !== undefined && side === undefined)
+            throw invalid("side is required for full-file content.");
+        if (side !== undefined && ((side !== "old" && side !== "new") || hunkIndex !== undefined))
+            throw invalid("Choose either a hunkIndex or side old/new.");
         const snapshot = await this.service.getSnapshot(reviewId, run.revisionId);
         let data;
         if (filePath !== undefined) {
             const file = snapshot.files.find((f) => f.path === filePath);
-            if (!file) throw invalid("That file is not in this review's pinned snapshot.");
-            if (hunkIndex !== undefined && (!Number.isInteger(hunkIndex) || hunkIndex < 0 || hunkIndex >= file.hunks.length)) {
+            if (!file)
+                throw invalid("That file is not in this review's pinned snapshot.");
+            if (hunkIndex !== undefined && (typeof hunkIndex !== "number" || !Number.isInteger(hunkIndex) || hunkIndex < 0 || hunkIndex >= file.hunks.length)) {
                 throw invalid("hunkIndex is outside the pinned file.");
             }
             const { hunks, ...metadata } = file;
             data = { file: metadata, hunkCount: hunks.length, ...(hunkIndex !== undefined ? { hunk: hunks[hunkIndex] } : {}) };
             if (side !== undefined) {
                 const start = startLine ?? 1;
-                if (!Number.isSafeInteger(start) || start < 1) throw invalid("startLine must be a positive integer.");
+                if (typeof start !== "number" || !Number.isSafeInteger(start) || start < 1)
+                    throw invalid("startLine must be a positive integer.");
                 let content;
                 const absent = side === "old" ? file.status === "added" : file.status === "deleted";
                 if (absent) {
                     content = { available: true, absent: true, lines: [] };
-                } else if (file.binary) {
+                }
+                else if (file.binary) {
                     content = { available: false, reason: "binary" };
-                } else if (side === "new") {
-                    content = await this.service.getFileContent(reviewId, run.revisionId, filePath);
-                } else {
+                }
+                else if (side === "new") {
+                    content = await this.service.getFileContent(reviewId, run.revisionId, file.path);
+                }
+                else {
                     const lines = await this.service.git.readCommitFile(review.repoRoot, snapshot.baseCommit, file.oldPath ?? file.path);
-                    if (lines?.at(-1) === "") lines.pop();
+                    if (lines?.at(-1) === "")
+                        lines.pop();
                     content = lines ? { available: true, lines } : { available: false, reason: "base-unavailable" };
                 }
                 if (content.available) {
                     const { lines, ...details } = content;
-                    if (start > Math.max(1, lines.length)) throw invalid("startLine is outside the pinned file.");
+                    if (start > Math.max(1, lines.length))
+                        throw invalid("startLine is outside the pinned file.");
                     const end = Math.min(start + 399, lines.length);
                     content = { ...details, startLine: start, lineCount: lines.length, lines: lines.slice(start - 1, end), nextStartLine: end < lines.length ? end + 1 : null };
                 }
                 data.content = { ...content, side, path: side === "old" ? file.oldPath ?? file.path : file.path };
             }
-        } else {
+        }
+        else {
             data = { files: snapshot.files.map(({ path, status, binary, hunks }) => ({ path, status, binary, hunkCount: hunks.length })) };
         }
         await this.store.updateReview(reviewId, (review) => {
@@ -253,60 +276,71 @@ export class AgentReview {
             baseCommit: snapshot.baseCommit, headCommit: snapshot.headCommit, ...data,
         };
     }
-
     async report(reviewId, { runId, model, findings, summary, error, ponytail }) {
         const owner = this.owner();
         if (error !== undefined) {
             if (typeof error !== "string" || !error.trim() || error.length > 4000 || findings !== undefined || summary !== undefined || ponytail !== undefined) {
                 throw invalid("Provide a non-empty error (up to 4000 characters), or findings and summary, not both.");
             }
-        } else if (!Array.isArray(findings) || findings.length > 20) {
+        }
+        else if (!Array.isArray(findings) || findings.length > 20) {
             throw invalid("Provide up to 20 findings and a summary, or an error.");
-        } else {
+        }
+        else {
             summary = requiredText(summary, "summary", 4000);
         }
         const digest = createHash("sha256").update(JSON.stringify({ findings, summary, error, ponytail })).digest("hex");
         const result = await this.store.updateReview(reviewId, async (review) => {
+            if (!review)
+                throw new ReviewError("not_found", "Review not found.");
             const run = runIn(review, runId);
-            if (run.owner !== owner || !run.models.includes(model)) throw conflict("This model was not requested by this conversation.");
+            if (run.owner !== owner || typeof model !== "string" || !run.models.includes(model))
+                throw conflict("This model was not requested by this conversation.");
             const previous = run.results.find((r) => r.model === model);
-            if (previous?.digest === digest) return { write: false, value: run };
-            if (previous || !ACTIVE_RUN_STATES.includes(run.state)) throw conflict("This model's result or review is already finalized.");
+            if (previous?.digest === digest)
+                return { write: false, value: run };
+            if (previous || !ACTIVE_RUN_STATES.includes(run.state))
+                throw conflict("This model's result or review is already finalized.");
             const ponytailRequested = run.skills?.some((skill) => skill.role === "ponytail");
             let ponytailResult;
             if (!error && ponytailRequested) {
-                if (!ponytail || !["used", "unavailable"].includes(ponytail.status) || !Array.isArray(ponytail.benefits)
+                if (!isRecord(ponytail) || (ponytail.status !== "used" && ponytail.status !== "unavailable") || !Array.isArray(ponytail.benefits)
                     || ponytail.benefits.length > 5 || (ponytail.status === "unavailable" && ponytail.benefits.length)) {
                     throw invalid("Requested Ponytail needs a used/unavailable report, summary and up to five evidence-backed benefits; unavailable must have none.");
                 }
                 ponytailResult = {
                     status: ponytail.status, summary: requiredText(ponytail.summary, "ponytail.summary", 4000),
                     benefits: ponytail.benefits.map((entry) => ({
-                        proposal: requiredText(entry?.proposal, "ponytail.proposal", 2000),
-                        benefit: requiredText(entry?.benefit, "ponytail.benefit", 2000),
-                        evidence: evidenceOf(entry?.evidence),
+                        proposal: requiredText(isRecord(entry) ? entry.proposal : undefined, "ponytail.proposal", 2000),
+                        benefit: requiredText(isRecord(entry) ? entry.benefit : undefined, "ponytail.benefit", 2000),
+                        evidence: evidenceOf(isRecord(entry) ? entry.evidence : undefined),
                     })),
                 };
-            } else if (ponytail !== undefined) {
+            }
+            else if (ponytail !== undefined) {
                 throw invalid("Ponytail was not selected for this run.");
             }
             const snapshot = await this.service.getSnapshot(reviewId, run.revisionId);
             const threads = [];
-            for (const f of findings ?? []) {
-                if (!f || !["line", "file", "overview"].includes(f.kind)
-                    || !["issue", "simplification"].includes(f.category)
-                    || !FINDING_ASSESSMENTS.includes(f.assessment) || !FINDING_SEVERITIES.includes(f.severity)
-                    || typeof f.body !== "string" || !f.body.trim() || f.body.length > 8000) throw invalid("Invalid review finding.");
+            const candidates = Array.isArray(findings) ? findings : [];
+            for (const f of candidates) {
+                if (!isRecord(f) || (f.kind !== "line" && f.kind !== "file" && f.kind !== "overview")
+                    || (f.category !== "issue" && f.category !== "simplification")
+                    || typeof f.assessment !== "string" || !FINDING_ASSESSMENTS.includes(f.assessment)
+                    || typeof f.severity !== "string" || !FINDING_SEVERITIES.includes(f.severity)
+                    || typeof f.body !== "string" || !f.body.trim() || f.body.length > 8000)
+                    throw invalid("Invalid review finding.");
                 const evidence = evidenceOf(f.evidence);
                 if ((run.focus === "review" && f.category !== "issue") || (run.focus === "simplify" && f.category !== "simplification")) {
                     throw invalid("The finding does not match the requested review focus.");
                 }
                 if (f.kind !== "overview") {
                     const file = snapshot.files.find((file) => file.path === f.path);
-                    if (!file) throw invalid("A finding must reference a file in the pinned snapshot.");
+                    if (!file)
+                        throw invalid("A finding must reference a file in the pinned snapshot.");
                     if (f.kind === "line") {
                         const end = f.endLine ?? f.startLine;
-                        if (!["new", "old"].includes(f.side) || !Number.isInteger(f.startLine) || !Number.isInteger(end)
+                        if ((f.side !== "new" && f.side !== "old") || typeof f.startLine !== "number" || typeof end !== "number" || !Number.isInteger(f.startLine) || !Number.isInteger(end)
                             || f.startLine < 1 || end < f.startLine || end - f.startLine > 399
                             || selectedLines(file, f.side, f.startLine, end).length !== end - f.startLine + 1) {
                             throw invalid("Line findings must be anchored to the supplied diff rows.");
@@ -314,11 +348,14 @@ export class AgentReview {
                     }
                 }
                 const { thread } = await this.service.buildThread(review, {
-                    kind: f.kind, path: f.path, side: f.side, startLine: f.startLine, endLine: f.endLine,
+                    kind: f.kind, path: typeof f.path === "string" ? f.path : undefined,
+                    side: f.side === "old" ? "old" : "new",
+                    startLine: typeof f.startLine === "number" ? f.startLine : undefined,
+                    endLine: typeof f.endLine === "number" ? f.endLine : undefined,
                     body: f.body, author: "agent", revisionId: run.revisionId,
                 });
                 thread.agentReview = {
-                    runId, model, category: f.category, revisionId: run.revisionId,
+                    runId: run.runId, model, category: f.category, revisionId: run.revisionId,
                     assessment: f.assessment, severity: f.severity, evidence,
                 };
                 threads.push(thread);
@@ -327,7 +364,9 @@ export class AgentReview {
             if (run.revisionId !== review.currentRevisionId) {
                 await this.service.relocateThreads(review, review.currentRevisionId, review.git?.baseCommit);
             }
-            run.results.push({ model, digest, state: error ? "failed" : "completed", error, summary, ponytail: ponytailResult, threadIds: threads.map((t) => t.threadId), finishedAt: now() });
+            run.results.push({ model, digest, state: error ? "failed" : "completed",
+                error: typeof error === "string" ? error : undefined, summary: typeof summary === "string" ? summary : undefined,
+                ponytail: ponytailResult, threadIds: threads.map((t) => t.threadId), finishedAt: now() });
             run.state = "running";
             if (run.results.length === run.models.length) {
                 const failures = run.results.filter((r) => r.state === "failed").length;
@@ -339,8 +378,10 @@ export class AgentReview {
                         for (const benefit of result.ponytail?.benefits ?? []) {
                             const key = `${benefit.proposal}\0${benefit.benefit}`.replace(/\s+/g, " ").trim().toLowerCase();
                             const existing = benefits.get(key);
-                            if (existing) existing.models.push(result.model);
-                            else benefits.set(key, { ...benefit, models: [result.model] });
+                            if (existing)
+                                existing.models.push(result.model);
+                            else
+                                benefits.set(key, { ...benefit, models: [result.model] });
                         }
                     }
                     // No supported benefit means no success-shaped overview comment.
@@ -360,7 +401,7 @@ export class AgentReview {
                         const { thread } = await this.service.buildThread(review, {
                             kind: "overview", body, author: "agent", revisionId: run.revisionId,
                         });
-                        thread.ponytailReport = { runId, revisionId: run.revisionId };
+                        thread.ponytailReport = { runId: run.runId, revisionId: run.revisionId };
                         review.threads.push(thread);
                         run.ponytailThreadId = thread.threadId;
                     }
@@ -371,11 +412,11 @@ export class AgentReview {
         this.service.changed(reviewId, "agent-review");
         return result;
     }
-
     async close(reviewId, runId) {
         const result = await this.store.updateReview(reviewId, (review) => {
             const run = runIn(review, runId);
-            if (!ACTIVE_RUN_STATES.includes(run.state)) return { write: false, value: run };
+            if (!ACTIVE_RUN_STATES.includes(run.state))
+                return { write: false, value: run };
             run.state = "closed";
             run.finishedAt = now();
             return { review, value: run };
@@ -383,7 +424,6 @@ export class AgentReview {
         this.service.changed(reviewId, "agent-review");
         return result;
     }
-
     async recover(reviewId) {
         await this.store.updateReview(reviewId, (review) => {
             let changed = false;
@@ -398,12 +438,12 @@ export class AgentReview {
             return changed ? { review } : { write: false };
         });
     }
-
     async approve(reviewId, threadId, revisionId) {
         await this.service.refresh(reviewId);
         const result = await this.store.updateReview(reviewId, (review) => {
             const thread = review?.threads.find((t) => t.threadId === threadId);
-            if (!thread?.agentReview) throw invalid("Only agent review findings can be approved.");
+            if (!review || !thread?.agentReview)
+                throw invalid("Only agent review findings can be approved.");
             if (thread.agentReview.approvalMessageId) {
                 return { write: false, value: { threadId, messageId: thread.agentReview.approvalMessageId } };
             }
@@ -415,7 +455,8 @@ export class AgentReview {
             if (revisionId !== review.currentRevisionId || thread.agentReview.revisionId !== revisionId) {
                 throw conflict("This finding reviews an older diff. Run a fresh review before approving, or discuss it explicitly.");
             }
-            if (thread.status !== "active") throw conflict("Reopen the thread before approving it.");
+            if (thread.status !== "active")
+                throw conflict("Reopen the thread before approving it.");
             // Only trusted text is attributed to the user; the prompt renders the finding separately as untrusted model output.
             const message = {
                 messageId: `m-${randomUUID()}`, author: "user", createdAt: now(), reviewIntent: "approve",

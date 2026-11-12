@@ -6,6 +6,17 @@ import { createHash, randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { settingsDocument } from "../web/contracts.mjs";
+import type { SettingsDocument } from "../../types/contracts.js";
+import type { Review, Lesson } from "./review-service.mjs";
+import type { Snapshot } from "./git.mjs";
+
+interface ReviewUpdate<T> {
+    review?: Review | null;
+    value?: T;
+    write?: boolean;
+}
+type InstanceMap = Record<string, string | { reviewId: string; returnReviewId?: string | null }>;
+const errorCode = (error: unknown) => error && typeof error === "object" && "code" in error ? error.code : undefined;
 
 const REVIEW_ID = /^[a-z0-9][a-z0-9._-]{0,100}$/;
 const REVISION_ID = /^r[0-9]{1,6}$/;
@@ -20,12 +31,12 @@ export function legacyDataRoot() {
     return path.join(os.homedir(), ".copilot", "extension-data", "manual-review");
 }
 
-async function exists(p) {
+async function exists(p: string) {
     try {
         await stat(p);
         return true;
     } catch (err) {
-        if (err?.code === "ENOENT") return false;
+        if (errorCode(err) === "ENOENT") return false;
         throw err;
     }
 }
@@ -58,30 +69,31 @@ export async function migrateLegacyDataRoot(root = defaultDataRoot(), legacyRoot
     }
 }
 
-export function assertReviewId(reviewId) {
+export function assertReviewId(reviewId: unknown): string {
     if (typeof reviewId !== "string" || !REVIEW_ID.test(reviewId)) throw new Error(`Invalid reviewId: ${reviewId}`);
     return reviewId;
 }
 
-export function assertRevisionId(revisionId) {
+export function assertRevisionId(revisionId: unknown): string {
     if (typeof revisionId !== "string" || !REVISION_ID.test(revisionId)) throw new Error(`Invalid revisionId: ${revisionId}`);
     return revisionId;
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-async function withRetry(fn) {
+async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
     for (let attempt = 0; ; attempt++) {
         try {
             return await fn();
         } catch (err) {
-            if (!RETRYABLE.has(err?.code) || attempt >= 6) throw err;
+            const code = errorCode(err);
+            if (typeof code !== "string" || !RETRYABLE.has(code) || attempt >= 6) throw err;
             await sleep(25 * 2 ** attempt);
         }
     }
 }
 
-async function writeJsonAtomic(file, value) {
+async function writeJsonAtomic(file: string, value: unknown) {
     await mkdir(path.dirname(file), { recursive: true });
     const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
     await writeFile(tmp, JSON.stringify(value, null, 2), "utf8");
@@ -93,30 +105,32 @@ async function writeJsonAtomic(file, value) {
     }
 }
 
-async function readJson(file) {
+async function readJson(file: string): Promise<unknown> {
     try {
         return JSON.parse(await withRetry(() => readFile(file, "utf8")));
     } catch (err) {
-        if (err?.code === "ENOENT") return null;
+        if (errorCode(err) === "ENOENT") return null;
         throw err;
     }
 }
 
 export class Store {
+    readonly root: string;
+    private readonly locks: Map<string, Promise<void>>;
     constructor(root = defaultDataRoot()) {
         this.root = root;
         this.locks = new Map();
     }
 
-    reviewDir(reviewId) {
+    reviewDir(reviewId: string) {
         return path.join(this.root, "reviews", assertReviewId(reviewId));
     }
 
-    reviewFile(reviewId) {
+    reviewFile(reviewId: string) {
         return path.join(this.reviewDir(reviewId), "review.json");
     }
 
-    snapshotFile(reviewId, revisionId) {
+    snapshotFile(reviewId: string, revisionId: string | null) {
         return path.join(this.reviewDir(reviewId), "snapshots", `${assertRevisionId(revisionId)}.json`);
     }
 
@@ -126,7 +140,7 @@ export class Store {
 
     // The exclusive file covers the entire transaction across provider processes.
     // Never steal an old lock: a slow or suspended owner may still be writing.
-    async fileLock(key, fn) {
+    async fileLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
         const directory = path.join(this.root, "locks");
         await mkdir(directory, { recursive: true });
         const file = path.join(directory, `${createHash("sha256").update(key).digest("hex")}.lock`);
@@ -136,7 +150,7 @@ export class Store {
             try {
                 handle = await open(file, "wx", 0o600);
             } catch (err) {
-                if (err?.code !== "EEXIST") throw err;
+                if (errorCode(err) !== "EEXIST") throw err;
                 if (Date.now() >= deadline) {
                     throw new Error(`Timed out waiting for store lock ${file}. If a provider crashed, stop all self-review providers before removing this lock.`);
                 }
@@ -153,10 +167,10 @@ export class Store {
     }
 
     // Serializes async work per key; the callback always sees the latest committed state.
-    async lock(key, fn) {
+    async lock<T>(key: string, fn: () => Promise<T>): Promise<T> {
         const prev = this.locks.get(key) ?? Promise.resolve();
-        let release;
-        const next = new Promise((r) => (release = r));
+        let release!: () => void;
+        const next = new Promise<void>((r) => (release = r));
         const chained = prev.then(() => next);
         this.locks.set(key, chained);
         await prev;
@@ -168,13 +182,13 @@ export class Store {
         }
     }
 
-    async readReview(reviewId) {
-        return readJson(this.reviewFile(reviewId));
+    async readReview(reviewId: string): Promise<Review | null> {
+        return await readJson(this.reviewFile(reviewId)) as Review | null;
     }
 
     // Read-modify-write under the review lock.
     // mutate(current | null) => { review?, value?, write? = true }
-    async updateReview(reviewId, mutate) {
+    async updateReview<T = void>(reviewId: string, mutate: (review: Review | null) => ReviewUpdate<T> | Promise<ReviewUpdate<T>>): Promise<T> {
         return this.lock(`review:${reviewId}`, async () => {
             const current = await this.readReview(reviewId);
             const { review, value, write = true } = (await mutate(current)) ?? {};
@@ -182,31 +196,31 @@ export class Store {
                 review.updatedAt = new Date().toISOString();
                 await writeJsonAtomic(this.reviewFile(reviewId), review);
             }
-            return value;
+            return value as T;
         });
     }
 
-    async writeSnapshot(reviewId, revisionId, snapshot) {
+    async writeSnapshot(reviewId: string, revisionId: string, snapshot: Snapshot) {
         await writeJsonAtomic(this.snapshotFile(reviewId, revisionId), snapshot);
     }
 
-    async readSnapshot(reviewId, revisionId) {
-        return readJson(this.snapshotFile(reviewId, revisionId));
+    async readSnapshot(reviewId: string, revisionId: string | null): Promise<Snapshot | null> {
+        return await readJson(this.snapshotFile(reviewId, revisionId)) as Snapshot | null;
     }
 
-    async appendLesson(lesson) {
+    async appendLesson(lesson: Lesson) {
         await mkdir(this.root, { recursive: true });
         await this.lock("lessons", () => withRetry(() => appendFile(path.join(this.root, "lessons.jsonl"), JSON.stringify(lesson) + "\n", "utf8")));
     }
 
     // lessons.jsonl is append-only; a lesson updated in place (proposed -> saved) is appended again and the last record wins.
-    async readLessons() {
+    async readLessons(): Promise<Lesson[]> {
         try {
             const text = await readFile(path.join(this.root, "lessons.jsonl"), "utf8");
-            const byId = new Map();
+            const byId = new Map<string, Lesson>();
             for (const line of text.split("\n").filter(Boolean)) {
                 try {
-                    const lesson = JSON.parse(line);
+                    const lesson = JSON.parse(line) as Lesson;
                     byId.set(lesson.lessonId ?? line, lesson);
                 } catch {
                     // A torn or hand-edited line is skipped rather than failing the whole read.
@@ -214,7 +228,7 @@ export class Store {
             }
             return [...byId.values()];
         } catch (err) {
-            if (err?.code === "ENOENT") return [];
+            if (errorCode(err) === "ENOENT") return [];
             throw err;
         }
     }
@@ -229,7 +243,7 @@ export class Store {
      * @param {(settings: import("../../types/contracts.js").SettingsDocument) => T | Promise<T>} mutate
      * @returns {Promise<T>}
      */
-    async updateSettings(mutate) {
+    async updateSettings<T>(mutate: (settings: SettingsDocument) => T | Promise<T>): Promise<T> {
         return this.lock("settings", async () => {
             const settings = await this.readSettings();
             if (!settings.repos || typeof settings.repos !== "object") settings.repos = {};
@@ -239,12 +253,12 @@ export class Store {
         });
     }
 
-    async getInstanceReview(instanceId) {
+    async getInstanceReview(instanceId: string) {
         return (await this.getInstanceContext(instanceId))?.reviewId ?? null;
     }
 
-    async getInstanceContext(instanceId) {
-        const map = (await readJson(path.join(this.root, "instances.json"))) ?? {};
+    async getInstanceContext(instanceId: string) {
+        const map = (await readJson(path.join(this.root, "instances.json")) as InstanceMap | null) ?? {};
         const entry = map[instanceId];
         if (entry == null) return null;
         if (typeof entry === "string") return { reviewId: assertReviewId(entry), returnReviewId: null };
@@ -254,10 +268,10 @@ export class Store {
         };
     }
 
-    async setInstanceReview(instanceId, reviewId) {
+    async setInstanceReview(instanceId: string, reviewId: string) {
         await this.lock("instances", async () => {
             const file = path.join(this.root, "instances.json");
-            const map = (await readJson(file)) ?? {};
+            const map = (await readJson(file) as InstanceMap | null) ?? {};
             if (map[instanceId] === reviewId) return;
             map[instanceId] = reviewId;
             await writeJsonAtomic(file, map);

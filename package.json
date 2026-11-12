@@ -3,14 +3,16 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "node extensions/self-review/scripts/build.mjs",
-    "typecheck": "tsc -p tsconfig.node.json && tsc -p tsconfig.web.json",
-    "check-skill-updates": "node extensions/self-review/scripts/check-bundled-skill-updates.mjs",
-    "test": "npm run build && node --test extensions/self-review/test/*.test.mjs && node extensions/self-review/scripts/test-build-watcher.mjs"
+    "build:tools": "tsc -p tsconfig.tools.json",
+    "build": "npm run build:tools && node .build/extensions/self-review/scripts/build.mjs",
+    "typecheck": "tsc -p tsconfig.node.json && tsc -p tsconfig.web.json && tsc -p tsconfig.tools.json --noEmit",
+    "check-skill-updates": "npm run build:tools && node .build/extensions/self-review/scripts/check-bundled-skill-updates.mjs",
+    "test": "npm run build && node --test .build/extensions/self-review/test/*.test.mjs && node .build/extensions/self-review/scripts/test-build-watcher.mjs"
   },
   "devDependencies": {
     "@github/copilot-sdk": "1.0.30",
     "@types/node": "^22.19.0",
+    "playwright-core": "1.64.1",
     "typescript": "^5.9.3"
   }
 }

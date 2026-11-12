@@ -1,29 +1,30 @@
-import { EventEmitter } from "node:events";
-import { appendFile, readFile, writeFile } from "node:fs/promises";
+import { appendFile, readFile, rm, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { startReviewServer } from "../dist/lib/server.mjs";
+import {
+    AgentReview, Delivery, ReviewService, ReviewSkills, SettingsService, Store, startReviewServer,
+} from "../test/modules.mjs";
 
-const extensionRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const repositoryRoot = path.resolve(extensionRoot, "..", "..");
+const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../../");
+const extensionRoot = path.join(repositoryRoot, "extensions", "self-review");
 const webRoot = path.join(extensionRoot, "dist", "web");
 const styleFile = path.join(webRoot, "styles.css");
-const buildScript = path.join(extensionRoot, "scripts", "build.mjs");
+const buildScript = path.join(repositoryRoot, ".build", "extensions", "self-review", "scripts", "build.mjs");
 
 function runBuild() {
     return new Promise((resolve, reject) => {
         const child = spawn(process.execPath, [buildScript], { cwd: repositoryRoot, stdio: "inherit" });
         child.once("error", reject);
         child.once("exit", (code, signal) => {
-            if (code === 0) resolve();
+            if (code === 0) resolve(undefined);
             else reject(new Error(`Build failed (${signal ?? code}).`));
         });
     });
 }
 
-function waitFor(predicate, message, timeoutMs = 5000) {
-    return new Promise((resolve, reject) => {
+function waitFor(predicate: () => boolean, message: string, timeoutMs = 5000): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
         const startedAt = Date.now();
         const check = () => {
             if (predicate()) return resolve();
@@ -34,21 +35,35 @@ function waitFor(predicate, message, timeoutMs = 5000) {
     });
 }
 
-const service = new EventEmitter();
-const delivery = new EventEmitter();
+const watcherDataRoot = path.join(repositoryRoot, ".build", "watcher-data");
+const store = new Store(watcherDataRoot);
+const service = new ReviewService({ store });
+const settings = new SettingsService({ store });
+const reviewSkills = new ReviewSkills({ store });
+const agentReview = new AgentReview({
+    service,
+    settings,
+    reviewSkills,
+    sessionId: () => undefined,
+    send: async () => { throw new Error("The build watcher must not dispatch agent reviews."); },
+});
+const delivery = new Delivery({ service, send: async () => "watcher", log: () => {}, reviewIds: () => [] });
 delivery.busy = null;
 const server = await startReviewServer({
     instanceId: "build-watch-regression",
     getReviewId: () => "build-watch-regression",
     service,
     delivery,
+    settings,
+    agentReview,
+    reviewSkills,
     webRoot,
 });
 const controller = new AbortController();
-let reader;
-let pump;
-let events = [];
-let originalStyles;
+let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+let pump: Promise<void> | undefined;
+const events: string[] = [];
+let originalStyles: Buffer | undefined;
 let stylesTouched = false;
 
 try {
@@ -76,6 +91,16 @@ try {
 
     await waitFor(() => events.includes("hello"), "Canvas SSE hello was not received.");
     await runBuild();
+    const renderer = await readFile(path.join(webRoot, "app.js"), "utf8");
+    const rendererSource = await readFile(path.join(extensionRoot, "src", "web", "app.ts"), "utf8");
+    const rendererMarker = "FOLDER_VIEW_ROW_BUDGET";
+    if (!rendererSource.includes(rendererMarker) || !renderer.includes(rendererMarker)) {
+        throw new Error("The generated browser asset does not contain the TypeScript renderer.");
+    }
+    const rendererResponse = await fetch(new URL("app.js", server.url));
+    if (!rendererResponse.ok || !(await rendererResponse.text()).includes(rendererMarker)) {
+        throw new Error("The server did not serve the generated TypeScript renderer.");
+    }
     await new Promise((resolve) => setTimeout(resolve, 400));
 
     const previousAssetEvents = events.filter((event) => event === "assets").length;
@@ -92,6 +117,7 @@ try {
     await reader?.cancel().catch(() => {});
     await server.close();
     await pump?.catch(() => {});
-    if (stylesTouched) await writeFile(styleFile, originalStyles);
+    if (stylesTouched && originalStyles) await writeFile(styleFile, originalStyles);
     await runBuild();
+    await rm(watcherDataRoot, { recursive: true, force: true });
 }

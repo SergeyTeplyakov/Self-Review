@@ -6,50 +6,247 @@ import path from "node:path";
 import * as gitDefault from "./git.mjs";
 import { relocate } from "./anchors.mjs";
 import { hunkExcerpt, selectedLines } from "./diff.mjs";
-import { ReviewError } from "../web/contracts.mjs";
+import { ReviewError, isRecord } from "../web/contracts.mjs";
 export { ReviewError } from "../web/contracts.mjs";
+import type { Log, ReviewScope, DeliveryChoice } from "../../types/contracts.js";
+import type { Store } from "./store.mjs";
+import type { DiffFile, DiffSide } from "./diff.mjs";
+import type { Snapshot } from "./git.mjs";
+import type { AgentReviewRun, FindingMetadata } from "./agent-review.mjs";
+
+export interface ReviewDescription {
+    body: string;
+    version: number;
+    revisionId: string | null;
+    updatedAt: string;
+}
+
+export interface MessageDelivery {
+    state: "draft" | "saving" | "failed" | "queued" | "processing" | "no-reply" | "replied";
+    attempts?: number;
+    attemptId?: string;
+    claimPid?: number;
+    senderSessionId?: string;
+    processedBy?: string;
+    sessionMessageId?: string | null;
+    batchId?: string;
+    error?: string | null;
+    updatedAt?: string;
+    queuedAt?: string;
+    processingAt?: string;
+    repliedAt?: string;
+}
+
+export interface ReviewMessage {
+    messageId: string;
+    author: "user" | "agent";
+    body: string;
+    createdAt: string;
+    clientRequestId?: string | null;
+    delivery?: MessageDelivery;
+    outcome?: string | null;
+    verification?: string | null;
+    inReplyTo?: string | null;
+    lessonIds?: string[];
+    descriptionContext?: ReviewDescription | null;
+    reviewIntent?: "approve";
+}
+
+export interface ReviewAnchor {
+    revisionId: string;
+    path: string;
+    oldPath?: string | null;
+    side?: DiffSide;
+    startLine?: number;
+    endLine?: number;
+    selectedLines?: string[];
+    hunkHeader?: string | null;
+    hunkText?: string | null;
+}
+
+export interface ReviewLocation extends ReviewAnchor {
+    state: "current" | "outdated";
+}
+
+export interface ReviewThread {
+    threadId: string;
+    kind: string;
+    status: string;
+    author: "user" | "agent";
+    createdAt: string;
+    anchor: ReviewAnchor | null;
+    location: ReviewLocation | null;
+    messages: ReviewMessage[];
+    agentReview?: FindingMetadata;
+    ponytailReport?: { runId: string; revisionId: string };
+}
+
+export interface Lesson {
+    lessonId: string;
+    reviewId: string;
+    threadId: string;
+    messageId: string;
+    scope: string;
+    rule: string;
+    status?: string;
+    savedTo: string | null;
+    createdAt: string;
+    updatedAt?: string;
+}
+
+export interface ReviewRevision {
+    revisionId: string;
+    fingerprint: string;
+    createdAt: string;
+    headCommit: string;
+    baseCommit: string;
+    files: number;
+    additions: number;
+    deletions: number;
+}
+
+export interface Review {
+    schema: number;
+    reviewId: string;
+    repoRoot: string;
+    branch: string | null;
+    originBranch?: string | null;
+    title: string;
+    base: string | null;
+    paths: string[];
+    exclude: string[];
+    includeUntracked: boolean;
+    contextLines: number;
+    scope?: ReviewScope | "commit";
+    currentRevisionId: string | null;
+    revisions: ReviewRevision[];
+    threads: ReviewThread[];
+    lessons: Lesson[];
+    git: {
+        branch: string;
+        headCommit: string;
+        baseCommit: string;
+        upstream: Snapshot["upstream"];
+        uncommittedFiles: number;
+        capturedAt: string;
+    } | null;
+    deliveryMode?: DeliveryChoice;
+    agentReviews?: AgentReviewRun[];
+    description?: ReviewDescription;
+    siblingReviewId?: string;
+    createdAt: string;
+    updatedAt?: string;
+    headCommit?: string;
+    baseCommit?: string;
+}
+
+export interface OpenReviewInput {
+    reviewId?: string;
+    scope?: unknown;
+    repoPath?: string;
+    base?: string;
+    title?: string;
+    paths?: string[];
+    exclude?: string[];
+    includeUntracked?: boolean;
+    context?: number;
+}
+
+export interface LessonInput {
+    lessonId?: string;
+    scope?: string;
+    rule?: string;
+    status?: string;
+    savedTo?: string;
+}
+
+export interface MessageInput {
+    body?: unknown;
+    author?: unknown;
+    clientRequestId?: unknown;
+    hold?: unknown;
+    outcome?: unknown;
+    verification?: unknown;
+    inReplyTo?: unknown;
+    lessons?: unknown;
+    descriptionVersion?: unknown;
+}
+
+export interface ThreadInput extends MessageInput {
+    kind?: string;
+    path?: string;
+    side?: DiffSide;
+    startLine?: number;
+    endLine?: number;
+    revisionId?: string;
+}
+
+export interface DeliveryClaim {
+    attemptId: string;
+    attempts: number;
+}
+
+export interface DraftClaim extends DeliveryClaim {
+    threadId: string;
+    messageId: string;
+}
+
+export type FileContent = { revisionId: string; path: string } & (
+    { available: true; lines: string[] } |
+    { available: false; reason: string; stale?: boolean }
+);
+export interface RefreshResult { revisionId: string; created: boolean; moved: number }
+export interface ThreadResult { thread: ReviewThread; message: ReviewMessage; duplicate?: boolean }
+type ReviewIdentity = { repoRoot: string; branch: string | null; base: string | null; paths?: string[]; exclude?: string[]; scope?: ReviewScope };
+type NewReview = Required<Omit<ReviewIdentity, "scope">> & {
+    reviewId: string; title: string; includeUntracked: boolean; contextLines: number;
+    originBranch?: string | null; scope: ReviewScope;
+};
+const errorMessage = (error: unknown) => String(
+    error && typeof error === "object" && "message" in error ? error.message ?? error : error,
+);
 
 export const THREAD_KINDS = ["overview", "file", "change", "line"];
 export const THREAD_STATUSES = ["active", "resolved", "wontfix", "closed"];
 export const OUTCOMES = ["answered", "changed", "blocked", "disagreed", "needs-input"];
 export const LESSON_STATUSES = ["proposed", "saved", "declined"];
-export const SCOPES = ["all", "pending"];
+export const SCOPES: ReviewScope[] = ["all", "pending"];
 const PENDING_SUFFIX = " (pending changes)";
 const MAX_BODY = 20000;
 const MAX_RANGE = 2000;
 const MAX_ANCHOR_LINES = 400;
 const MAX_FULL_FILE_LINES = 20000;
 
-const invalid = (msg) => new ReviewError("invalid_input", msg);
-const notFound = (msg) => new ReviewError("not_found", msg);
+const invalid = (msg: string) => new ReviewError("invalid_input", msg);
+const notFound = (msg: string) => new ReviewError("not_found", msg);
 
-function slug(value) {
+function slug(value: string) {
     return value.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/-+/g, "-").replace(/^[-.]+|[-.]+$/g, "");
 }
 
 // "all" reviews the whole branch or PR (working tree vs merge-base); "pending" reviews only uncommitted work (working tree vs HEAD).
-export function checkScope(value) {
+export function checkScope(value: unknown): ReviewScope {
     if (value == null) return "all";
-    if (!SCOPES.includes(value)) throw invalid(`scope must be one of ${SCOPES.join(", ")}.`);
+    if (value !== "all" && value !== "pending") throw invalid(`scope must be one of ${SCOPES.join(", ")}.`);
     return value;
 }
 
 // Reviews saved before scopes existed have no scope field and are "all" reviews.
-export function scopeOf(review) {
+export function scopeOf(review: Pick<Review, "scope"> | null | undefined): ReviewScope {
     return review?.scope === "pending" ? "pending" : "all";
 }
 
 // Historical single-commit reviews were removed; their records stay on disk but are never reopened as All or Pending reviews.
-export function isRetiredCommitReview(review) {
+export function isRetiredCommitReview(review: Pick<Review, "scope"> | null | undefined) {
     return review?.scope === "commit";
 }
 
-export function retiredCommitError(review) {
+export function retiredCommitError(review: Pick<Review, "reviewId">) {
     return new ReviewError("unsupported", `Review ${review.reviewId} is a historical single-commit review. That mode was removed; its local notes remain stored but it can no longer be opened. Open an All changes or Pending changes review instead.`);
 }
 
 // The "all" id must stay identical to the pre-scope computation so existing reviews keep their threads.
-export function computeReviewId({ repoRoot, branch, base, paths = [], exclude = [], scope = "all" }) {
+export function computeReviewId({ repoRoot, branch, base, paths = [], exclude = [], scope = "all" }: ReviewIdentity) {
     const parts = [path.resolve(repoRoot).toLowerCase(), branch, base, [...paths].sort().join(","), [...exclude].sort().join(",")];
     if (scope === "pending") parts.push("pending");
     const hash = createHash("sha256").update(parts.join("|")).digest("hex").slice(0, 8);
@@ -58,11 +255,11 @@ export function computeReviewId({ repoRoot, branch, base, paths = [], exclude = 
     return `${readable}-${hash}`;
 }
 
-function defaultTitle({ branch, base, scope }) {
+function defaultTitle({ branch, base, scope }: Pick<Review, "branch" | "base" | "scope">) {
     return scope === "pending" ? `${branch}${PENDING_SUFFIX}` : `${branch} vs ${base}`;
 }
 
-function applyOpenOptions(review, input) {
+function applyOpenOptions(review: Review, input: OpenReviewInput) {
     if (input.title) review.title = input.title;
     if (input.includeUntracked !== undefined) review.includeUntracked = input.includeUntracked;
     if (input.context !== undefined) review.contextLines = input.context;
@@ -70,7 +267,7 @@ function applyOpenOptions(review, input) {
 }
 
 // A default title is regenerated for the target scope; a custom title is carried over with the pending suffix toggled.
-function siblingTitle(source, targetScope) {
+function siblingTitle(source: Review, targetScope: ReviewScope) {
     const origin = source.originBranch ?? source.branch;
     if (source.title === defaultTitle({ branch: origin, base: source.base, scope: scopeOf(source) })) {
         return defaultTitle({ branch: source.branch, base: source.base, scope: targetScope });
@@ -81,7 +278,7 @@ function siblingTitle(source, targetScope) {
 }
 
 // originBranch is the branch the id was computed from; branch is the live label refreshed on every capture.
-function newReviewRecord({ reviewId, title, repoRoot, base, paths, exclude, includeUntracked, contextLines, branch, originBranch = branch, scope }) {
+function newReviewRecord({ reviewId, title, repoRoot, base, paths, exclude, includeUntracked, contextLines, branch, originBranch = branch, scope }: NewReview): Review {
     return {
         schema: 1,
         reviewId,
@@ -108,38 +305,61 @@ function nowIso() {
     return new Date().toISOString();
 }
 
-function checkBody(body) {
+function checkBody(body: unknown) {
     if (typeof body !== "string" || !body.trim()) throw invalid("Comment body is required.");
     if (body.length > MAX_BODY) throw invalid(`Comment body exceeds ${MAX_BODY} characters.`);
     return body.trim();
 }
 
-function checkLine(value, name) {
-    if (!Number.isInteger(value) || value < 1) throw invalid(`${name} must be a positive integer.`);
+function optionalString(value: unknown, name: string): string | undefined {
+    if (value == null) return undefined;
+    if (typeof value !== "string") throw invalid(`${name} must be a string.`);
     return value;
 }
 
-function allMessages(review) {
+function lessonInput(value: unknown): LessonInput {
+    if (!isRecord(value)) throw invalid("Each lesson needs a non-empty rule or the lessonId of an existing guideline.");
+    const fields = value;
+    const hasRule = typeof fields.rule === "string" && fields.rule.trim();
+    if (!hasRule && !fields.lessonId) throw invalid("Each lesson needs a non-empty rule or the lessonId of an existing guideline.");
+    if (fields.scope && fields.scope !== "repo" && fields.scope !== "personal") throw invalid("lesson.scope must be repo or personal.");
+    if (fields.status != null && (typeof fields.status !== "string" || !LESSON_STATUSES.includes(fields.status))) {
+        throw invalid(`lesson.status must be one of ${LESSON_STATUSES.join(", ")}.`);
+    }
+    return {
+        lessonId: optionalString(fields.lessonId, "lesson.lessonId"),
+        rule: typeof fields.rule === "string" ? fields.rule : undefined,
+        scope: optionalString(fields.scope, "lesson.scope"),
+        status: optionalString(fields.status, "lesson.status"),
+        savedTo: optionalString(fields.savedTo, "lesson.savedTo"),
+    };
+}
+
+function checkLine(value: unknown, name: string): asserts value is number {
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 1) throw invalid(`${name} must be a positive integer.`);
+}
+
+function allMessages(review: Review) {
     return review.threads.flatMap((t) => t.messages.map((m) => ({ thread: t, message: m })));
 }
 
-function findDuplicate(review, clientRequestId) {
+function findDuplicate(review: Review, clientRequestId?: unknown) {
     if (!clientRequestId) return null;
     return allMessages(review).find((e) => e.message.clientRequestId === clientRequestId) ?? null;
 }
 
-function findThread(review, threadId) {
+function findThread(review: Review, threadId: string) {
     const thread = review.threads.find((t) => t.threadId === threadId);
     if (!thread) throw notFound(`Thread ${threadId} not found in review ${review.reviewId}.`);
     return thread;
 }
 
-const normalizeRule = (rule) => rule.toLowerCase().replace(/\s+/g, " ").replace(/[\s.;:!,]+$/, "").trim();
+const normalizeRule = (rule: string) => rule.toLowerCase().replace(/\s+/g, " ").replace(/[\s.;:!,]+$/, "").trim();
 
 // Records a guideline the agent reported. A decision on a guideline proposed earlier in the thread (by lessonId,
 // or by the same rule text) updates that lesson in place instead of adding a duplicate. Lessons without a
 // status are legacy records and count as saved.
-function applyLesson(review, { reviewId, threadId, messageId }, input) {
+function applyLesson(review: Review, { reviewId, threadId, messageId }: Pick<Lesson, "reviewId" | "threadId" | "messageId">, input: LessonInput) {
     const status = input.status ?? "saved";
     const rule = typeof input.rule === "string" ? input.rule.trim() : "";
     let lesson;
@@ -172,7 +392,7 @@ function applyLesson(review, { reviewId, threadId, messageId }, input) {
     return lesson;
 }
 
-function matchesRevision(file, oldLines, newLines) {
+function matchesRevision(file: DiffFile, oldLines: string[], newLines: string[]) {
     let oldIndex = 0;
     let newIndex = 0;
     for (const hunk of file.hunks) {
@@ -206,22 +426,30 @@ const DELIVERY_RANK = { draft: -1, saving: 0, failed: 1, queued: 2, processing: 
 const REVIEW_DELIVERY_CHOICES = ["immediate", "batch"];
 
 // Signal 0 only probes the process; EPERM means it exists but belongs to another user.
-function processAlive(pid) {
+function processAlive(pid: number) {
     try {
         process.kill(pid, 0);
         return true;
     } catch (err) {
-        return err?.code === "EPERM";
+        return err instanceof Error && "code" in err && err.code === "EPERM";
     }
 }
 
 export class ReviewService extends EventEmitter {
+    readonly store: Store;
+    readonly git: typeof gitDefault;
+    readonly log: Log;
+    readonly pid: number;
+    readonly isProcessAlive: (pid: number) => boolean;
+    private readonly refreshes: Map<string, { again: boolean; promise?: Promise<RefreshResult> }>;
     /**
      * @param {object} p
      * @param {number} [p.pid] process recorded on delivery claims
      * @param {(pid: number) => boolean} [p.isProcessAlive] whether a claiming process is still running
      */
-    constructor({ store, git = gitDefault, log = () => {}, pid = process.pid, isProcessAlive = processAlive }) {
+    constructor({ store, git = gitDefault, log = () => {}, pid = process.pid, isProcessAlive = processAlive }: {
+        store: Store; git?: typeof gitDefault; log?: Log; pid?: number; isProcessAlive?: (pid: number) => boolean;
+    }) {
         super();
         this.store = store;
         this.git = git;
@@ -231,19 +459,19 @@ export class ReviewService extends EventEmitter {
         this.refreshes = new Map();
     }
 
-    changed(reviewId, reason) {
+    changed(reviewId: string, reason: string) {
         this.emit("changed", { reviewId, reason });
     }
 
-    async getReview(reviewId) {
+    async getReview(reviewId: string) {
         const review = await this.store.readReview(reviewId);
         if (!review) throw notFound(`Review ${reviewId} not found.`);
         return review;
     }
 
-    async updateDescription(reviewId, { body, expectedVersion }) {
+    async updateDescription(reviewId: string, { body, expectedVersion }: { body?: unknown; expectedVersion?: unknown }) {
         const text = checkBody(body);
-        if (!Number.isInteger(expectedVersion) || expectedVersion < 0) throw invalid("expectedVersion must be a non-negative integer.");
+        if (typeof expectedVersion !== "number" || !Number.isInteger(expectedVersion) || expectedVersion < 0) throw invalid("expectedVersion must be a non-negative integer.");
         const description = await this.store.updateReview(reviewId, (review) => {
             if (!review) throw notFound(`Review ${reviewId} not found.`);
             if (isRetiredCommitReview(review)) throw retiredCommitError(review);
@@ -259,7 +487,7 @@ export class ReviewService extends EventEmitter {
         return description;
     }
 
-    descriptionContext(review, input) {
+    descriptionContext(review: Review, input: Pick<MessageInput, "descriptionVersion">) {
         if (input.descriptionVersion !== undefined && input.descriptionVersion !== (review.description?.version ?? 0)) {
             throw new ReviewError("conflict", "Description changed since you read it. Refresh and review it before posting.");
         }
@@ -268,7 +496,7 @@ export class ReviewService extends EventEmitter {
 
     // Creates the review on first open, then captures a fresh snapshot.
     // An explicit scope that differs from an existing review's scope opens its sibling review instead.
-    async ensureReview(input = {}, { cwd = process.cwd() } = {}) {
+    async ensureReview(input: OpenReviewInput = {}, { cwd = process.cwd() } = {}) {
         const requestedScope = input.scope == null ? null : checkScope(input.scope);
         if (input.reviewId) {
             const existing = await this.getReview(input.reviewId);
@@ -277,7 +505,10 @@ export class ReviewService extends EventEmitter {
             const reviewId = switching ? await this.openSibling(input.reviewId, requestedScope, { base: input.base }) : input.reviewId;
             const hasOptions = input.title || input.includeUntracked !== undefined || input.context !== undefined;
             if (hasOptions) {
-                await this.store.updateReview(reviewId, (r) => ({ review: applyOpenOptions(r, input) }));
+                await this.store.updateReview(reviewId, (r) => {
+                    if (!r) throw notFound(`Review ${reviewId} not found.`);
+                    return { review: applyOpenOptions(r, input) };
+                });
             }
             if (!switching || hasOptions) await this.refresh(reviewId);
             return reviewId;
@@ -287,7 +518,7 @@ export class ReviewService extends EventEmitter {
         try {
             repoRoot = await this.git.resolveRepoRoot(input.repoPath || cwd);
         } catch (err) {
-            throw invalid(`Not a git repository: ${input.repoPath || cwd} (${err.message})`);
+            throw invalid(`Not a git repository: ${input.repoPath || cwd} (${errorMessage(err)})`);
         }
         const scope = requestedScope ?? "all";
         const base = input.base || (scope === "pending" ? null : await this.git.defaultBase(repoRoot));
@@ -320,7 +551,7 @@ export class ReviewService extends EventEmitter {
     }
 
     // Opens the other-scope review of the same repository, branch, base, and pathspecs, creating it on first use.
-    async openSibling(reviewId, scope, { base: requestedBase } = {}) {
+    async openSibling(reviewId: string, scope: ReviewScope, { base: requestedBase }: { base?: string } = {}) {
         const target = checkScope(scope);
         const source = await this.getReview(reviewId);
         if (isRetiredCommitReview(source)) throw retiredCommitError(source);
@@ -358,18 +589,21 @@ export class ReviewService extends EventEmitter {
             };
         });
         await this.refresh(siblingId);
-        await this.store.updateReview(reviewId, (review) => ({ review: Object.assign(review, { siblingReviewId: siblingId }) }));
+        await this.store.updateReview(reviewId, (review) => {
+            if (!review) throw notFound(`Review ${reviewId} not found.`);
+            return { review: Object.assign(review, { siblingReviewId: siblingId }) };
+        });
         return siblingId;
     }
 
     // Coalesces overlapping refreshes; a refresh requested mid-capture triggers one more pass.
-    refresh(reviewId) {
+    refresh(reviewId: string): Promise<RefreshResult> {
         const running = this.refreshes.get(reviewId);
-        if (running) {
+        if (running?.promise) {
             running.again = true;
             return running.promise;
         }
-        const entry = { again: false };
+        const entry: { again: boolean; promise?: Promise<RefreshResult> } = { again: false };
         entry.promise = (async () => {
             try {
                 let result;
@@ -386,7 +620,7 @@ export class ReviewService extends EventEmitter {
         return entry.promise;
     }
 
-    async refreshOnce(reviewId) {
+    async refreshOnce(reviewId: string): Promise<RefreshResult> {
         const before = await this.getReview(reviewId);
         if (isRetiredCommitReview(before)) throw retiredCommitError(before);
         let snapshot;
@@ -401,10 +635,11 @@ export class ReviewService extends EventEmitter {
                 scope: scopeOf(before),
             });
         } catch (err) {
-            throw new ReviewError("git_error", err.message);
+            throw new ReviewError("git_error", errorMessage(err));
         }
 
         const result = await this.store.updateReview(reviewId, async (review) => {
+            if (!review) throw notFound(`Review ${reviewId} not found.`);
             const git = {
                 branch: snapshot.branch,
                 headCommit: snapshot.headCommit,
@@ -434,42 +669,42 @@ export class ReviewService extends EventEmitter {
             }
             review.git = git;
             review.branch = snapshot.branch;
-            const moved = await this.relocateThreads(review, revisionId, snapshot.baseCommit);
-            return { review, value: { revisionId, created, moved } };
+            const moved = await this.relocateThreads(review, revisionId!, snapshot.baseCommit);
+            return { review, value: { revisionId: revisionId!, created, moved } };
         });
         if (result.created || result.moved) this.changed(reviewId, "revision");
         else this.changed(reviewId, "git");
         return result;
     }
 
-    async relocateThreads(review, revisionId, baseCommit) {
-        const cache = new Map();
-        const contentFor = async (side, filePath) => {
+    async relocateThreads(review: Review, revisionId: string | null, baseCommit?: string) {
+        const cache = new Map<string, string[] | null>();
+        const contentFor = async (side: DiffSide | undefined, filePath: string) => {
             const key = `${side}\0${filePath}`;
             if (!cache.has(key)) {
                 cache.set(key, side === "old"
-                    ? await this.git.readCommitFile(review.repoRoot, baseCommit, filePath)
+                    ? await this.git.readCommitFile(review.repoRoot, baseCommit!, filePath)
                     : await this.git.readWorkingFile(review.repoRoot, filePath));
             }
-            return cache.get(key);
+            return cache.get(key)!;
         };
         let moved = 0;
         for (const thread of review.threads) {
             if (!thread.location || thread.location.revisionId === revisionId) continue;
             if (thread.kind === "line" || thread.kind === "change") {
                 const side = thread.location.side;
-                const lines = await contentFor(side, side === "old" ? (thread.anchor.oldPath ?? thread.anchor.path) : thread.location.path);
-                const next = relocate(thread.anchor, thread.location.startLine, lines);
+                const lines = await contentFor(side, side === "old" ? (thread.anchor!.oldPath ?? thread.anchor!.path) : thread.location.path);
+                const next = relocate(thread.anchor as ReviewAnchor & { startLine: number; endLine: number }, thread.location.startLine!, lines);
                 if (next.startLine !== thread.location.startLine || next.state !== thread.location.state) moved++;
-                thread.location = { ...thread.location, ...next, revisionId };
+                thread.location = { ...thread.location, ...next, revisionId: revisionId! };
             } else {
-                thread.location = { ...thread.location, revisionId };
+                thread.location = { ...thread.location, revisionId: revisionId! };
             }
         }
         return moved;
     }
 
-    async getSnapshot(reviewId, revisionId) {
+    async getSnapshot(reviewId: string, revisionId?: string | null) {
         const review = await this.getReview(reviewId);
         const rev = revisionId ?? review.currentRevisionId;
         const snapshot = await this.store.readSnapshot(reviewId, rev);
@@ -478,7 +713,7 @@ export class ReviewService extends EventEmitter {
     }
 
     // Validate gaps against the saved base as well as hunks so newer edits cannot leak into an older revision.
-    async getFileContent(reviewId, revisionId, filePath) {
+    async getFileContent(reviewId: string, revisionId: string | null | undefined, filePath: string | null): Promise<FileContent> {
         const review = await this.getReview(reviewId);
         if (typeof filePath !== "string" || !filePath) throw invalid("path is required.");
         this.git.safeJoin(review.repoRoot, filePath);
@@ -487,7 +722,7 @@ export class ReviewService extends EventEmitter {
         if (!snapshot) throw notFound(`Revision ${rev} not found for review ${reviewId}.`);
         const file = snapshot.files.find((f) => f.path === filePath);
         if (!file) throw notFound(`${filePath} is not part of revision ${rev}.`);
-        const base = { revisionId: rev, path: filePath };
+        const base = { revisionId: rev!, path: filePath };
         if (file.binary) return { ...base, available: false, reason: "binary" };
         if (file.status === "deleted") return { ...base, available: false, reason: "deleted" };
 
@@ -510,7 +745,7 @@ export class ReviewService extends EventEmitter {
         return { ...base, available: true, lines };
     }
 
-    async buildAnchor(review, { kind, path: filePath, side, startLine, endLine, revisionId }) {
+    async buildAnchor(review: Review, { kind, path: filePath, side, startLine, endLine, revisionId }: Omit<ThreadInput, "body">): Promise<{ anchor: ReviewAnchor | null; location: ReviewLocation | null }> {
         if (kind === "overview") return { anchor: null, location: null };
         if (typeof filePath !== "string" || !filePath) throw invalid("path is required for file, change, and line threads.");
         this.git.safeJoin(review.repoRoot, filePath);
@@ -520,15 +755,15 @@ export class ReviewService extends EventEmitter {
         if (!snapshot) throw notFound(`Revision ${rev} not found for review ${review.reviewId}.`);
 
         if (kind === "file") {
-            const base = { revisionId: rev, path: filePath, oldPath: file?.oldPath ?? null };
-            return { anchor: base, location: { revisionId: rev, path: filePath, state: "current" } };
+            const base = { revisionId: rev!, path: filePath, oldPath: file?.oldPath ?? null };
+            return { anchor: base, location: { revisionId: rev!, path: filePath, state: "current" } };
         }
         if (!file) throw notFound(`${filePath} is not part of revision ${rev}.`);
 
         const s = side === "old" ? "old" : "new";
         checkLine(startLine, "startLine");
-        checkLine(endLine ?? startLine, "endLine");
         const end = endLine ?? startLine;
+        checkLine(end, "endLine");
         if (end < startLine) throw invalid("endLine must be >= startLine.");
         if (end - startLine + 1 > MAX_RANGE) throw invalid(`Range exceeds ${MAX_RANGE} lines.`);
 
@@ -536,13 +771,13 @@ export class ReviewService extends EventEmitter {
         if (selected.length !== end - startLine + 1) {
             const content = s === "old"
                 ? await this.git.readCommitFile(review.repoRoot, snapshot.baseCommit, file.oldPath ?? filePath)
-                : await this.revisionLines(review.reviewId, rev, filePath);
+                : await this.revisionLines(review.reviewId, rev!, filePath);
             if (!content || end > content.length) throw invalid(`Lines ${startLine}-${end} are outside ${filePath} (${s} side).`);
             selected = content.slice(startLine - 1, end);
         }
         const excerpt = file ? hunkExcerpt(file, s, startLine, end) : null;
-        const anchor = {
-            revisionId: rev,
+        const anchor: ReviewAnchor = {
+            revisionId: rev!,
             path: filePath,
             oldPath: file?.oldPath ?? null,
             side: s,
@@ -552,26 +787,26 @@ export class ReviewService extends EventEmitter {
             hunkHeader: excerpt?.header ?? null,
             hunkText: excerpt?.text ?? null,
         };
-        return { anchor, location: { revisionId: rev, path: filePath, side: s, startLine, endLine: end, state: "current" } };
+        return { anchor, location: { revisionId: rev!, path: filePath, side: s, startLine, endLine: end, state: "current" } };
     }
 
-    async buildThread(review, input) {
+    async buildThread(review: Review, input: ThreadInput): Promise<ThreadResult> {
         if (isRetiredCommitReview(review)) throw retiredCommitError(review);
         const kind = input.kind ?? "line";
         if (!THREAD_KINDS.includes(kind)) throw invalid(`kind must be one of ${THREAD_KINDS.join(", ")}.`);
         const author = input.author === "agent" ? "agent" : "user";
         const body = checkBody(input.body);
         const { anchor, location } = await this.buildAnchor(review, { ...input, kind });
-        const message = {
+        const message: ReviewMessage = {
             messageId: `m-${randomUUID()}`,
             author,
             body,
             createdAt: nowIso(),
-            clientRequestId: input.clientRequestId ?? null,
-            ...(author === "user" ? { delivery: input.hold ? { state: "draft", attempts: 0 } : { state: "saving", attempts: 0, claimPid: this.pid } } : { outcome: input.outcome ?? null }),
+            clientRequestId: optionalString(input.clientRequestId, "clientRequestId") ?? null,
+            ...(author === "user" ? { delivery: input.hold ? { state: "draft", attempts: 0 } : { state: "saving", attempts: 0, claimPid: this.pid } } : { outcome: optionalString(input.outcome, "outcome") ?? null }),
             ...(kind === "overview" ? { descriptionContext: this.descriptionContext(review, input) } : {}),
         };
-        const thread = {
+        const thread: ReviewThread = {
             threadId: `t-${randomUUID().slice(0, 8)}`,
             kind,
             status: "active",
@@ -584,7 +819,7 @@ export class ReviewService extends EventEmitter {
         return { thread, message };
     }
 
-    async createThread(reviewId, input) {
+    async createThread(reviewId: string, input: ThreadInput): Promise<ThreadResult> {
         const result = await this.store.updateReview(reviewId, async (review) => {
             if (!review) throw notFound(`Review ${reviewId} not found.`);
             const dup = findDuplicate(review, input.clientRequestId);
@@ -600,21 +835,15 @@ export class ReviewService extends EventEmitter {
         return result;
     }
 
-    async addMessage(reviewId, threadId, input) {
+    async addMessage(reviewId: string, threadId: string, input: MessageInput): Promise<ThreadResult> {
         const author = input.author === "agent" ? "agent" : "user";
         const body = checkBody(input.body);
-        if (author === "agent" && input.outcome && !OUTCOMES.includes(input.outcome)) {
+        if (author === "agent" && input.outcome && (typeof input.outcome !== "string" || !OUTCOMES.includes(input.outcome))) {
             throw invalid(`outcome must be one of ${OUTCOMES.join(", ")}.`);
         }
-        const lessonsInput = Array.isArray(input.lessons) ? input.lessons : [];
-        for (const l of lessonsInput) {
-            const hasRule = typeof l?.rule === "string" && l.rule.trim();
-            if (!l || (!hasRule && !l.lessonId)) throw invalid("Each lesson needs a non-empty rule or the lessonId of an existing guideline.");
-            if (l.scope && !["repo", "personal"].includes(l.scope)) throw invalid("lesson.scope must be repo or personal.");
-            if (l.status != null && !LESSON_STATUSES.includes(l.status)) throw invalid(`lesson.status must be one of ${LESSON_STATUSES.join(", ")}.`);
-        }
+        const lessonsInput = Array.isArray(input.lessons) ? input.lessons.map((value: unknown) => lessonInput(value)) : [];
 
-        const touchedLessons = new Map();
+        const touchedLessons = new Map<string, Lesson>();
         const result = await this.store.updateReview(reviewId, async (review) => {
             if (!review) throw notFound(`Review ${reviewId} not found.`);
             if (isRetiredCommitReview(review)) throw retiredCommitError(review);
@@ -622,21 +851,21 @@ export class ReviewService extends EventEmitter {
             if (dup) return { write: false, value: { thread: dup.thread, message: dup.message, duplicate: true } };
             const thread = findThread(review, threadId);
 
-            const message = {
+            const message: ReviewMessage = {
                 messageId: `m-${randomUUID()}`,
                 author,
                 body,
                 createdAt: nowIso(),
-                clientRequestId: input.clientRequestId ?? null,
+                clientRequestId: optionalString(input.clientRequestId, "clientRequestId") ?? null,
                 ...(thread.kind === "overview" && author === "user" ? { descriptionContext: this.descriptionContext(review, input) } : {}),
             };
             if (author === "user") {
                 message.delivery = input.hold ? { state: "draft", attempts: 0 } : { state: "saving", attempts: 0, claimPid: this.pid };
                 if (thread.status !== "active") thread.status = "active";
             } else {
-                message.outcome = input.outcome ?? null;
-                message.verification = input.verification ?? null;
-                message.inReplyTo = input.inReplyTo ?? null;
+                message.outcome = optionalString(input.outcome, "outcome") ?? null;
+                message.verification = optionalString(input.verification, "verification") ?? null;
+                message.inReplyTo = optionalString(input.inReplyTo, "inReplyTo") ?? null;
                 const target = input.inReplyTo
                     ? thread.messages.find((m) => m.messageId === input.inReplyTo)
                     : [...thread.messages].reverse().find((m) => m.author === "user" && m.delivery && !["replied", "draft"].includes(m.delivery.state));
@@ -650,7 +879,7 @@ export class ReviewService extends EventEmitter {
                     // One reply answers every comment the same submitted review added to this thread.
                     const batchId = target.delivery.batchId;
                     for (const m of batchId ? thread.messages : []) {
-                        if (m !== target && m.author === "user" && m.delivery?.batchId === batchId && m.delivery.state !== "replied") {
+                        if (m !== target && m.author === "user" && m.delivery?.batchId === batchId && m.delivery?.state !== "replied") {
                             m.delivery = { ...m.delivery, state: "replied", repliedAt };
                         }
                     }
@@ -670,8 +899,8 @@ export class ReviewService extends EventEmitter {
         return result;
     }
 
-    async setThreadStatus(reviewId, threadId, status) {
-        if (!THREAD_STATUSES.includes(status)) throw invalid(`status must be one of ${THREAD_STATUSES.join(", ")}.`);
+    async setThreadStatus(reviewId: string, threadId: string, status: unknown) {
+        if (typeof status !== "string" || !THREAD_STATUSES.includes(status)) throw invalid(`status must be one of ${THREAD_STATUSES.join(", ")}.`);
         const thread = await this.store.updateReview(reviewId, (review) => {
             if (!review) throw notFound(`Review ${reviewId} not found.`);
             if (isRetiredCommitReview(review)) throw retiredCommitError(review);
@@ -684,7 +913,7 @@ export class ReviewService extends EventEmitter {
     }
 
     // Claim before doing any async prompt work or sending; only one provider may send an attempt.
-    async claimDelivery(reviewId, threadId, messageId, { retry = false, senderSessionId } = {}) {
+    async claimDelivery(reviewId: string, threadId: string, messageId: string, { retry = false, senderSessionId }: { retry?: boolean; senderSessionId?: string } = {}) {
         const claim = await this.store.updateReview(reviewId, (review) => {
             if (!review) throw notFound(`Review ${reviewId} not found.`);
             if (isRetiredCommitReview(review)) throw retiredCommitError(review);
@@ -692,8 +921,8 @@ export class ReviewService extends EventEmitter {
             if (!message || message.author !== "user") throw invalid(`Message ${messageId} is not a user message in ${threadId}.`);
             const current = message.delivery;
             const initial = current?.state === "draft" || (current?.state === "saving" && !current.attempts);
-            if (!initial && !(retry && ["failed", "no-reply"].includes(current?.state))) return { write: false, value: null };
-            const attempt = { attemptId: randomUUID(), attempts: (current.attempts ?? 0) + 1 };
+            if (!initial && !(retry && ["failed", "no-reply"].includes(current?.state ?? ""))) return { write: false, value: null };
+            const attempt = { attemptId: randomUUID(), attempts: (current?.attempts ?? 0) + 1 };
             message.delivery = { state: "saving", ...attempt, senderSessionId, claimPid: this.pid, error: null, updatedAt: nowIso() };
             return { review, value: attempt };
         });
@@ -702,7 +931,7 @@ export class ReviewService extends EventEmitter {
     }
 
     // Claims every draft in one atomic update so a submitted review is sent once, as one batch.
-    async claimDrafts(reviewId, { senderSessionId } = {}) {
+    async claimDrafts(reviewId: string, { senderSessionId }: { senderSessionId?: string } = {}) {
         const claims = await this.store.updateReview(reviewId, (review) => {
             if (!review) throw notFound(`Review ${reviewId} not found.`);
             if (isRetiredCommitReview(review)) throw retiredCommitError(review);
@@ -710,7 +939,7 @@ export class ReviewService extends EventEmitter {
             if (!drafts.length) return { write: false, value: [] };
             const batchId = randomUUID();
             const value = drafts.map(({ thread, message }) => {
-                const attempt = { attemptId: randomUUID(), attempts: (message.delivery.attempts ?? 0) + 1 };
+                const attempt = { attemptId: randomUUID(), attempts: (message.delivery!.attempts ?? 0) + 1 };
                 message.delivery = { state: "saving", ...attempt, batchId, senderSessionId, claimPid: this.pid, error: null, updatedAt: nowIso() };
                 return { threadId: thread.threadId, messageId: message.messageId, ...attempt };
             });
@@ -721,7 +950,7 @@ export class ReviewService extends EventEmitter {
     }
 
     // Records how an ask-mode review delivers comments; null asks the reviewer again.
-    async setDeliveryChoice(reviewId, mode) {
+    async setDeliveryChoice(reviewId: string, mode: DeliveryChoice) {
         if (mode !== null && !REVIEW_DELIVERY_CHOICES.includes(mode)) {
             throw invalid(`mode must be one of ${REVIEW_DELIVERY_CHOICES.join(", ")}, or null.`);
         }
@@ -737,7 +966,7 @@ export class ReviewService extends EventEmitter {
     }
 
     // Removes a draft the agent has never seen; a thread left without messages goes with it.
-    async discardDraft(reviewId, messageId) {
+    async discardDraft(reviewId: string, messageId: string) {
         const result = await this.store.updateReview(reviewId, (review) => {
             if (!review) throw notFound(`Review ${reviewId} not found.`);
             const entry = allMessages(review).find((e) => e.message.messageId === messageId);
@@ -756,7 +985,7 @@ export class ReviewService extends EventEmitter {
     }
 
     // A marker is only a lookup hint, never permission to release a draft or transfer processing ownership.
-    async processDelivery(reviewId, messageId, { attemptId, sessionMessageId, sessionId, finished = false }) {
+    async processDelivery(reviewId: string, messageId: string, { attemptId, sessionMessageId, sessionId, finished = false }: { attemptId?: string; sessionMessageId?: string; sessionId?: string; finished?: boolean }) {
         const applied = await this.store.updateReview(reviewId, (review) => {
             const current = review && allMessages(review).find((e) => e.message.messageId === messageId)?.message.delivery;
             // Older queued attempts have no sender field. Only their exact persisted transport event
@@ -779,7 +1008,7 @@ export class ReviewService extends EventEmitter {
 
     // Applies a delivery transition; later states win within the claimed attempt.
     // Non-state fields (e.g. sessionMessageId) are merged even when the state change is ignored.
-    async setDelivery(reviewId, messageId, patch, { attemptId } = {}) {
+    async setDelivery(reviewId: string, messageId: string, patch: Partial<MessageDelivery>, { attemptId }: { attemptId?: string } = {}) {
         const applied = await this.store.updateReview(reviewId, (review) => {
             if (!review) return { write: false, value: false };
             const entry = allMessages(review).find((e) => e.message.messageId === messageId);
@@ -789,9 +1018,9 @@ export class ReviewService extends EventEmitter {
             const { state, ...rest } = patch;
             if (state === "failed" && !["saving", "failed"].includes(current.state)) return { write: false, value: false };
             const allowState = Boolean(state) && current.state !== "replied"
-                && (state === "failed" || DELIVERY_RANK[state] >= DELIVERY_RANK[current.state]);
+                && (state === "failed" || DELIVERY_RANK[state!] >= DELIVERY_RANK[current.state]);
             if (!allowState && Object.keys(rest).length === 0) return { write: false, value: false };
-            entry.message.delivery = { ...current, ...rest, ...(allowState ? { state } : {}), updatedAt: nowIso() };
+            entry.message.delivery = { ...current, ...rest, ...(allowState ? { state: state! } : {}), updatedAt: nowIso() };
             return { review, value: true };
         });
         if (applied) this.changed(reviewId, "delivery");
@@ -800,7 +1029,7 @@ export class ReviewService extends EventEmitter {
 
     // Marks user messages still "processing" as unanswered (called when the agent goes idle).
     // With a sessionId, only messages that session was processing are settled; another session's turn may still be running.
-    async settleProcessing(reviewId, { sessionId } = {}) {
+    async settleProcessing(reviewId: string, { sessionId }: { sessionId?: string } = {}) {
         const ids = await this.store.updateReview(reviewId, (review) => {
             if (!review) return { write: false, value: [] };
             const hits = allMessages(review).filter(({ message }) => message.delivery?.state === "processing"
@@ -814,12 +1043,12 @@ export class ReviewService extends EventEmitter {
 
     // A comment claimed by a provider process that has since stopped can never be sent, so it is failed
     // and the reviewer can resend it. Claims held by running providers, including other sessions', are left alone.
-    async recoverAbandonedClaims(reviewId) {
+    async recoverAbandonedClaims(reviewId: string) {
         const ids = await this.store.updateReview(reviewId, (review) => {
             if (!review) return { write: false, value: [] };
             const hits = allMessages(review).filter(({ message }) => {
                 const d = message.delivery;
-                return d?.state === "saving" && Number.isInteger(d.claimPid) && d.claimPid !== this.pid && !this.isProcessAlive(d.claimPid);
+                return d?.state === "saving" && Number.isInteger(d.claimPid) && d.claimPid !== this.pid && !this.isProcessAlive(d.claimPid!);
             });
             for (const { message } of hits) {
                 message.delivery = { ...message.delivery, state: "failed", error: "The extension stopped before this comment was sent. Resend it.", updatedAt: nowIso() };
@@ -830,14 +1059,14 @@ export class ReviewService extends EventEmitter {
         return ids;
     }
 
-    async findMessage(reviewId, messageId) {
+    async findMessage(reviewId: string, messageId: string) {
         const review = await this.getReview(reviewId);
         const entry = allMessages(review).find((e) => e.message.messageId === messageId);
         if (!entry) throw notFound(`Message ${messageId} not found.`);
         return { review, thread: entry.thread, message: entry.message };
     }
 
-    async revisionLines(reviewId, revisionId, filePath) {
+    async revisionLines(reviewId: string, revisionId: string, filePath: string) {
         const content = await this.getFileContent(reviewId, revisionId, filePath);
         if (!content.available) {
             throw new ReviewError("conflict", `Cannot use ${filePath} from revision ${revisionId}: ${content.reason}. Refresh the review and check the selection before retrying.`);
@@ -846,24 +1075,24 @@ export class ReviewService extends EventEmitter {
     }
 
     // Everything the agent prompt needs for one message, resolved against the current revision.
-    async promptContext(reviewId, threadId) {
+    async promptContext(reviewId: string, threadId: string) {
         const review = await this.getReview(reviewId);
         const thread = findThread(review, threadId);
-        let excerpt = null;
-        let selected = null;
+        let excerpt: { text: string; header?: string } | null = null;
+        let selected: string[] | null = null;
         const loc = thread.location;
         if (loc && (thread.kind === "line" || thread.kind === "change") && loc.state !== "outdated") {
             const snapshot = await this.store.readSnapshot(reviewId, loc.revisionId);
             const file = snapshot?.files.find((f) => f.path === loc.path);
             if (file) {
-                excerpt = hunkExcerpt(file, loc.side, loc.startLine, loc.endLine);
-                selected = selectedLines(file, loc.side, loc.startLine, loc.endLine);
+                excerpt = hunkExcerpt(file, loc.side!, loc.startLine!, loc.endLine!);
+                selected = selectedLines(file, loc.side!, loc.startLine!, loc.endLine!);
             }
-            if (!selected || selected.length !== loc.endLine - loc.startLine + 1) {
+            if (!selected || selected.length !== loc.endLine! - loc.startLine! + 1) {
                 const content = loc.side === "old"
-                    ? await this.git.readCommitFile(review.repoRoot, snapshot?.baseCommit, thread.anchor.oldPath ?? loc.path)
+                    ? await this.git.readCommitFile(review.repoRoot, snapshot?.baseCommit!, thread.anchor!.oldPath ?? loc.path)
                     : await this.revisionLines(reviewId, loc.revisionId, loc.path);
-                selected = content ? content.slice(loc.startLine - 1, loc.endLine) : selected;
+                selected = content ? content.slice(loc.startLine! - 1, loc.endLine) : selected;
             }
         }
         if (loc && thread.kind === "file") {
@@ -886,9 +1115,9 @@ export class ReviewService extends EventEmitter {
     }
 
     // The agent's view of a review. Drafts are still held by the reviewer, so only their count is shown.
-    summarize(review, { threadId, includeResolved = false, maxBody = 2000 } = {}) {
+    summarize(review: Review, { threadId, includeResolved = false, maxBody = 2000 }: { threadId?: string; includeResolved?: boolean; maxBody?: number } = {}) {
         if (isRetiredCommitReview(review)) throw retiredCommitError(review);
-        const isDraft = (m) => m.author === "user" && m.delivery?.state === "draft";
+        const isDraft = (m: ReviewMessage) => m.author === "user" && m.delivery?.state === "draft";
         const visible = review.threads.filter((t) => t.messages.some((m) => !isDraft(m)));
         const threads = visible.filter((t) => (threadId ? t.threadId === threadId : includeResolved || t.status === "active"));
         return {
@@ -904,7 +1133,7 @@ export class ReviewService extends EventEmitter {
             counts: {
                 total: visible.length,
                 active: visible.filter((t) => t.status === "active").length,
-                awaitingAgent: allMessages(review).filter((e) => ["queued", "processing", "failed", "no-reply"].includes(e.message.delivery?.state)).length,
+                awaitingAgent: allMessages(review).filter((e) => ["queued", "processing", "failed", "no-reply"].includes(e.message.delivery?.state ?? "")).length,
                 drafts: allMessages(review).filter((e) => isDraft(e.message)).length,
             },
             threads: threads.map((t) => ({

@@ -221,8 +221,9 @@ npm run typecheck
 npm test
 ```
 
-`npm run build` compiles the TypeScript sources to ESM and copies the retained
-JavaScript modules and browser assets into `extensions/self-review/dist/`.
+`npm run build` compiles the TypeScript provider and browser renderer to ESM and
+copies static browser assets and bundled skill snapshots into
+`extensions/self-review/dist/`.
 `npm test` performs that build first, then exercises the emitted modules and an
 installation-shaped copy. Commit generated `dist/` changes together with source
 changes; CI checks that the distribution is up to date.
@@ -231,23 +232,24 @@ The SDK package is a **development-only** source of its public canvas types, pin
 for reproducible checking; the installed Copilot runtime still supplies the SDK at
 run time. No extension-local SDK installation is needed. If `tsc` or SDK declarations
 are missing, run the install command above rather than substituting ambient stubs.
-CI runs the same type checks and regression suite.
+CI runs the same type checks and regression suite on Node 22.12.0 and current Node 22.
 
-The Node and browser projects use separate libraries and ambient types, with shared
-contracts in `extensions/self-review/types/contracts.d.ts`. Strict TypeScript
-currently checks `src/extension.mts`; `src/lib/anchors.mts`,
-`completion-guidance.mts`, `git-process.mts`, `pull-request.mts`, `server.mts`,
-`review-skills.mts`, `settings.mts`, `settings-actions.mts`, and `settings-http.mts`; and
-`src/web/contracts.mts` and `settings-api.mts`. Compile-only negative fixtures
+All handwritten implementation code is TypeScript: the provider and backend live
+in `src/`, including the renderer in `src/web/app.ts`; tests, development scripts,
+and screenshot tooling are also compiled and strictly checked. The Node and browser
+projects use separate libraries and ambient types, with shared contracts in
+`extensions/self-review/types/contracts.d.ts`. Compile-only negative fixtures
 ensure invalid settings modes, request envelopes, and checkbox values are rejected.
-External HTTP, SDK, and persisted data still receive runtime validation.
+External HTTP, SDK, and persisted data still receive runtime validation; migrating
+the implementation does not change stored reviews or settings.
 
-**Remaining unchecked legacy implementation:** `src/lib/agent-review.mjs`,
-`delivery.mjs`, `diff.mjs`, `git.mjs`, `prompt.mjs`, `review-service.mjs`, and
-`store.mjs`, plus the main browser renderer `web/app.js`. Type declarations at the
-TypeScript boundaries describe these JavaScript modules but do not statically check
-their implementations. Runtime regression tests exercise the emitted distribution
-and its integration with the legacy modules; this is not full TypeScript coverage.
+Development tooling and tests compile into ignored `.build/` output before
+execution, rather than relying on native TypeScript stripping, so Node 22.12+
+remains supported. The checked-in `dist/` stays host-facing JavaScript ESM; the
+one-line `extensions/self-review/extension.mjs` is the required discovery bootstrap.
+Generated output, minimal platform bootstraps, and unmodified third-party snapshots
+are the only JavaScript exceptions. Repository instructions require TypeScript for
+new handwritten code as well.
 
 The screenshots in this README come from a script that builds a demo repository, seeds a review, and captures the real canvas in light and dark themes with Playwright, using your installed Edge or Chrome. It never installs third-party skills or dispatches agent reviews. Build the runtime first:
 
@@ -255,10 +257,10 @@ The screenshots in this README come from a script that builds a demo repository,
 npm run build
 cd docs/screenshots
 npm install
-node render.mjs
+npm run render
 ```
 
-Pass `--keep` to leave the demo review running and print its URL.
+Pass `-- --keep` to `npm run render` to leave the demo review running and print its URL.
 
 ## Status
 

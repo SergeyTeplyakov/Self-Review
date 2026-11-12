@@ -8,6 +8,20 @@ Preserve existing uncommitted changes. If a prerequisite is missing from main,
 stop and ask before reapplying it; do not silently use its unmerged branch as the
 base.
 
+# Language
+
+Use TypeScript for all handwritten implementation code, including the Node
+provider, browser renderer, development scripts, screenshot tooling, and tests.
+Include new code in the appropriate strict TypeScript project; do not substitute
+declaration shims, unchecked JavaScript, or blanket type-check suppressions.
+
+JavaScript is allowed only as generated distribution/build output, an unavoidable
+platform discovery/bootstrap entry point (keep it minimal), or an unmodified
+vendored third-party snapshot. Keep the host-facing ESM output and Node 22.12+
+runtime compatibility; TypeScript execution must not require newer Node-only
+type-stripping support. Commit generated `extensions/self-review/dist/` alongside
+its sources.
+
 # Documentation
 
 Every major feature must update `README.md` in the same change: describe what the
