@@ -29,6 +29,46 @@ feature does, how to use it, and how it relates to existing features. Keep the
 README faithful to the code and refresh affected screenshots when the UI they
 show changes.
 
+# Verifying PR pushes
+
+Immediately after every successful push to a PR branch, verify that the PR's
+remote head is the exact commit just pushed. Confirm the repository, checkout
+path, branch, pushed commit SHA, PR number, and target branch; fetch the target
+and compare the remote PR head with the pushed SHA. Run `npm run build`,
+`npm run typecheck`, and the relevant tests at that exact commit, then check CI
+for the same PR head SHA. A pending or unavailable check is not a pass.
+
+After every PR push, confirm the running Self-Review provider serves a build
+from the exact checkout and pushed commit. This identity check applies to every
+PR, not only provider/UI changes. Reuse an already-matching installation; do not
+deploy or reload unnecessarily. A mismatch does not authorize deployment or
+reload. Before any authorized provider deployment or reload, record and back up
+the existing installation so it can be restored. Preserve stored reviews,
+settings, and other user data; verification must not clear or overwrite them.
+If verification fails, restore the prior provider build without deleting saved
+data.
+
+After every PR push, also perform a live Self-Review canvas smoke check on the
+exact PR checkout. Use the correct repository path and the whole-PR comparison
+against the verified PR target, not an empty comparison or Pending scope. Confirm
+that the canvas loads the pushed diff and exercise behavior relevant to the
+pushed change. Do not change the user's selected review, scope, or filters to
+perform this check. If the active review is Pending or has narrower filters, use
+a separate full-PR comparison for the smoke check and leave the active review
+unchanged. Preserve the active review, its settings and threads, and all other
+user data. Coordinate ownership of the shared preview; do not retarget a panel
+another session is driving.
+
+Verification is not a gate on pushing an authorized fix. If a check fails, is
+pending, or cannot be performed, report that accurately; an authorized needed
+fix may still be pushed. Any new push starts a fresh verification cycle for its
+new exact PR head. If the branch moves during verification, do not treat results
+for the old SHA as verification of the new tip. Do not claim success until
+build, tests, CI, provider identity, checkout/comparison, data safety, and the
+live canvas check are confirmed. If any cannot be confirmed, report what passed
+and what is blocked instead of claiming the pushed change works based on partial
+verification.
+
 # Completing UI changes
 
 A UI change is not finished until the user can see it. Before reporting it done:
