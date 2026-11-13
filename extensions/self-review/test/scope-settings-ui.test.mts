@@ -41,11 +41,13 @@ interface DialogState {
 
 interface RuntimeState {
     [key: string]: unknown;
-    review: Record<string, unknown> & { reviewId: string; scope?: string };
+    review: Record<string, unknown> & { reviewId: string; scope?: string; threads: Array<{ status: string; messages: unknown[] }> };
     dialog: DialogState | null;
     settings: Record<string, unknown> & { learning: string; delivery: string; configured: boolean; repoName?: string } | null | undefined;
     skillOverrides: Map<string, Set<string>>;
     open: Set<string>;
+    expanded: Set<string>;
+    collapsedThreads: Set<string>;
     focusedComposer: string | null;
     approving: Set<string>;
     agentReviewAvailable: boolean;
@@ -158,6 +160,61 @@ function capturedBody(posts: CapturedPost[], index = -1): Record<string, unknown
     assert.ok(typeof body === "object" && body !== null && !Array.isArray(body));
     return body as Record<string, unknown>;
 }
+
+test("active threads can be collapsed and expanded without changing their status or replies", async () => {
+    const thread = {
+        threadId: "t1", kind: "line", status: "active",
+        location: { path: "src/a.cs", side: "new", startLine: 10, endLine: 10, state: "current" },
+        messages: [
+            { messageId: "m1", author: "user", body: "Please explain this line.", createdAt: "2026-01-01T00:00:00Z" },
+            { messageId: "m2", author: "agent", body: "It handles the retry.", createdAt: "2026-01-01T00:01:00Z" },
+        ],
+    };
+    const app = await loadApp();
+    app.state.review = reviewFixture({ threads: [thread] });
+    app.state.snapshot = { revisionId: "r1", files: [] };
+    const html = () => app.run<string>('threadHtml(state.review.threads[0])');
+    const click = clicker(app);
+
+    assert.match(html(), /aria-expanded="true">Hide/);
+    await click("toggle", { thread: "t1" });
+    assert.match(html(), /class="thread collapsed"/);
+    assert.match(html(), /aria-expanded="false">Show/);
+    assert.equal(app.state.review.threads[0].status, "active");
+    assert.equal(app.state.review.threads[0].messages.length, 2);
+
+    await click("toggle", { thread: "t1" });
+    assert.doesNotMatch(html(), /class="thread collapsed"/);
+    assert.match(html(), /aria-expanded="true">Hide/);
+    assert.equal(app.state.review.threads[0].status, "active");
+    assert.equal(app.state.review.threads[0].messages.length, 2);
+});
+
+test("hiding default-collapsed threads does not override the active, current default", async () => {
+    for (const [status, locationState] of [
+        ["resolved", "current"], ["wontfix", "current"], ["closed", "current"], ["active", "outdated"],
+    ]) {
+        const thread = {
+            threadId: "t1", kind: "line", status,
+            location: { path: "src/a.cs", side: "new", startLine: 10, endLine: 10, state: locationState },
+            messages: [{ messageId: "m1", author: "user", body: "A comment", createdAt: "2026-01-01T00:00:00Z" }],
+        };
+        const app = await loadApp();
+        app.state.review = reviewFixture({ threads: [thread] });
+        app.state.snapshot = { revisionId: "r1", files: [] };
+        const html = () => app.run<string>('threadHtml(state.review.threads[0])');
+        const click = clicker(app);
+
+        assert.match(html(), /aria-expanded="false">Show/);
+        await click("toggle", { thread: "t1" });
+        assert.match(html(), /aria-expanded="true">Hide/);
+        await click("toggle", { thread: "t1" });
+        assert.match(html(), /aria-expanded="false">Show/);
+        thread.status = "active";
+        thread.location.state = "current";
+        assert.match(html(), /aria-expanded="true">Hide/, `${status}/${locationState} becomes active and current`);
+    }
+});
 
 const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
 const skillsApp = async (

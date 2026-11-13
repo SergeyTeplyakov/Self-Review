@@ -262,6 +262,7 @@ const state = {
     open: new Set(),
     pending: new Map(),
     expanded: new Set(),
+    collapsedThreads: new Set(),
     showResolved: false,
     collapsedDirs: null,
     fileFold: new Map(),
@@ -700,6 +701,7 @@ function resetForReview() {
     state.open.clear();
     state.pending.clear();
     state.expanded.clear();
+    state.collapsedThreads.clear();
     state.fileFold.clear();
     state.content.clear();
     state.collapsedDirs = null;
@@ -1762,8 +1764,8 @@ function findingEvidenceHtml(finding) {
 function threadHtml(t, { showLocation = false } = {}) {
     const loc = t.location ?? {};
     const outdated = loc.state === "outdated";
-    const collapsible = t.status !== "active" || outdated;
-    const collapsed = collapsible && !state.expanded.has(t.threadId);
+    const defaultCollapsed = t.status !== "active" || outdated;
+    const collapsed = state.collapsedThreads.has(t.threadId) || (defaultCollapsed && !state.expanded.has(t.threadId));
     const pending = t.messages.filter((m) => m.delivery && m.delivery.state !== "replied");
     const notInDiff = !outdated && !isPlaced(t);
     const anchor = t.anchor;
@@ -1781,7 +1783,7 @@ function threadHtml(t, { showLocation = false } = {}) {
         + (t.status !== "active" ? `<span class="badge st-${t.status}">${t.status === "wontfix" ? "won't fix" : t.status}</span>` : "")
         + `<select data-action="status" data-thread="${esc(t.threadId)}" title="Thread status">${options}</select>`
         + (collapsed ? pending.map(deliveryHtml).join("") : "")
-        + (collapsible ? `<button class="link" data-action="toggle" data-thread="${esc(t.threadId)}" aria-expanded="${!collapsed}">${collapsed ? "Show" : "Hide"}</button>` : "")
+        + `<button class="link" data-action="toggle" data-thread="${esc(t.threadId)}" aria-expanded="${!collapsed}">${collapsed ? "Show" : "Hide"}</button>`
         + `</div>`;
     const original = outdated && t.anchor?.selectedLines?.length
         ? `<div class="original muted">Originally commented code (${esc(t.anchor.revisionId)}, ${esc(lineLabel(t.anchor))}):<pre>${esc(t.anchor.selectedLines.join("\n"))}</pre></div>`
@@ -2022,6 +2024,7 @@ function jumpToThread(threadId) {
     const t = review.threads.find((x) => x.threadId === threadId);
     if (!t)
         return;
+    state.collapsedThreads.delete(threadId);
     if (t.status !== "active" || t.location?.state === "outdated")
         state.expanded.add(threadId);
     const path = t.location?.path;
@@ -2166,6 +2169,7 @@ async function onClick(e) {
                 await loadState();
                 break;
             case "discuss-finding":
+                state.collapsedThreads.delete(value("thread"));
                 state.expanded.add(value("thread"));
                 state.open.add(`reply:${value("thread")}`);
                 render();
@@ -2310,10 +2314,21 @@ async function onClick(e) {
                 break;
             case "toggle": {
                 const id = value("thread");
-                if (state.expanded.has(id))
-                    state.expanded.delete(id);
-                else
+                const thread = state.review?.threads.find((t) => t.threadId === id);
+                if (!thread)
+                    break;
+                const outdated = thread.location?.state === "outdated";
+                const defaultCollapsed = thread.status !== "active" || outdated;
+                const collapsed = state.collapsedThreads.has(id) || (defaultCollapsed && !state.expanded.has(id));
+                if (collapsed) {
+                    state.collapsedThreads.delete(id);
                     state.expanded.add(id);
+                }
+                else {
+                    state.expanded.delete(id);
+                    if (!defaultCollapsed)
+                        state.collapsedThreads.add(id);
+                }
                 render();
                 break;
             }
