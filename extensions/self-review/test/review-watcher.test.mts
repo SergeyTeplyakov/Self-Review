@@ -142,6 +142,71 @@ test("unnamed events always refresh and directory replacement does not discard a
     assert.deepEqual(f.logs, []);
 });
 
+test("deletion refreshes when a captured untracked file was never inventoried", async (t) => {
+    const f = await fixture(t);
+    let checkout: ((file: string | null) => void) | undefined;
+    const watcher = new ReviewWatcher(f.service, (text) => f.logs.push(text), 10, (root, change) => {
+        if (root === f.repo) checkout = change;
+        return { close() {} };
+    });
+    t.after(() => watcher.close());
+    await watcher.setReview(f.id);
+    assert.ok(checkout);
+    const file = path.join(f.repo, "new.ts");
+    await writeFile(file, "captured before the watcher inventory\n");
+    await mkdir(path.join(f.repo, "node_modules"));
+    const ignored = path.join(f.repo, "node_modules", "output.js");
+    await writeFile(ignored, "ignored\n");
+    await f.service.refresh(f.id);
+    assert.ok((await f.service.getSnapshot(f.id)).files.some((entry) => entry.path === "new.ts"));
+    await rm(file);
+    await rm(ignored);
+    checkout("node_modules/output.js");
+    checkout("new.ts");
+    await until(async () => !(await f.service.getSnapshot(f.id)).files.some((entry) => entry.path === "new.ts"));
+    assert.deepEqual(f.logs, []);
+});
+
+test("ignored submodule events do not refresh even with a subsequent tracked event", async (t) => {
+    const f = await fixture(t);
+    const source = path.join(f.tmp, "submodule-source");
+    await runGit(f.tmp, ["init", "-q", "-b", "main", source]);
+    await writeFile(path.join(source, "nested.ts"), "base\n");
+    await writeFile(path.join(source, ".gitignore"), "node_modules/\n");
+    await runGit(source, ["add", "."]);
+    await runGit(source, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "base"]);
+    await f.git("-c", "protocol.file.allow=always", "submodule", "add", "-q", source, "vendor/lib");
+    await f.git("commit", "-qam", "submodule");
+    let checkout: ((file: string | null) => void) | undefined;
+    let calls = 0;
+    const watcher = new ReviewWatcher({
+        getReview: (id) => f.service.getReview(id),
+        refresh: async () => { calls++; return { revisionId: "r1", created: false, moved: 0 }; },
+    }, (text) => f.logs.push(text), 10, (root, change) => {
+        if (root === f.repo) checkout = change;
+        return { close() {} };
+    });
+    t.after(() => watcher.close());
+    await watcher.setReview(f.id);
+    assert.ok(checkout);
+    const submodule = path.join(f.repo, "vendor", "lib");
+    await mkdir(path.join(submodule, "node_modules"));
+    await writeFile(path.join(submodule, "node_modules", "output.js"), "ignored\n");
+    checkout("vendor/lib/node_modules");
+    checkout("vendor/lib/node_modules/output.js");
+    await delay(1000);
+    assert.equal(calls, 1, "ignored output does not cause a refresh");
+    await rm(path.join(submodule, "node_modules", "output.js"));
+    checkout("vendor/lib/node_modules/output.js");
+    await delay(1000);
+    assert.equal(calls, 1, "deleting ignored output does not cause a refresh");
+    await writeFile(path.join(submodule, "nested.ts"), "changed\n");
+    checkout("vendor/lib/nested.ts");
+    await until(() => calls > 1);
+    assert.equal(calls, 2, "only the tracked event causes a refresh");
+    assert.deepEqual(f.logs, []);
+});
+
 test("submodule working files and stored HEAD metadata trigger superproject refreshes", async (t) => {
     const f = await fixture(t);
     const source = path.join(f.tmp, "submodule-source");
@@ -158,13 +223,11 @@ test("submodule working files and stored HEAD metadata trigger superproject refr
     await writeFile(path.join(submodule, "nested.ts"), "dirty\n");
     await until(async () => (await f.service.getSnapshot(f.id)).files.some((file) => file.path === "vendor/lib"));
     await until(() => f.count() > beforeTracked);
-    const afterTrackedEdit = f.count();
     await mkdir(path.join(submodule, "node_modules"));
     await writeFile(path.join(submodule, "node_modules", "output.js"), "ignored\n");
     assert.equal((await runGit(submodule, ["check-ignore", "node_modules/output.js"])).stdout.trim(), "node_modules/output.js");
     assert.ok(!(await runGit(submodule, ["ls-files", "--cached", "--others", "--exclude-standard", "-z"])).stdout.includes("node_modules/output.js"));
     await delay(1800);
-    assert.equal(f.count(), afterTrackedEdit, "ignored submodule output does not trigger a superproject refresh");
     const beforeUntracked = f.count();
     const untracked = path.join(submodule, "new.ts");
     await writeFile(untracked, "untracked review content\n");

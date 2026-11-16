@@ -98,6 +98,7 @@ export class ReviewWatcher {
                         let relevant = false;
                         let rescan = false;
                         const changedPaths = [];
+                        const missingPaths = [];
                         for (const [absolute, candidate] of candidates) {
                             if (!candidate.file) {
                                 relevant = true;
@@ -126,6 +127,8 @@ export class ReviewWatcher {
                                 continue;
                             }
                             changedPaths.push(candidate.file);
+                            if (signature === "missing")
+                                missingPaths.push(candidate.file);
                         }
                         if (changedPaths.length || rescan) {
                             // Keep the old inventory too, so deleting an untracked reviewed file still refreshes.
@@ -162,6 +165,32 @@ export class ReviewWatcher {
                                     relevant = true;
                                 if (!next.submodules.has(submodule))
                                     next.submoduleFiles.delete(submodule);
+                            }
+                            if (!relevant) {
+                                // A concurrent refresh may capture an untracked file before either inventory sees its deletion.
+                                const missingByRoot = new Map();
+                                for (const missing of missingPaths) {
+                                    let submodule = path.posix.dirname(missing);
+                                    while (submodule !== "." && !next.submodules.has(submodule))
+                                        submodule = path.posix.dirname(submodule);
+                                    const root = submodule === "." ? review.repoRoot : path.join(review.repoRoot, submodule);
+                                    const relative = submodule === "." ? missing : path.posix.relative(submodule, missing);
+                                    const paths = missingByRoot.get(root) ?? new Set();
+                                    paths.add(relative);
+                                    missingByRoot.set(root, paths);
+                                }
+                                for (const [root, paths] of missingByRoot) {
+                                    const ignored = await runGit(root, ["check-ignore", "--no-index", "-z", "--stdin"], {
+                                        allowFail: true,
+                                        input: [...paths].join("\0") + "\0",
+                                    });
+                                    if (ignored.exitCode !== 0 && ignored.exitCode !== 1)
+                                        throw new Error(`git check-ignore failed: ${ignored.stderr.trim() || `exit code ${ignored.exitCode}`}`);
+                                    if (ignored.stdout.split("\0").filter(Boolean).length < paths.size) {
+                                        relevant = true;
+                                        break;
+                                    }
+                                }
                             }
                             known = next;
                         }

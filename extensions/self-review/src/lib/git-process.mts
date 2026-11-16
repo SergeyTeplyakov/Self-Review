@@ -4,16 +4,17 @@ import { execFile } from "node:child_process";
 /**
  * @param {string} cwd
  * @param {string[]} args
- * @param {{allowFail?: boolean}} [options]
- * @returns {Promise<{ok: boolean, stdout: string, stderr: string}>}
+ * @param {{allowFail?: boolean, input?: string}} [options]
+ * @returns {Promise<{ok: boolean, stdout: string, stderr: string, exitCode: number | null}>}
  */
-export function runGit(cwd: string, args: string[], { allowFail = false }: { allowFail?: boolean } = {}): Promise<{
+export function runGit(cwd: string, args: string[], { allowFail = false, input }: { allowFail?: boolean; input?: string } = {}): Promise<{
     ok: boolean;
     stdout: string;
     stderr: string;
+    exitCode: number | null;
 }> {
-    return new Promise<{ ok: boolean; stdout: string; stderr: string }>((resolve, reject) => {
-        execFile(
+    return new Promise<{ ok: boolean; stdout: string; stderr: string; exitCode: number | null }>((resolve, reject) => {
+        const child = execFile(
             "git",
             ["--no-pager", "-c", "core.quotepath=false", ...args],
             {
@@ -28,8 +29,12 @@ export function runGit(cwd: string, args: string[], { allowFail = false }: { all
                     reject(new Error(`git ${args[0]} failed: ${(stderr || err.message).trim().split("\n").slice(0, 3).join(" ")}`));
                     return;
                 }
-                resolve({ ok: !err, stdout: stdout ?? "", stderr: stderr ?? "" });
+                resolve({ ok: !err, stdout: stdout ?? "", stderr: stderr ?? "", exitCode: err ? typeof err.code === "number" ? err.code : null : 0 });
             },
         );
+        if (input !== undefined && child.stdin) {
+            child.stdin.on("error", reject);
+            child.stdin.end(input);
+        }
     });
 }
