@@ -104,14 +104,15 @@ export async function repoIdentity(repoRoot: string, git: GitRunner = gitDefault
     const common = await git.runGit(repoRoot, ["rev-parse", "--git-common-dir"], { allowFail: true });
     const dir = common.ok ? common.stdout.trim() : "";
     const root = dir ? path.resolve(repoRoot, dir) : path.resolve(repoRoot);
-    let nameRoot = path.basename(root) === ".git" ? path.dirname(root) : repoRoot;
+    let nameRoot = repoRoot;
     if (dir) {
         const worktree = await git.runGit(repoRoot, ["--git-dir", root, "config", "--path", "--default", "", "--get", "core.worktree"], { allowFail: true });
         const configured = worktree.ok ? worktree.stdout.trim() : "";
         if (configured) nameRoot = path.resolve(root, configured);
-        else if (path.basename(root) !== ".git") {
+        else {
             const bare = await git.runGit(repoRoot, ["--git-dir", root, "rev-parse", "--is-bare-repository"], { allowFail: true });
             if (bare.ok && bare.stdout.trim() === "true") nameRoot = root;
+            else if (path.basename(root) === ".git" && root === path.resolve(repoRoot, ".git")) nameRoot = path.dirname(root);
         }
     }
     const name = path.basename(nameRoot);

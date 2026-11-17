@@ -21,7 +21,7 @@ You get a PR-style review of your local changes. Select a line, write a comment,
 
 To review only what you haven't committed yet, ask for your pending changes instead, or switch between **All changes** and **Pending changes** in the top bar at any time.
 
-The file tree root uses the repository name from `origin`, not a generated worktree-folder name. Local-only linked worktrees use the main repository folder name (or the bare repository folder name when linked to a bare repository). With `--separate-git-dir`, an explicit common `core.worktree` supplies the main checkout name; otherwise Git does not retain that path, so linked worktrees keep their checkout-folder label. Hover over the root to see the full checkout path and review scope; the root folder view uses the same repository label.
+The file tree root uses the repository name from `origin`, not a generated worktree-folder name. For local-only repositories, each checkout uses its own folder name unless a common `core.worktree` identifies the main checkout; bare repositories use the bare repository folder name. Hover over the root to see the full checkout path and review scope; the root folder view uses the same repository label.
 
 ## Why
 

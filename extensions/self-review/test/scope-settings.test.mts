@@ -482,7 +482,7 @@ test("repoIdentity resolves a local-path origin against its repository", async (
     assert.equal((await repoIdentity(byUrl)).key, a.key, "a file URL names the same repository");
 });
 
-test("repoIdentity follows the origin remote across clones and worktrees, and falls back to the git directory", async () => {
+test("repoIdentity follows the origin remote across clones and worktrees, and falls back to checkout names", async () => {
     const main = path.join(tmp, "ident");
     await runGit(tmp, ["init", "-q", "-b", "main", main]);
     await writeFile(path.join(main, "f.txt"), "x\n");
@@ -494,7 +494,9 @@ test("repoIdentity follows the origin remote across clones and worktrees, and fa
     const local = await repoIdentity(main);
     assert.match(local.key, /^local:/);
     assert.equal(local.name, "ident");
-    assert.deepEqual(await repoIdentity(worktree), local, "local-only worktrees share the repository key and name");
+    const localWorktree = await repoIdentity(worktree);
+    assert.equal(localWorktree.key, local.key, "local-only worktrees share the repository key");
+    assert.equal(localWorktree.name, "ident-wt", "without a configured main checkout, a linked worktree uses its checkout name");
 
     await git(main, "remote", "add", "origin", "git@github.com:Owner/My-Repo.git");
     assert.deepEqual(await repoIdentity(main), { key: "remote:github.com/owner/my-repo", name: "My-Repo" });
@@ -539,6 +541,8 @@ test("local-only separate-Git-directory worktrees resolve core.worktree when the
 
     const common = await git(worktree, "rev-parse", "--git-common-dir");
     const key = `local:${pathKey(path.resolve(worktree, common.stdout.trim()))}`;
+    assert.deepEqual(await repoIdentity(main), { key, name: "dotgit-primary-repo" });
+    assert.deepEqual(await repoIdentity(worktree), { key, name: "generated-dotgit-worktree" });
     await git(main, "config", "core.worktree", path.relative(gitDir, main));
     assert.deepEqual(await repoIdentity(main), { key, name: "dotgit-primary-repo" });
     assert.deepEqual(await repoIdentity(worktree), { key, name: "dotgit-primary-repo" });
