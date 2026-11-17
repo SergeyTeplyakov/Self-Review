@@ -482,7 +482,7 @@ test("repoIdentity resolves a local-path origin against its repository", async (
     assert.equal((await repoIdentity(byUrl)).key, a.key, "a file URL names the same repository");
 });
 
-test("repoIdentity follows the origin remote across clones and worktrees, and falls back to the git directory", async () => {
+test("repoIdentity follows the origin remote across clones and worktrees, and falls back to checkout names", async () => {
     const main = path.join(tmp, "ident");
     await runGit(tmp, ["init", "-q", "-b", "main", main]);
     await writeFile(path.join(main, "f.txt"), "x\n");
@@ -494,16 +494,71 @@ test("repoIdentity follows the origin remote across clones and worktrees, and fa
     const local = await repoIdentity(main);
     assert.match(local.key, /^local:/);
     assert.equal(local.name, "ident");
-    assert.equal((await repoIdentity(worktree)).key, local.key, "worktrees share the key of their repository");
+    const localWorktree = await repoIdentity(worktree);
+    assert.equal(localWorktree.key, local.key, "local-only worktrees share the repository key");
+    assert.equal(localWorktree.name, "ident-wt", "without a configured main checkout, a linked worktree uses its checkout name");
 
     await git(main, "remote", "add", "origin", "git@github.com:Owner/My-Repo.git");
     assert.deepEqual(await repoIdentity(main), { key: "remote:github.com/owner/my-repo", name: "My-Repo" });
-    assert.equal((await repoIdentity(worktree)).key, "remote:github.com/owner/my-repo");
+    assert.deepEqual(await repoIdentity(worktree), { key: "remote:github.com/owner/my-repo", name: "My-Repo" });
 
     const clone = path.join(tmp, "ident-clone");
     await runGit(tmp, ["init", "-q", "-b", "main", clone]);
     await git(clone, "remote", "add", "origin", "https://user@github.com/owner/my-repo.git");
     assert.equal((await repoIdentity(clone)).key, "remote:github.com/owner/my-repo", "a clone over another protocol is the same repository");
+});
+
+test("local-only separate-Git-directory worktrees honor core.worktree and otherwise keep the checkout fallback", async () => {
+    const main = path.join(tmp, "separate-primary-repo");
+    const gitDir = path.join(tmp, "external-git-metadata");
+    const worktree = path.join(tmp, "generated-separate-worktree-id");
+    await git(tmp, "init", "-q", "-b", "main", "--separate-git-dir", gitDir, main);
+    await git(main, "commit", "-q", "--allow-empty", "-m", "init");
+    await git(main, "worktree", "add", "-q", "-b", "linked", worktree);
+
+    const common = await git(worktree, "rev-parse", "--git-common-dir");
+    const key = `local:${pathKey(path.resolve(worktree, common.stdout.trim()))}`;
+    assert.deepEqual(await repoIdentity(main), { key, name: "separate-primary-repo" });
+    assert.deepEqual(await repoIdentity(worktree), { key, name: "generated-separate-worktree-id" });
+
+    await git(main, "config", "core.worktree", path.relative(gitDir, main));
+    assert.deepEqual(await repoIdentity(main), { key, name: "separate-primary-repo" });
+    assert.deepEqual(await repoIdentity(worktree), { key, name: "separate-primary-repo" });
+
+    await git(main, "config", "core.worktree", "~self_review_no_such_user_7f2a/path");
+    assert.equal((await git(worktree, "status", "--short")).ok, true, "the linked checkout remains usable");
+    assert.deepEqual(await repoIdentity(worktree), { key, name: "generated-separate-worktree-id" }, "an unexpandable display hint keeps the checkout-name fallback");
+});
+
+test("local-only separate-Git-directory worktrees resolve core.worktree when the metadata directory is named .git", async () => {
+    const main = path.join(tmp, "dotgit-primary-repo");
+    const gitDir = path.join(tmp, "dotgit-metadata", ".git");
+    const worktree = path.join(tmp, "generated-dotgit-worktree");
+    await mkdir(path.dirname(gitDir));
+    await git(tmp, "init", "-q", "-b", "main", "--separate-git-dir", gitDir, main);
+    await git(main, "commit", "-q", "--allow-empty", "-m", "init");
+    await git(main, "worktree", "add", "-q", "-b", "linked", worktree);
+
+    const common = await git(worktree, "rev-parse", "--git-common-dir");
+    const key = `local:${pathKey(path.resolve(worktree, common.stdout.trim()))}`;
+    assert.deepEqual(await repoIdentity(main), { key, name: "dotgit-primary-repo" });
+    assert.deepEqual(await repoIdentity(worktree), { key, name: "generated-dotgit-worktree" });
+    await git(main, "config", "core.worktree", path.relative(gitDir, main));
+    assert.deepEqual(await repoIdentity(main), { key, name: "dotgit-primary-repo" });
+    assert.deepEqual(await repoIdentity(worktree), { key, name: "dotgit-primary-repo" });
+});
+
+test("local-only bare repository worktrees use the repository name without changing settings keys", async () => {
+    const bare = path.join(tmp, "local-bare.git");
+    const worktree = path.join(tmp, "generated-bare-worktree-id");
+    await git(tmp, "clone", "--bare", "--quiet", repo, bare);
+    await git(tmp, "--git-dir", bare, "remote", "remove", "origin");
+    await git(tmp, "--git-dir", bare, "worktree", "add", "-q", "-b", "bare-worktree", worktree, "feature");
+
+    const common = await git(worktree, "rev-parse", "--git-common-dir");
+    const key = `local:${pathKey(path.resolve(worktree, common.stdout.trim()))}`;
+    assert.deepEqual(await repoIdentity(bare), { key, name: "local-bare.git" });
+    assert.deepEqual(await repoIdentity(worktree), { key, name: "local-bare.git" });
 });
 
 test("SettingsService keeps learning off until a mode is chosen and stores each choice per repository", async () => {

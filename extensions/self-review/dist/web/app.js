@@ -833,7 +833,7 @@ function expandAncestors(path) {
 // ---------- File tree ----------
 const inDir = (path, dir) => dir === "" || path.startsWith(`${dir}/`);
 const filesUnder = (dir) => (state.snapshot?.files ?? []).filter((f) => inDir(f.path, dir)).sort((a, b) => a.path.localeCompare(b.path));
-const repoName = () => (state.review?.repoRoot ?? "").split(/[\\/]/).filter(Boolean).pop() ?? "All files";
+const repoName = () => state.settings?.repoName ?? (state.review?.repoRoot ?? "").split(/[\\/]/).filter(Boolean).pop() ?? "All files";
 // Folders first, then files; chains of single-child folders are compacted like ADO ("src/Common/Foo").
 function buildTree(files) {
     const root = { name: repoName(), path: "", dirs: new Map(), files: [], children: [] };

@@ -21,6 +21,8 @@ You get a PR-style review of your local changes. Select a line, write a comment,
 
 To review only what you haven't committed yet, ask for your pending changes instead, or switch between **All changes** and **Pending changes** in the top bar at any time.
 
+The file tree root uses the repository name from `origin`, not a generated worktree-folder name. For local-only repositories, each checkout uses its own folder name unless a common `core.worktree` identifies the main checkout; bare repositories use the bare repository folder name. Hover over the root to see the full checkout path and review scope; the root folder view uses the same repository label.
+
 ## Why
 
 Agents write code faster than you can read it. Reviewing in chat is awkward: you paste file names and line numbers, describe which `if` you mean, and lose track of what was already addressed. PR tools have the right shape for this, but they only kick in after you push, and their comments go to people, not to the agent that wrote the code.

@@ -136,6 +136,23 @@ const reviewFixture = (overrides: Record<string, unknown> = {}) => ({
     ...overrides,
 });
 const settingsFixture = (overrides: Record<string, unknown> = {}) => ({ repoName: "repo", learning: "off", delivery: "immediate", configured: false, dismissed: false, ...overrides });
+
+test("tree root and root folder use the repository identity, retaining the checkout tooltip", async () => {
+    const app = await loadApp();
+    app.state.review = reviewFixture({ repoRoot: "C:\\worktrees\\generated-workspace-id" });
+    app.state.snapshot = { revisionId: "r1", files: [] };
+    for (const name of ["Self-Review", "local-repo", "Repo <name>"]) {
+        app.state.settings = settingsFixture({ repoName: name });
+        const escaped = name.replace("<", "&lt;").replace(">", "&gt;");
+        const tree = app.run<string>('(() => { const out = []; treeHtml(buildTree([]), 0, out); return out.join(""); })()');
+        assert.ok(tree.includes(`<span class="name">${escaped}</span>`));
+        assert.ok(tree.includes('title="C:\\worktrees\\generated-workspace-id'));
+        assert.ok(app.run<string>('folderView("")').includes(`<span class="path">${escaped}</span>`));
+    }
+    app.state.settings = null;
+    assert.equal(app.run('buildTree([]).name'), "generated-workspace-id", "older providers without settings retain the checkout fallback");
+});
+
 const jsonResponse = (data: unknown, status = 200) => ({ ok: status < 400, status, statusText: status < 400 ? "OK" : "Error", json: async () => data });
 const clicker = (app: LoadedApp) => (action: string, dataset: Record<string, string> = {}) => {
     const target = Object.assign(new MockElement("BUTTON"), { dataset: { action, ...dataset } });
