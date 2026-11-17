@@ -51,6 +51,40 @@ async function fixture(t: TestContext, branch = "main"): Promise<{ dir: string; 
     return { dir, repo, text, store, service: new ReviewService({ store }) };
 }
 
+test("refresh lifecycle reports coalesced capture progress, failure and recovery without changing the saved description", async (t) => {
+    const { repo, service, store } = await fixture(t);
+    const id = await service.ensureReview({ repoPath: repo, base: "main" });
+    await service.updateDescription(id, { body: "Saved purpose", expectedVersion: 0 });
+    const snapshot = await service.getSnapshot(id);
+    let release = () => {};
+    let fail = false;
+    let captures = 0;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const active = new ReviewService({ store, git: { ...service.git, captureSnapshot: async () => {
+        captures++;
+        await gate;
+        if (fail) throw new Error("capture unavailable");
+        return snapshot;
+    } } });
+    const events: unknown[] = [];
+    active.on("changed", () => events.push(active.refreshState(id)));
+    const first = active.refresh(id);
+    assert.equal(active.refresh(id), first);
+    assert.deepEqual(active.refreshState(id), { status: "refreshing" });
+    release();
+    await first;
+    assert.equal(captures, 2, "a request during capture queues a second pass");
+    assert.deepEqual(events[0], { status: "refreshing" });
+    assert.deepEqual(events.at(-1), { status: "idle" });
+    fail = true;
+    await assert.rejects(active.refresh(id), /capture unavailable/);
+    assert.deepEqual(active.refreshState(id), { status: "error", error: "capture unavailable" });
+    assert.equal((await active.getReview(id)).description?.body, "Saved purpose");
+    fail = false;
+    await active.refresh(id);
+    assert.deepEqual(active.refreshState(id), { status: "idle" });
+});
+
 test("quoted diff headers identify binary, empty, mode-only and mixed quoted paths without text headers", () => {
     const fixtures = [
         ['"a/tab\\tfile.png" "b/tab\\tfile.png"', "Binary files differ", "tab\tfile.png", "tab\tfile.png"],

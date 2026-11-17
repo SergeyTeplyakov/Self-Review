@@ -310,6 +310,7 @@ test("an open server pushes checkout refreshes and closing the panel stops refre
         await writeFile(path.join(f.repo, "file.ts"), "automatically refreshed\n");
         const event = await reader.read();
         assert.match(new TextDecoder().decode(event.value), /event: changed/);
+        await until(async () => (await f.service.getReview(f.id)).currentRevisionId === "r2");
         const response = await fetch(new URL(`/api/state${url.search}`, url));
         const state = await response.json() as { review: { currentRevisionId: string } };
         assert.equal(state.review.currentRevisionId, "r2");

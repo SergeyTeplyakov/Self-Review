@@ -181,8 +181,10 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         const parts = url.pathname.split("/").filter(Boolean).slice(1);
         if (req.method === "GET") {
             if (parts[0] === "state" && parts.length === 1) {
+                const initial = await service.getReview(reviewId);
+                const [pullRequest, settingsState] = await Promise.all([readPullRequest(initial), settingsHttp.read(initial.repoRoot)]);
                 const review = await service.getReview(reviewId);
-                return send(res, 200, { instanceId, review, session: { busy: delivery.busy }, pullRequest: await readPullRequest(review), agentReviewAvailable: Boolean(agentReview), reviewSkillsAvailable: Boolean(reviewSkills), agentReviewSuggestedModels: SUGGESTED_REVIEWERS, ...await settingsHttp.read(review.repoRoot) });
+                return send(res, 200, { instanceId, review, refresh: service.refreshState(reviewId), session: { busy: delivery.busy }, pullRequest, agentReviewAvailable: Boolean(agentReview), reviewSkillsAvailable: Boolean(reviewSkills), agentReviewSuggestedModels: SUGGESTED_REVIEWERS, ...settingsState });
             }
             if (parts[0] === "review-skills" && parts.length === 1) {
                 if (!reviewSkills)

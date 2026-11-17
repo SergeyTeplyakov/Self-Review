@@ -528,3 +528,46 @@ test("descriptions persist across reopen, reject stale updates, and are captured
         service.off("changed", listener);
     }
 });
+
+test("state returns the latest Overview after slow PR discovery and exposes capture progress and failures", async (t) => {
+    let releaseDiscovery = () => {};
+    let discoveryStarted = () => {};
+    const discoveryGate = new Promise<void>((resolve) => { releaseDiscovery = resolve; });
+    const discovery = new Promise<void>((resolve) => { discoveryStarted = resolve; });
+    const server = await startReviewServer({
+        instanceId: "loading-state", getReviewId: () => reviewId, service, delivery, webRoot: WEB_ROOT,
+        findPullRequest: async () => { discoveryStarted(); await discoveryGate; return null; },
+    });
+    t.after(() => server.close());
+    t.after(() => releaseDiscovery());
+    const url = new URL(server.url);
+    const readState = async (): Promise<{ review: { description: { body: string } }; refresh: { status: string; error?: string } }> => {
+        const response = await fetch(new URL(`/api/state${url.search}`, url));
+        assert.equal(response.status, 200);
+        return response.json();
+    };
+    const pending = readState();
+    await discovery;
+    await service.updateDescription(reviewId, { expectedVersion: (await getReview()).description?.version ?? 0, body: "Updated during discovery" });
+    releaseDiscovery();
+    const latest = await pending;
+    assert.equal(latest.review.description.body, "Updated during discovery");
+    assert.equal(latest.refresh.status, "idle");
+
+    let releaseCapture = () => {};
+    const captureGate = new Promise<void>((resolve) => { releaseCapture = resolve; });
+    t.after(() => releaseCapture());
+    const capture = t.mock.method(service, "refreshOnce", async () => {
+        await captureGate;
+        throw new Error("capture failed");
+    });
+    const refreshing = service.refresh(reviewId);
+    const rejected = assert.rejects(refreshing, /capture failed/);
+    assert.equal((await readState()).refresh.status, "refreshing");
+    releaseCapture();
+    await rejected;
+    assert.deepEqual((await readState()).refresh, { status: "error", error: "capture failed" });
+    capture.mock.restore();
+    await service.refresh(reviewId);
+    assert.equal((await readState()).refresh.status, "idle");
+});

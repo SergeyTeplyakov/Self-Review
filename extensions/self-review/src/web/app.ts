@@ -174,6 +174,7 @@ type SkillCatalog = {
 };
 type StateResponse = {
     review: Review;
+    refresh?: { status: "idle" | "refreshing" } | { status: "error"; error: string };
     session?: { busy: boolean | null };
     pullRequest: PullRequest | null;
     agentReviewAvailable: boolean;
@@ -462,6 +463,9 @@ function parseContent(value: unknown, file: DiffFile): ContentEntry {
 
 function isStateResponse(value: unknown): value is RawStateResponse {
     if (!isRecord(value) || !isReview(value.review)
+        || (value.refresh !== undefined && (!isRecord(value.refresh)
+            || !["idle", "refreshing", "error"].includes(String(value.refresh.status))
+            || (value.refresh.status === "error" && typeof value.refresh.error !== "string")))
         || (value.session !== undefined && (!isRecord(value.session)
             || (value.session.busy !== null && typeof value.session.busy !== "boolean")))
         || (value.pullRequest !== undefined && value.pullRequest !== null
@@ -476,6 +480,7 @@ function parseState(value: unknown): StateResponse {
     if (!isStateResponse(value)) throw new Error("Invalid state response.");
     return {
         review: value.review,
+        refresh: value.refresh,
         session: value.session === undefined ? undefined : { busy: value.session.busy },
         pullRequest: value.pullRequest == null ? null : { number: value.pullRequest.number, url: value.pullRequest.url },
         agentReviewAvailable: value.agentReviewAvailable === true,
@@ -936,24 +941,48 @@ function resetForReview() {
 
 let loading: Promise<void> | null = null;
 let reloadAgain = false;
+let reloadPending = false;
+let refreshing = false;
+let loadError = "";
+let serverRefresh: StateResponse["refresh"];
+
+function renderLoadStatus(): void {
+    const status = $("#review-status");
+    if (!status) return;
+    const pending = Boolean(loading) || reloadPending || refreshing || (!loadError && serverRefresh?.status === "refreshing");
+    const error = loadError || (serverRefresh?.status === "error" ? serverRefresh.error : "");
+    status.hidden = !pending && !error;
+    status.className = error && !pending ? "review-status del" : "review-status muted";
+    status.innerHTML = pending
+        ? state.review ? "Refreshing review and Overview... Showing the last loaded data." : "Loading review and Overview..."
+        : error ? `Could not load the current review: ${esc(error)}. ${state.review ? "Showing the last loaded data. " : ""}<button data-action="refresh">Retry</button>` : "";
+}
+
 async function loadState() {
+    clearTimeout(reloadTimer);
+    reloadPending = false;
     if (loading) {
         reloadAgain = true;
         return loading;
     }
-    loading = (async () => {
+    loadError = "";
+    loading = Promise.resolve().then(async () => {
         do {
             reloadAgain = false;
             const data = parseState(await api("GET", "state"));
             const rev = data.review.currentRevisionId;
             const snapshot = !rev ? null : state.review?.reviewId !== data.review.reviewId || state.snapshot?.revisionId !== rev
                 ? parseSnapshot(await api("GET", `snapshot/${rev}`)) : state.snapshot;
+            if (snapshot && snapshot.revisionId !== rev) throw new Error("Snapshot does not match the review revision.");
+            // An event received during either request invalidates the pair before it reaches the screen.
+            if (reloadAgain) continue;
             const reviewChanged = state.review?.reviewId !== data.review.reviewId;
             if (state.review && reviewChanged) resetForReview();
             else if (state.review && state.review.currentRevisionId !== data.review.currentRevisionId) pinComposers();
             state.review = data.review;
             if (reviewChanged) restorePinnedComposers(data.review.reviewId);
             state.snapshot = snapshot;
+            serverRefresh = data.refresh;
             state.reviewSkillsAvailable = data.reviewSkillsAvailable === true;
             state.pullRequest = data.pullRequest ?? null;
             const settingsState = settingsApi.readState(data.settingsPayload);
@@ -967,16 +996,44 @@ async function loadState() {
             restoreView();
             render();
         } while (reloadAgain);
-    })().finally(() => {
+    }).catch((error: unknown) => {
+        loadError = errorMessage(error);
+        throw error;
+    }).finally(() => {
         loading = null;
+        renderLoadStatus();
     });
+    renderLoadStatus();
     return loading;
 }
 
 let reloadTimer: number | undefined;
 function scheduleReload() {
+    reloadPending = true;
+    renderLoadStatus();
     clearTimeout(reloadTimer);
+    if (loading) {
+        reloadAgain = true;
+        reloadPending = false;
+        return;
+    }
     reloadTimer = window.setTimeout(() => loadState().catch((err: unknown) => toast(errorMessage(err), true)), 120);
+}
+
+async function refreshReview(): Promise<void> {
+    refreshing = true;
+    loadError = "";
+    renderLoadStatus();
+    try {
+        await api("POST", "refresh", {});
+        await loadState();
+    } catch (error) {
+        loadError = errorMessage(error);
+        throw error;
+    } finally {
+        refreshing = false;
+        renderLoadStatus();
+    }
 }
 
 function connect() {
@@ -1219,6 +1276,7 @@ function render() {
     if (!main) return;
     const scroll = main.scrollTop;
     renderTop();
+    renderLoadStatus();
     renderBanner();
     renderSide();
     renderMain();
@@ -1784,8 +1842,8 @@ function descriptionHtml(): string {
     return `<div class="section-head"><h2>Change overview</h2><span class="spacer"></span>`
         + `<button data-action="discuss-description">Discuss / request edits</button></div>`
         + `<div class="card description"><div class="muted">Local PR-style draft; not synced to the published PR.`
-        + (d ? ` v${d.version} · based on ${esc(d.revisionId)}${stale ? " · Diff changed; description may need updating." : ""}` : "")
-        + `</div>${d ? md(d.body) : `<div class="empty">No description yet. Ask Copilot below to describe the purpose, behavior, scope, verification, and risks.</div>`}</div>`;
+        + (d ? ` v${d.version} · based on ${esc(d.revisionId)}${stale ? " · Earlier diff: description has not been updated for the current revision." : ""}` : "")
+        + `</div>${d ? md(d.body) : `<div class="empty">No saved description. Descriptions are not generated automatically. Ask Copilot below to describe the purpose, behavior, scope, verification, and risks.</div>`}</div>`;
 }
 
 function renderSide(): void {
@@ -2472,8 +2530,7 @@ async function onClick(e: MouseEvent): Promise<void> {
                 break;
             case "refresh":
                 target.setAttribute("disabled", "");
-                await api("POST", "refresh", {});
-                await loadState();
+                await refreshReview();
                 toast("Refreshed from the working tree");
                 break;
             case "open":
