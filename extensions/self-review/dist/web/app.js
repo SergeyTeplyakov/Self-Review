@@ -793,8 +793,12 @@ async function loadState() {
         loadError = errorMessage(error);
         throw error;
     }).finally(() => {
+        const retryQueued = reloadAgain;
+        reloadAgain = false;
         loading = null;
         renderLoadStatus();
+        if (retryQueued)
+            scheduleReload();
     });
     renderLoadStatus();
     return loading;

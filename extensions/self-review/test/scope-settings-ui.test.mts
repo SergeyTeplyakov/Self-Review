@@ -205,6 +205,61 @@ test("loading waits for a matching snapshot and never publishes an SSE-invalidat
     assert.equal(app.node("#review-status").hidden, true);
 });
 
+test("a reload queued during failed state or snapshot requests is retried automatically", async () => {
+    for (const failedRequest of ["state", "snapshot/r1"]) {
+        const failure = deferred<ReturnType<typeof jsonResponse>>();
+        const requestStarted = deferred<void>();
+        let stateRequests = 0;
+        let snapshotRequests = 0;
+        const timers: Array<() => void> = [];
+        const app = await loadApp({
+            window: { setTimeout: (callback: () => void) => { timers.push(callback); return timers.length; } },
+            fetch: async (url) => {
+                if (url === "/api/state") {
+                    stateRequests++;
+                    if (failedRequest === "state" && stateRequests === 1) {
+                        requestStarted.resolve();
+                        return failure.promise;
+                    }
+                    const revision = failedRequest === "snapshot/r1" && stateRequests === 1 ? "r1" : "r2";
+                    return jsonResponse({ review: reviewFixture({
+                        currentRevisionId: revision,
+                        description: { version: revision === "r1" ? 1 : 2, revisionId: revision, body: revision === "r1" ? "Old overview" : "Recovered overview" },
+                    }) });
+                }
+                if (url === "/api/snapshot/r1") {
+                    snapshotRequests++;
+                    if (failedRequest === "snapshot/r1") {
+                        requestStarted.resolve();
+                        return failure.promise;
+                    }
+                    return jsonResponse({ revisionId: "r1", files: [] });
+                }
+                if (url === "/api/snapshot/r2") {
+                    snapshotRequests++;
+                    return jsonResponse({ revisionId: "r2", files: [] });
+                }
+                throw new Error(`Unexpected request ${url}`);
+            },
+        });
+        app.run("renderRuler = () => {}");
+        const initialLoad = app.run<Promise<void>>("loadState()");
+        await requestStarted.promise;
+        app.run("scheduleReload()");
+        failure.resolve(jsonResponse({ error: { message: `temporary ${failedRequest} failure` } }, 503));
+        await assert.rejects(initialLoad, new RegExp(`temporary ${failedRequest} failure`));
+
+        assert.equal(timers.length, 1, "the failed load schedules the change-triggered retry");
+        timers[0]?.();
+        await app.run<Promise<void>>("loading");
+        assert.equal(stateRequests, 2);
+        assert.equal(app.state.review.currentRevisionId, "r2");
+        assert.equal(app.read("state.review.description.body"), "Recovered overview");
+        assert.equal(app.node("#review-status").hidden, true);
+        if (failedRequest === "snapshot/r1") assert.equal(snapshotRequests, 2);
+    }
+});
+
 test("refresh progress and load failure preserve the current view and composer DOM until a successful retry", async () => {
     let failed = false;
     let refresh: { status: string; error?: string } = { status: "refreshing" };
