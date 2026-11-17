@@ -246,6 +246,7 @@ export class ReviewService extends EventEmitter {
     pid;
     isProcessAlive;
     refreshes;
+    refreshErrors = new Map();
     /**
      * @param {object} p
      * @param {number} [p.pid] process recorded on delivery claims
@@ -402,6 +403,12 @@ export class ReviewService extends EventEmitter {
         });
         return siblingId;
     }
+    refreshState(reviewId) {
+        if (this.refreshes.has(reviewId))
+            return { status: "refreshing" };
+        const error = this.refreshErrors.get(reviewId);
+        return error === undefined ? { status: "idle" } : { status: "error", error };
+    }
     // Coalesces overlapping refreshes; a refresh requested mid-capture triggers one more pass.
     refresh(reviewId) {
         const running = this.refreshes.get(reviewId);
@@ -410,6 +417,8 @@ export class ReviewService extends EventEmitter {
             return running.promise;
         }
         const entry = { again: false };
+        this.refreshes.set(reviewId, entry);
+        this.refreshErrors.delete(reviewId);
         entry.promise = (async () => {
             try {
                 let result;
@@ -419,11 +428,16 @@ export class ReviewService extends EventEmitter {
                 } while (entry.again);
                 return result;
             }
+            catch (error) {
+                this.refreshErrors.set(reviewId, errorMessage(error));
+                throw error;
+            }
             finally {
                 this.refreshes.delete(reviewId);
+                this.changed(reviewId, "refresh");
             }
         })();
-        this.refreshes.set(reviewId, entry);
+        this.changed(reviewId, "refresh");
         return entry.promise;
     }
     async refreshOnce(reviewId) {

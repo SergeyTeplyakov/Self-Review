@@ -15,6 +15,8 @@ interface MockNode {
     inert?: boolean;
     scrollTop: number;
     focus: () => number | void;
+    setSelectionRange?: (start: number, end: number) => void;
+    selectionRange?: [number, number];
     tagName?: string;
     dataset?: Record<string, string>;
     closest?: (selector: string) => MockNode | null;
@@ -66,7 +68,14 @@ interface RuntimeState {
 
 type MockFetch = (url: string, options?: { method?: string; body?: string }) => Promise<unknown>;
 type CapturedPost = [string, ...unknown[]];
-type MockFocusable = { focus?: MockNode["focus"]; checked?: boolean };
+type MockFocusable = {
+    focus?: MockNode["focus"];
+    checked?: boolean;
+    tagName?: string;
+    dataset?: Record<string, string>;
+    selectionStart?: number;
+    selectionEnd?: number;
+};
 
 interface LoadedApp {
     document: {
@@ -102,9 +111,11 @@ async function loadApp(globals: Record<string, unknown> & { fetch?: MockFetch } 
     const focused: string[] = [];
     const node = (selector: string): MockNode => {
         if (!nodes.has(selector)) {
-            const element = Object.assign(new MockElement(), {
+            let element: MockNode;
+            element = Object.assign(new MockElement(), {
                 innerHTML: "", textContent: "", className: "", hidden: false, inert: false, scrollTop: 0,
                 focus: () => focused.push(selector),
+                setSelectionRange: (start: number, end: number) => { element.selectionRange = [start, end]; },
             });
             nodes.set(selector, element);
         }
@@ -154,6 +165,170 @@ test("tree root and root folder use the repository identity, retaining the check
 });
 
 const jsonResponse = (data: unknown, status = 200) => ({ ok: status < 400, status, statusText: status < 400 ? "OK" : "Error", json: async () => data });
+
+function deferred<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((done) => { resolve = done; });
+    return { promise, resolve };
+}
+
+test("loading waits for a matching snapshot and never publishes an SSE-invalidated Overview", async () => {
+    const snapshotStarted = deferred<void>();
+    const snapshot = deferred<ReturnType<typeof jsonResponse>>();
+    let reads = 0;
+    const app = await loadApp({ fetch: async (url) => {
+        if (url === "/api/state") {
+            reads++;
+            return jsonResponse({ review: reviewFixture({
+                currentRevisionId: reads === 1 ? "r1" : "r2",
+                description: { version: reads, revisionId: reads === 1 ? "r1" : "r2", body: reads === 1 ? "Older overview" : "Current overview" },
+            }) });
+        }
+        if (url === "/api/snapshot/r1") {
+            snapshotStarted.resolve();
+            return snapshot.promise;
+        }
+        if (url === "/api/snapshot/r2") return jsonResponse({ revisionId: "r2", files: [] });
+        throw new Error(`Unexpected request ${url}`);
+    } });
+    app.run("var renderedDescriptions = []; render = () => { renderedDescriptions.push(state.review.description.body); };");
+    const loading = app.run<Promise<void>>("loadState()");
+    assert.match(app.node("#review-status").innerHTML, /Loading review and Overview/);
+    await snapshotStarted.promise;
+    assert.equal(app.read("state.review"), null, "neither the tree nor Overview is published without the snapshot");
+    app.run("scheduleReload()");
+    snapshot.resolve(jsonResponse({ revisionId: "r1", files: [] }));
+    await loading;
+    assert.deepEqual(app.read("renderedDescriptions"), ["Current overview"]);
+    assert.equal(app.state.review.currentRevisionId, "r2");
+    assert.equal(app.state.snapshot?.revisionId, "r2");
+    assert.equal(app.node("#review-status").hidden, true);
+});
+
+test("a reload queued during failed state or snapshot requests is retried automatically", async () => {
+    for (const failedRequest of ["state", "snapshot/r1"]) {
+        const failure = deferred<ReturnType<typeof jsonResponse>>();
+        const requestStarted = deferred<void>();
+        let stateRequests = 0;
+        let snapshotRequests = 0;
+        const timers: Array<() => void> = [];
+        const app = await loadApp({
+            window: { setTimeout: (callback: () => void) => { timers.push(callback); return timers.length; } },
+            fetch: async (url) => {
+                if (url === "/api/state") {
+                    stateRequests++;
+                    if (failedRequest === "state" && stateRequests === 1) {
+                        requestStarted.resolve();
+                        return failure.promise;
+                    }
+                    const revision = failedRequest === "snapshot/r1" && stateRequests === 1 ? "r1" : "r2";
+                    return jsonResponse({ review: reviewFixture({
+                        currentRevisionId: revision,
+                        description: { version: revision === "r1" ? 1 : 2, revisionId: revision, body: revision === "r1" ? "Old overview" : "Recovered overview" },
+                    }) });
+                }
+                if (url === "/api/snapshot/r1") {
+                    snapshotRequests++;
+                    if (failedRequest === "snapshot/r1") {
+                        requestStarted.resolve();
+                        return failure.promise;
+                    }
+                    return jsonResponse({ revisionId: "r1", files: [] });
+                }
+                if (url === "/api/snapshot/r2") {
+                    snapshotRequests++;
+                    return jsonResponse({ revisionId: "r2", files: [] });
+                }
+                throw new Error(`Unexpected request ${url}`);
+            },
+        });
+        app.run("renderRuler = () => {}");
+        const initialLoad = app.run<Promise<void>>("loadState()");
+        await requestStarted.promise;
+        app.run("scheduleReload()");
+        failure.resolve(jsonResponse({ error: { message: `temporary ${failedRequest} failure` } }, 503));
+        await assert.rejects(initialLoad, new RegExp(`temporary ${failedRequest} failure`));
+
+        assert.equal(timers.length, 1, "the failed load schedules the change-triggered retry");
+        timers[0]?.();
+        await app.run<Promise<void>>("loading");
+        assert.equal(stateRequests, 2);
+        assert.equal(app.state.review.currentRevisionId, "r2");
+        assert.equal(app.read("state.review.description.body"), "Recovered overview");
+        assert.equal(app.node("#review-status").hidden, true);
+        if (failedRequest === "snapshot/r1") assert.equal(snapshotRequests, 2);
+    }
+});
+
+test("refresh progress and load failure preserve the current view and composer DOM until a successful retry", async () => {
+    let failed = false;
+    let refresh: { status: string; error?: string } = { status: "refreshing" };
+    const app = await loadApp({ fetch: async (url) => {
+        if (failed) throw new Error("offline <now>");
+        if (url === "/api/state") return jsonResponse({ review: reviewFixture(), refresh });
+        throw new Error(`Unexpected request ${url}`);
+    } });
+    app.state.review = reviewFixture();
+    app.state.snapshot = { revisionId: "r1", files: [] };
+    app.state.view = { type: "overview" };
+    const composer = Object.assign(Object.create(MockElement.prototype) as MockElement, {
+        tagName: "TEXTAREA", value: "Keep this draft", dataset: { composer: "overview:new" }, selectionStart: 2, selectionEnd: 6,
+    });
+    app.document.activeElement = composer;
+    app.localStorage.setItem("sr:r:draft:overview:new", "Keep this draft");
+    const focusTarget = app.node('textarea[data-composer="overview:new"]');
+    app.run("renderRuler = () => {}; globalThis.CSS = { escape: (value) => value };");
+    await app.run("loadState()");
+    assert.match(app.node("#review-status").innerHTML, /Refreshing review and Overview.*last loaded/);
+    assert.match(app.node("#main").innerHTML, /<textarea data-composer="overview:new"[^>]*>Keep this draft<\/textarea>/);
+    assert.ok(app.focused.includes('textarea[data-composer="overview:new"]'));
+    assert.deepEqual(focusTarget.selectionRange, [2, 6]);
+    failed = true;
+    await assert.rejects(app.run<Promise<void>>("loadState()"), /offline/);
+    assert.match(app.node("#review-status").innerHTML, /Could not load the current review.*offline &lt;now&gt;.*Retry/);
+    assert.equal(app.node("#review-status").hidden, false);
+    assert.equal(app.document.activeElement, composer);
+    assert.equal(app.localStorage.getItem("sr:r:draft:overview:new"), "Keep this draft");
+    assert.equal(app.state.view.type, "overview");
+    failed = false;
+    refresh = { status: "error", error: "Git capture failed" };
+    await app.run("loadState()");
+    assert.match(app.node("#review-status").innerHTML, /Git capture failed.*Retry/);
+    refresh = { status: "idle" };
+    await app.run("loadState()");
+    assert.equal(app.node("#review-status").hidden, true);
+});
+
+test("manual refresh shows progress before the server responds and reports capture failure", async () => {
+    const response = deferred<ReturnType<typeof jsonResponse>>();
+    const app = await loadApp({ fetch: async () => response.promise });
+    app.state.review = reviewFixture();
+    const refreshing = app.run<Promise<void>>("refreshReview()");
+    assert.match(app.node("#review-status").innerHTML, /Refreshing review and Overview/);
+    response.resolve(jsonResponse({ error: { message: "capture failed" } }, 500));
+    await assert.rejects(refreshing, /capture failed/);
+    assert.match(app.node("#review-status").innerHTML, /Could not refresh from the working tree.*capture failed.*Retry/);
+});
+
+test("refresh progress SSE updates the status without requesting a duplicate full state reload", async () => {
+    let requests = 0;
+    const app = await loadApp({ fetch: async () => { requests++; return jsonResponse({}); } });
+    app.state.review = reviewFixture();
+    app.run('onRefreshProgress({ data: JSON.stringify({ status: "refreshing" }) })');
+    assert.match(app.node("#review-status").innerHTML, /Refreshing review and Overview/);
+    app.run('onRefreshProgress({ data: JSON.stringify({ status: "error", error: "capture failed" }) })');
+    assert.match(app.node("#review-status").innerHTML, /Could not refresh from the working tree.*capture failed.*Retry/);
+    assert.equal(requests, 0);
+});
+
+test("missing and older descriptions are not presented as pending generation or current content", async () => {
+    const app = await loadApp();
+    app.state.review = reviewFixture();
+    assert.match(app.run("descriptionHtml()"), /No saved description\. Descriptions are not generated automatically/);
+    app.state.review = reviewFixture({ description: { version: 1, revisionId: "r0", body: "Original purpose" } });
+    assert.match(app.run("descriptionHtml()"), /Earlier diff: description has not been updated for the current revision/);
+});
+
 const clicker = (app: LoadedApp) => (action: string, dataset: Record<string, string> = {}) => {
     const target = Object.assign(new MockElement("BUTTON"), { dataset: { action, ...dataset } });
     target.closest = () => target;
