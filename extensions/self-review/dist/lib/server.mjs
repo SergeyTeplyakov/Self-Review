@@ -96,8 +96,14 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
             res.write(frame);
     };
     const onChanged = (e) => {
-        if (e.reason === "agent-review-settings" || e.reviewId === getReviewId())
+        if (e.reason === "agent-review-settings")
             broadcast("changed", e);
+        else if (e.reviewId === getReviewId()) {
+            if (e.reason === "refresh")
+                broadcast("refresh", service.refreshState(e.reviewId));
+            else
+                broadcast("changed", e);
+        }
     };
     const onSession = (e) => broadcast("session", e);
     service.on("changed", onChanged);
@@ -183,8 +189,10 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
             if (parts[0] === "state" && parts.length === 1) {
                 const initial = await service.getReview(reviewId);
                 const [pullRequest, settingsState] = await Promise.all([readPullRequest(initial), settingsHttp.read(initial.repoRoot)]);
+                // PR discovery can outlive a scope/branch change; pair it only with the review it describes.
                 const review = await service.getReview(reviewId);
-                return send(res, 200, { instanceId, review, refresh: service.refreshState(reviewId), session: { busy: delivery.busy }, pullRequest, agentReviewAvailable: Boolean(agentReview), reviewSkillsAvailable: Boolean(reviewSkills), agentReviewSuggestedModels: SUGGESTED_REVIEWERS, ...settingsState });
+                const currentPullRequest = initial.repoRoot === review.repoRoot && initial.branch === review.branch ? pullRequest : null;
+                return send(res, 200, { instanceId, review, refresh: service.refreshState(reviewId), session: { busy: delivery.busy }, pullRequest: currentPullRequest, agentReviewAvailable: Boolean(agentReview), reviewSkillsAvailable: Boolean(reviewSkills), agentReviewSuggestedModels: SUGGESTED_REVIEWERS, ...settingsState });
             }
             if (parts[0] === "review-skills" && parts.length === 1) {
                 if (!reviewSkills)

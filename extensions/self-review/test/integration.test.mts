@@ -536,22 +536,39 @@ test("state returns the latest Overview after slow PR discovery and exposes capt
     const discovery = new Promise<void>((resolve) => { discoveryStarted = resolve; });
     const server = await startReviewServer({
         instanceId: "loading-state", getReviewId: () => reviewId, service, delivery, webRoot: WEB_ROOT,
-        findPullRequest: async () => { discoveryStarted(); await discoveryGate; return null; },
+        findPullRequest: async (repoPath, branch) => {
+            assert.equal(repoPath, repo);
+            assert.equal(branch, "feature");
+            discoveryStarted();
+            await discoveryGate;
+            return { number: 42, url: "https://github.com/example/repo/pull/42" };
+        },
     });
     t.after(() => server.close());
     t.after(() => releaseDiscovery());
     const url = new URL(server.url);
-    const readState = async (): Promise<{ review: { description: { body: string } }; refresh: { status: string; error?: string } }> => {
+    const readState = async (): Promise<{
+        review: { description: { body: string }; branch?: string | null };
+        refresh: { status: string; error?: string };
+        pullRequest: { number: number; url: string } | null;
+    }> => {
         const response = await fetch(new URL(`/api/state${url.search}`, url));
         assert.equal(response.status, 200);
         return response.json();
     };
     const pending = readState();
     await discovery;
+    await store.updateReview(reviewId, (review) => {
+        assert.ok(review);
+        review.branch = "other-branch";
+        return { review };
+    });
     await service.updateDescription(reviewId, { expectedVersion: (await getReview()).description?.version ?? 0, body: "Updated during discovery" });
     releaseDiscovery();
     const latest = await pending;
     assert.equal(latest.review.description.body, "Updated during discovery");
+    assert.equal(latest.review.branch, "other-branch");
+    assert.equal(latest.pullRequest, null, "PR metadata discovered for the old branch is not paired with the newer review");
     assert.equal(latest.refresh.status, "idle");
 
     let releaseCapture = () => {};

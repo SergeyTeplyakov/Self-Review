@@ -308,8 +308,14 @@ test("an open server pushes checkout refreshes and closing the panel stops refre
     try {
         await reader.read(); // Initial hello establishes the live SSE connection.
         await writeFile(path.join(f.repo, "file.ts"), "automatically refreshed\n");
-        const event = await reader.read();
-        assert.match(new TextDecoder().decode(event.value), /event: changed/);
+        let received = "";
+        while (!received.includes("event: changed")) {
+            const event = await reader.read();
+            if (event.done) throw new Error("SSE stream closed before the refreshed review event.");
+            received += new TextDecoder().decode(event.value);
+        }
+        assert.match(received, /event: refresh\ndata: \{"status":"refreshing"\}/);
+        assert.match(received, /event: changed/);
         await until(async () => (await f.service.getReview(f.id)).currentRevisionId === "r2");
         const response = await fetch(new URL(`/api/state${url.search}`, url));
         const state = await response.json() as { review: { currentRevisionId: string } };

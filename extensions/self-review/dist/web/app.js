@@ -4,6 +4,15 @@ import { createSettingsApi } from "./settings-api.mjs";
 function isRecord(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value);
 }
+function onRefreshProgress(event) {
+    const payload = JSON.parse(event.data);
+    if (!isRefreshStatus(payload))
+        throw new Error("Invalid refresh progress event.");
+    serverRefresh = payload;
+    if (serverRefresh?.status !== "refreshing")
+        refreshError = "";
+    renderLoadStatus();
+}
 function isView(value) {
     if (!isRecord(value))
         return false;
@@ -199,11 +208,13 @@ function parseContent(value, file) {
     }
     return { status: "ready", full: buildFullFile(file, value.lines) };
 }
+function isRefreshStatus(value) {
+    return isRecord(value) && ["idle", "refreshing", "error"].includes(String(value.status))
+        && (value.status !== "error" || typeof value.error === "string");
+}
 function isStateResponse(value) {
     if (!isRecord(value) || !isReview(value.review)
-        || (value.refresh !== undefined && (!isRecord(value.refresh)
-            || !["idle", "refreshing", "error"].includes(String(value.refresh.status))
-            || (value.refresh.status === "error" && typeof value.refresh.error !== "string")))
+        || (value.refresh !== undefined && !isRefreshStatus(value.refresh))
         || (value.session !== undefined && (!isRecord(value.session)
             || (value.session.busy !== null && typeof value.session.busy !== "boolean")))
         || (value.pullRequest !== undefined && value.pullRequest !== null
@@ -717,18 +728,21 @@ let reloadAgain = false;
 let reloadPending = false;
 let refreshing = false;
 let loadError = "";
+let refreshError = "";
 let serverRefresh;
 function renderLoadStatus() {
     const status = $("#review-status");
     if (!status)
         return;
-    const pending = Boolean(loading) || reloadPending || refreshing || (!loadError && serverRefresh?.status === "refreshing");
-    const error = loadError || (serverRefresh?.status === "error" ? serverRefresh.error : "");
+    const refreshFailure = refreshError || (serverRefresh?.status === "error" ? serverRefresh.error : "");
+    const pending = Boolean(loading) || reloadPending || refreshing || (!loadError && !refreshFailure && serverRefresh?.status === "refreshing");
+    const error = loadError || refreshFailure;
+    const failureLabel = loadError ? "Could not load the current review" : "Could not refresh from the working tree";
     status.hidden = !pending && !error;
     status.className = error && !pending ? "review-status del" : "review-status muted";
     status.innerHTML = pending
         ? state.review ? "Refreshing review and Overview... Showing the last loaded data." : "Loading review and Overview..."
-        : error ? `Could not load the current review: ${esc(error)}. ${state.review ? "Showing the last loaded data. " : ""}<button data-action="refresh">Retry</button>` : "";
+        : error ? `${failureLabel}: ${esc(error)}. ${state.review ? "Showing the last loaded data. " : ""}<button data-action="refresh">Retry</button>` : "";
 }
 async function loadState() {
     clearTimeout(reloadTimer);
@@ -760,6 +774,7 @@ async function loadState() {
                 restorePinnedComposers(data.review.reviewId);
             state.snapshot = snapshot;
             serverRefresh = data.refresh;
+            refreshError = "";
             state.reviewSkillsAvailable = data.reviewSkillsAvailable === true;
             state.pullRequest = data.pullRequest ?? null;
             const settingsState = settingsApi.readState(data.settingsPayload);
@@ -799,13 +814,14 @@ function scheduleReload() {
 async function refreshReview() {
     refreshing = true;
     loadError = "";
+    refreshError = "";
     renderLoadStatus();
     try {
         await api("POST", "refresh", {});
         await loadState();
     }
     catch (error) {
-        loadError = errorMessage(error);
+        refreshError = errorMessage(error);
         throw error;
     }
     finally {
@@ -815,6 +831,7 @@ async function refreshReview() {
 }
 function connect() {
     const es = new EventSource(`/api/events?t=${encodeURIComponent(TOKEN)}`);
+    es.addEventListener("refresh", (event) => onRefreshProgress(event));
     es.addEventListener("hello", (event) => {
         state.connection = "open";
         const payload = JSON.parse(event.data);

@@ -67,7 +67,11 @@ test("refresh lifecycle reports coalesced capture progress, failure and recovery
         return snapshot;
     } } });
     const events: unknown[] = [];
-    active.on("changed", () => events.push(active.refreshState(id)));
+    const reasons: string[] = [];
+    active.on("changed", (event: { reason: string }) => {
+        events.push(active.refreshState(id));
+        reasons.push(event.reason);
+    });
     const first = active.refresh(id);
     assert.equal(active.refresh(id), first);
     assert.deepEqual(active.refreshState(id), { status: "refreshing" });
@@ -76,6 +80,7 @@ test("refresh lifecycle reports coalesced capture progress, failure and recovery
     assert.equal(captures, 2, "a request during capture queues a second pass");
     assert.deepEqual(events[0], { status: "refreshing" });
     assert.deepEqual(events.at(-1), { status: "idle" });
+    assert.deepEqual(reasons, ["refresh", "git", "git", "refresh"], "the start/end events publish lifecycle transitions around each capture");
     fail = true;
     await assert.rejects(active.refresh(id), /capture unavailable/);
     assert.deepEqual(active.refreshState(id), { status: "error", error: "capture unavailable" });

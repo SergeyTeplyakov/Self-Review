@@ -15,6 +15,8 @@ interface MockNode {
     inert?: boolean;
     scrollTop: number;
     focus: () => number | void;
+    setSelectionRange?: (start: number, end: number) => void;
+    selectionRange?: [number, number];
     tagName?: string;
     dataset?: Record<string, string>;
     closest?: (selector: string) => MockNode | null;
@@ -66,7 +68,14 @@ interface RuntimeState {
 
 type MockFetch = (url: string, options?: { method?: string; body?: string }) => Promise<unknown>;
 type CapturedPost = [string, ...unknown[]];
-type MockFocusable = { focus?: MockNode["focus"]; checked?: boolean };
+type MockFocusable = {
+    focus?: MockNode["focus"];
+    checked?: boolean;
+    tagName?: string;
+    dataset?: Record<string, string>;
+    selectionStart?: number;
+    selectionEnd?: number;
+};
 
 interface LoadedApp {
     document: {
@@ -102,9 +111,11 @@ async function loadApp(globals: Record<string, unknown> & { fetch?: MockFetch } 
     const focused: string[] = [];
     const node = (selector: string): MockNode => {
         if (!nodes.has(selector)) {
-            const element = Object.assign(new MockElement(), {
+            let element: MockNode;
+            element = Object.assign(new MockElement(), {
                 innerHTML: "", textContent: "", className: "", hidden: false, inert: false, scrollTop: 0,
                 focus: () => focused.push(selector),
+                setSelectionRange: (start: number, end: number) => { element.selectionRange = [start, end]; },
             });
             nodes.set(selector, element);
         }
@@ -204,20 +215,26 @@ test("refresh progress and load failure preserve the current view and composer D
     } });
     app.state.review = reviewFixture();
     app.state.snapshot = { revisionId: "r1", files: [] };
-    app.state.view = { type: "lessons" };
-    const composer = app.node('textarea[data-composer="overview:new"]');
+    app.state.view = { type: "overview" };
+    const composer = Object.assign(Object.create(MockElement.prototype) as MockElement, {
+        tagName: "TEXTAREA", value: "Keep this draft", dataset: { composer: "overview:new" }, selectionStart: 2, selectionEnd: 6,
+    });
     app.document.activeElement = composer;
     app.localStorage.setItem("sr:r:draft:overview:new", "Keep this draft");
-    app.run("render = () => {}");
+    const focusTarget = app.node('textarea[data-composer="overview:new"]');
+    app.run("renderRuler = () => {}; globalThis.CSS = { escape: (value) => value };");
     await app.run("loadState()");
     assert.match(app.node("#review-status").innerHTML, /Refreshing review and Overview.*last loaded/);
+    assert.match(app.node("#main").innerHTML, /<textarea data-composer="overview:new"[^>]*>Keep this draft<\/textarea>/);
+    assert.ok(app.focused.includes('textarea[data-composer="overview:new"]'));
+    assert.deepEqual(focusTarget.selectionRange, [2, 6]);
     failed = true;
     await assert.rejects(app.run<Promise<void>>("loadState()"), /offline/);
-    assert.match(app.node("#review-status").innerHTML, /Could not load.*offline &lt;now&gt;.*Retry/);
+    assert.match(app.node("#review-status").innerHTML, /Could not load the current review.*offline &lt;now&gt;.*Retry/);
     assert.equal(app.node("#review-status").hidden, false);
     assert.equal(app.document.activeElement, composer);
     assert.equal(app.localStorage.getItem("sr:r:draft:overview:new"), "Keep this draft");
-    assert.equal(app.state.view.type, "lessons");
+    assert.equal(app.state.view.type, "overview");
     failed = false;
     refresh = { status: "error", error: "Git capture failed" };
     await app.run("loadState()");
@@ -235,7 +252,18 @@ test("manual refresh shows progress before the server responds and reports captu
     assert.match(app.node("#review-status").innerHTML, /Refreshing review and Overview/);
     response.resolve(jsonResponse({ error: { message: "capture failed" } }, 500));
     await assert.rejects(refreshing, /capture failed/);
-    assert.match(app.node("#review-status").innerHTML, /Could not load.*capture failed.*Retry/);
+    assert.match(app.node("#review-status").innerHTML, /Could not refresh from the working tree.*capture failed.*Retry/);
+});
+
+test("refresh progress SSE updates the status without requesting a duplicate full state reload", async () => {
+    let requests = 0;
+    const app = await loadApp({ fetch: async () => { requests++; return jsonResponse({}); } });
+    app.state.review = reviewFixture();
+    app.run('onRefreshProgress({ data: JSON.stringify({ status: "refreshing" }) })');
+    assert.match(app.node("#review-status").innerHTML, /Refreshing review and Overview/);
+    app.run('onRefreshProgress({ data: JSON.stringify({ status: "error", error: "capture failed" }) })');
+    assert.match(app.node("#review-status").innerHTML, /Could not refresh from the working tree.*capture failed.*Retry/);
+    assert.equal(requests, 0);
 });
 
 test("missing and older descriptions are not presented as pending generation or current content", async () => {
