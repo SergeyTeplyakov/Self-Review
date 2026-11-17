@@ -14,6 +14,7 @@ interface MockNode {
     hidden: boolean;
     inert?: boolean;
     scrollTop: number;
+    insertAdjacentHTML?: (position: InsertPosition, html: string) => void;
     focus: () => number | void;
     setSelectionRange?: (start: number, end: number) => void;
     selectionRange?: [number, number];
@@ -114,6 +115,7 @@ async function loadApp(globals: Record<string, unknown> & { fetch?: MockFetch } 
             let element: MockNode;
             element = Object.assign(new MockElement(), {
                 innerHTML: "", textContent: "", className: "", hidden: false, inert: false, scrollTop: 0,
+                insertAdjacentHTML: (_position: InsertPosition, html: string) => { element.innerHTML = html + element.innerHTML; },
                 focus: () => focused.push(selector),
                 setSelectionRange: (start: number, end: number) => { element.selectionRange = [start, end]; },
             });
@@ -407,6 +409,56 @@ test("hiding default-collapsed threads does not override the active, current def
         thread.status = "active";
         thread.location.state = "current";
         assert.match(html(), /aria-expanded="true">Hide/, `${status}/${locationState} becomes active and current`);
+    }
+});
+
+test("an outdated thread keeps its unfinished reply visible and labels it if manually collapsed", async () => {
+    const thread = {
+        threadId: "t1", kind: "line", status: "active",
+        location: { path: "src/a.cs", side: "new", startLine: 10, endLine: 10, state: "current" },
+        messages: [{ messageId: "m1", author: "user", body: "A comment", createdAt: "2026-01-01T00:00:00Z" }],
+    };
+    const app = await loadApp();
+    app.state.review = reviewFixture({ threads: [thread] });
+    app.state.snapshot = { revisionId: "r1", files: [] };
+    app.run('setDraft("reply:t1", "Unfinished reply")');
+    thread.location.state = "outdated";
+    const html = () => app.run<string>("threadHtml(state.review.threads[0])");
+
+    assert.match(html(), /aria-expanded="true">Hide/);
+    assert.match(html(), /Unfinished reply<\/textarea>/);
+    await clicker(app)("toggle", { thread: "t1" });
+    assert.match(html(), /Unposted reply/);
+    assert.match(html(), /aria-expanded="false">Show/);
+    await clicker(app)("toggle", { thread: "t1" });
+    assert.match(html(), /aria-expanded="true">Hide/);
+});
+
+test("an unposted reply can be recovered when its thread is outside the current view", async () => {
+    const app = await loadApp();
+    app.state.review = reviewFixture({ threads: [{
+        threadId: "t1", kind: "line", status: "active",
+        location: { path: "src/a.cs", side: "new", startLine: 10, endLine: 10, state: "outdated" },
+        messages: [{ messageId: "m1", author: "user", body: "A comment", createdAt: "2026-01-01T00:00:00Z" }],
+    }] });
+    app.state.snapshot = { revisionId: "r2", files: [] };
+    app.run('setDraft("reply:t1", "Unfinished reply"); renderMain = () => { $("#main").innerHTML = "Other files remain"; }; renderRuler = () => {}; render();');
+    assert.match(app.node("#main").innerHTML, /data-action="jump" data-thread="t1"[^>]*>Resume reply/);
+    app.document.querySelectorAll = (selector) => selector === "#main [data-thread-id]" ? [{ dataset: { threadId: "t1" } }] : [];
+    app.run("render()");
+    assert.doesNotMatch(app.node("#main").innerHTML, /Resume reply/);
+});
+
+test("composer rerenders preserve leading newlines in both new comments and replies", async () => {
+    const app = await loadApp();
+    app.state.review = reviewFixture();
+    for (const [key, options] of [
+        ["file:file.ts", '{ kind: "file", path: "file.ts" }'], ["reply:t1", "{}"],
+    ]) {
+        app.run(`setDraft(${JSON.stringify(key)}, "\\n\\nDraft & <text>")`);
+        const html = app.run<string>(`composerHtml(${JSON.stringify(key)}, ${options})`);
+        // The HTML parser removes exactly one leading LF in a textarea.
+        assert.match(html, /<textarea[^>]*>\n\n\nDraft &amp; &lt;text&gt;<\/textarea>/);
     }
 });
 

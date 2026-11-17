@@ -1300,10 +1300,11 @@ function render() {
     renderBanner();
     renderSide();
     renderMain();
-    if (pinnedComposers.size) {
-        main.innerHTML = [...pinnedComposers].map(([key, options]) =>
+    const outsideReplies = outsideDraftRepliesHtml();
+    if (pinnedComposers.size || outsideReplies) {
+        main.insertAdjacentHTML("afterbegin", outsideReplies + [...pinnedComposers].map(([key, options]) =>
             `<div class="thread"><div class="muted">Diff changed. This comment keeps its original location in ${esc(options.revisionId)}.</div>${composerHtml(key, options)}</div>`,
-        ).join("") + main.innerHTML;
+        ).join(""));
     }
     main.scrollTop = scroll;
     renderRuler();
@@ -2003,6 +2004,8 @@ function composerHtml(key: string, {
     label, placeholder, kind, path, side, startLine, endLine, alwaysOpen, revisionId,
 }: ComposerOptions): string {
     const draft = getDraft(key);
+    // The HTML parser strips the first newline immediately after a textarea's opening tag.
+    const draftHtml = (draft.startsWith("\n") ? "\n" : "") + esc(draft);
     const p = state.pending.get(key);
     const open = alwaysOpen || state.open.has(key) || Boolean(draft) || Boolean(p);
     if (open && (kind === "line" || kind === "change" || kind === "file") && !pinnedComposers.has(key)) {
@@ -2025,7 +2028,7 @@ function composerHtml(key: string, {
         : `<button class="primary" data-action="submit" data-key="${k}" ${p?.sending ? "disabled" : ""}>${p?.sending ? "Sending…" : "Comment"}</button>`;
     return `<div class="composer${open ? " open" : ""}" ${data}>`
         + (label ? `<div class="label">${esc(label)}</div>` : "")
-        + `<textarea data-composer="${k}" placeholder="${esc(placeholder ?? "Write a comment…")}" ${p?.sending ? "disabled" : ""}>${esc(draft)}</textarea>`
+        + `<textarea data-composer="${k}" placeholder="${esc(placeholder ?? "Write a comment…")}" ${p?.sending ? "disabled" : ""}>${draftHtml}</textarea>`
         + (p?.error ? `<div class="err">${esc(p.error)}</div>` : "")
         + `<div class="bar"><span class="hint">Markdown · Ctrl+Enter to ${batching ? "add to review" : "send"} · Esc to close</span>`
         + `<button data-action="cancel" data-key="${k}">Cancel</button>`
@@ -2092,11 +2095,27 @@ function findingEvidenceHtml(finding: FindingReport | null | undefined): string 
         + `</dl></details>`;
 }
 
+const replyKey = (threadId: string) => `reply:${threadId}`;
+const hasDraftReply = (threadId: string) => Boolean(getDraft(replyKey(threadId)));
+const threadDefaultsCollapsed = (t: ReviewThread) =>
+    (t.status !== "active" || t.location?.state === "outdated") && !hasDraftReply(t.threadId);
+const threadCollapsed = (t: ReviewThread) =>
+    state.collapsedThreads.has(t.threadId) || (threadDefaultsCollapsed(t) && !state.expanded.has(t.threadId));
+
+function outsideDraftRepliesHtml(): string {
+    const drafts = state.review?.threads.filter((t) => hasDraftReply(t.threadId));
+    if (!drafts?.length) return "";
+    const visible = new Set(Array.from(document.querySelectorAll<HTMLElement>("#main [data-thread-id]"), (el) => el.dataset.threadId));
+    const links = drafts.filter((t) => !visible.has(t.threadId)).map((t) =>
+        `<div><button class="link" data-action="jump" data-thread="${esc(t.threadId)}">Resume reply</button> · ${esc(locLabel(t))}</div>`,
+    );
+    return links.length ? `<div class="card"><strong>Unposted replies outside this view</strong>${links.join("")}</div>` : "";
+}
+
 function threadHtml(t: ReviewThread, { showLocation = false }: { showLocation?: boolean } = {}): string {
     const loc: Partial<ThreadLocation> = t.location ?? {};
     const outdated = loc.state === "outdated";
-    const defaultCollapsed = t.status !== "active" || outdated;
-    const collapsed = state.collapsedThreads.has(t.threadId) || (defaultCollapsed && !state.expanded.has(t.threadId));
+    const collapsed = threadCollapsed(t);
     const pending = t.messages.filter((m) => m.delivery && m.delivery.state !== "replied");
     const notInDiff = !outdated && !isPlaced(t);
     const anchor = t.anchor;
@@ -2114,12 +2133,13 @@ function threadHtml(t: ReviewThread, { showLocation = false }: { showLocation?: 
         + (t.status !== "active" ? `<span class="badge st-${t.status}">${t.status === "wontfix" ? "won't fix" : t.status}</span>` : "")
         + `<select data-action="status" data-thread="${esc(t.threadId)}" title="Thread status">${options}</select>`
         + (collapsed ? pending.map(deliveryHtml).join("") : "")
+        + (collapsed && hasDraftReply(t.threadId) ? `<span class="badge">Unposted reply</span>` : "")
         + `<button class="link" data-action="toggle" data-thread="${esc(t.threadId)}" aria-expanded="${!collapsed}">${collapsed ? "Show" : "Hide"}</button>`
         + `</div>`;
     const original = outdated && t.anchor?.selectedLines?.length
         ? `<div class="original muted">Originally commented code (${esc(t.anchor.revisionId)}, ${esc(lineLabel(t.anchor))}):<pre>${esc(t.anchor.selectedLines.join("\n"))}</pre></div>`
         : "";
-    const reply = composerHtml(`reply:${t.threadId}`, { placeholder: "Reply…" });
+    const reply = composerHtml(replyKey(t.threadId), { placeholder: "Reply…" });
     const staleFinding = t.agentReview && t.agentReview.revisionId !== state.review?.currentRevisionId;
     const approvalIssue = t.agentReview ? findingApprovalIssue(t.agentReview) : "";
     const actions = t.agentReview
@@ -2622,15 +2642,12 @@ async function onClick(e: MouseEvent): Promise<void> {
                 const id = value("thread");
                 const thread = state.review?.threads.find((t) => t.threadId === id);
                 if (!thread) break;
-                const outdated = thread.location?.state === "outdated";
-                const defaultCollapsed = thread.status !== "active" || outdated;
-                const collapsed = state.collapsedThreads.has(id) || (defaultCollapsed && !state.expanded.has(id));
-                if (collapsed) {
+                if (threadCollapsed(thread)) {
                     state.collapsedThreads.delete(id);
                     state.expanded.add(id);
                 } else {
                     state.expanded.delete(id);
-                    if (!defaultCollapsed) state.collapsedThreads.add(id);
+                    if (!threadDefaultsCollapsed(thread)) state.collapsedThreads.add(id);
                 }
                 render();
                 break;
