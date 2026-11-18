@@ -636,8 +636,8 @@ export class AgentReview {
                         model, benefit: run.results.find((item) => item.model === model)!.ponytail!.benefits[index],
                     }));
                     const preview = (value: string) => value.length > 120 ? `${value.slice(0, 120)}...` : value;
-                    ponytailLines.push(...contributions.map(({ model, benefit }) =>
-                        `${model}: ${preview(benefit.proposal)}\n\nBenefit: ${preview(benefit.benefit)}\n\nSource: ${preview(benefit.evidence.source)}\n\nBaseline: ${preview(benefit.evidence.baseline)}\n\nValidation: ${preview(benefit.evidence.validation)}`));
+                    const representative = contributions[0].benefit;
+                    ponytailLines.push(`Opportunity: ${preview(representative.proposal)}\n\nBenefit: ${preview(representative.benefit)}\n\nContributors: ${contributions.map(({ model }) => model).join(", ")}`);
                     continue;
                 }
                 const candidates = group.sources.map(({ model, index }) => run.results.find((item) => item.model === model)!.candidates![index]);
@@ -660,7 +660,7 @@ export class AgentReview {
             }
             if (ponytailLines.length) {
                 const body = ["### Ponytail: agreed simplification opportunities",
-                    "These are proposals, not implemented changes or measured savings.", ...ponytailLines].join("\n\n");
+                    "These are proposals, not implemented changes or measured savings. Each reviewer's original wording and evidence are in the run details.", ...ponytailLines].join("\n\n");
                 const { thread } = await this.service.buildThread(review, {
                     kind: "overview", body, author: "agent", revisionId: run.revisionId,
                 });

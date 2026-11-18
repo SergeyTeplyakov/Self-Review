@@ -188,12 +188,17 @@ test("per-review skill overrides do not change defaults and Ponytail creates one
     const ponytail = { status: "used", summary: "Applied the bundled ponytail-review text; inspected both sides. No tests run.", benefits: [
         { proposal: "Reuse the existing formatter.", benefit: "Avoid maintaining two equivalent formatting paths.", evidence: finding.evidence },
     ] };
+    const secondPonytail = { ...ponytail, benefits: [{
+        proposal: "Replace the duplicate formatter with the shared helper.",
+        benefit: "Keep one formatting implementation.",
+        evidence: { source: "Second model's source", baseline: "Second model's baseline", validation: "Second model's validation" },
+    }] };
     const report = { runId: run.runId, model: models[0], findings: [], summary };
     await assert.rejects(f.agent.report("review", report), /Requested Ponytail needs/);
     await assert.rejects(f.agent.report("review", { ...report, ponytail: { ...ponytail, status: "unavailable" } }), /unavailable must have none/);
     await f.agent.report("review", { ...report, ponytail });
     assert.equal((await f.service.getReview("review")).threads.length, 0, "wait for all reviewers before the consolidated note");
-    await f.agent.report("review", { ...report, model: models[1], ponytail });
+    await f.agent.report("review", { ...report, model: models[1], ponytail: secondPonytail });
     await finalizeAll(f.agent, "review", run.runId, [{
         kind: "ponytail", sources: models.map((model) => ({ model, index: 0 })), votes: agreed(models),
     }]);
@@ -207,9 +212,37 @@ test("per-review skill overrides do not change defaults and Ponytail creates one
     assert.match(first(thread.messages).body, /Avoid maintaining two equivalent/);
     assert.match(first(thread.messages).body, /gpt-review-test/);
     assert.match(first(thread.messages).body, /mai-review-test/);
+    assert.equal((first(thread.messages).body.match(/Opportunity:/g) ?? []).length, 1, "one agreed group yields one opportunity");
+    assert.equal((first(thread.messages).body.match(/Reuse the existing formatter\./g) ?? []).length, 1);
+    assert.equal((first(thread.messages).body.match(/Benefit:/g) ?? []).length, 1);
+    assert.doesNotMatch(first(thread.messages).body, /Replace the duplicate formatter/, "alternate wording belongs in run details");
+    const savedResults = first(required(review.agentReviews)).results;
+    assert.deepEqual(savedResults[0]?.ponytail?.benefits, ponytail.benefits);
+    assert.deepEqual(savedResults[1]?.ponytail?.benefits, secondPonytail.benefits);
     await assert.rejects(f.agent.approve("review", thread.threadId, "r1"), /Only agent review findings/);
-    await f.agent.report("review", { ...report, model: models[1], ponytail });
+    await f.agent.report("review", { ...report, model: models[1], ponytail: secondPonytail });
     assert.equal((await f.service.getReview("review")).threads.length, 1, "report retries do not duplicate the note");
+});
+
+test("distinct agreed Ponytail groups remain separate opportunities in the overview", async (t) => {
+    const f = await fixture(t);
+    setReviewSkills(f.agent, new ReviewSkills({ store: f.store }));
+    const run = await f.agent.start("review", { ...input, skillNames: ["ponytail-review"] }, "c");
+    const benefits = [
+        { proposal: "Reuse the formatter.", benefit: "Avoid duplicate formatting.", evidence: finding.evidence },
+        { proposal: "Remove the redundant conversion.", benefit: "Avoid unnecessary work.", evidence: finding.evidence },
+    ];
+    for (const model of models) {
+        await f.agent.report("review", { runId: run.runId, model, findings: [], summary,
+            ponytail: { status: "used", summary: "Inspected the diff.", benefits } });
+    }
+    await finalizeAll(f.agent, "review", run.runId, benefits.map((_, index) => ({
+        kind: "ponytail", sources: models.map((model) => ({ model, index })), votes: agreed(models),
+    })));
+    const body = first(first((await f.service.getReview("review")).threads).messages).body;
+    assert.equal((body.match(/Opportunity:/g) ?? []).length, 2);
+    assert.equal((body.match(/Reuse the formatter\./g) ?? []).length, 1);
+    assert.equal((body.match(/Remove the redundant conversion\./g) ?? []).length, 1);
 });
 
 test("Ponytail absence and failure are visible without fabricating a top-level benefits comment", async (t) => {

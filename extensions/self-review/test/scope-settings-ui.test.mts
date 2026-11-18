@@ -979,6 +979,33 @@ test("agent review results distinguish findings, assessments, limits, and missin
     assert.doesNotMatch(html, /<bad-model>|<failed>|<coverage>|<goal>/);
 });
 
+test("Ponytail run details retain each contributing model's wording and evidence", async () => {
+    const app = await loadApp();
+    const models = ["model-a", "model-b"];
+    app.state.review = reviewFixture({
+        agentReviews: [{
+            runId: "ar-one", state: "completed", focus: "both", revisionId: "r1", protocol: "consensus-v1", models,
+            results: models.map((model, index) => ({
+                model, state: "completed", threadIds: [], summary: "Inspected the diff.",
+                ponytail: { status: "used", summary: "Checked opportunities.", benefits: [{
+                    proposal: `Proposal ${index}`, benefit: `Benefit ${index}`,
+                    evidence: { source: `Source ${index}`, baseline: `Baseline ${index}`, validation: `Validation ${index}` },
+                }] },
+            })),
+            consensus: [{
+                kind: "ponytail", sources: models.map((model) => ({ model, index: 0 })),
+                votes: models.map((model) => ({ model, decision: "agree", discussion: "Discussed.", rationale: "Supported." })),
+            }],
+        }],
+    });
+    const html = app.run("agentReviewsHtml()");
+    for (const index of [0, 1]) {
+        for (const field of ["Proposal", "Benefit", "Source", "Baseline", "Validation"]) {
+            assert.match(html, new RegExp(`${field} ${index}`));
+        }
+    }
+});
+
 test("agreed finding exposes all reviewer evidence and votes without treating them as HTML", async () => {
     const app = await loadApp();
     const html = app.run<(finding: unknown) => string>("findingEvidenceHtml")({
