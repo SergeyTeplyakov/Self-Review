@@ -1757,17 +1757,27 @@ function agentReviewsHtml(): string {
                     outcome += `<details><summary>Coverage and verification</summary><p class="review-summary">${esc(result.summary ?? "No coverage or verification summary recorded.")}</p></details>`;
                     if (result.ponytail) {
                         const report = result.ponytail;
-                        const benefits = r.protocol === "consensus-v1" ? report.benefits.filter((_, index) =>
-                            r.consensus?.some((group) => group.kind === "ponytail"
-                                && group.sources.some((source) => source.model === model && source.index === index)
-                                && group.votes.every((vote) => vote.decision === "agree"))) : report.benefits;
+                        const groupFor = (index: number) => r.consensus?.find((group) => group.kind === "ponytail"
+                            && group.sources.some((source) => source.model === model && source.index === index));
+                        const isAgreed = (index: number) => {
+                            const group = groupFor(index);
+                            return !!group && group.votes.length === r.models.length && group.votes.every((vote) => vote.decision === "agree");
+                        };
+                        const agreedCount = r.protocol === "consensus-v1"
+                            ? report.benefits.filter((_, index) => isAgreed(index)).length : report.benefits.length;
                         const ponytailStatus = report.status !== "used" ? "unavailable / not loaded"
                             : r.protocol === "consensus-v1" && active(r) ? "awaiting consensus"
-                                : benefits.length ? `${benefits.length} ${r.protocol === "consensus-v1" ? "agreed" : "supported"} opportunities`
+                                : agreedCount ? `${agreedCount} ${r.protocol === "consensus-v1" ? "agreed" : "supported"} opportunities`
                                     : r.protocol === "consensus-v1" ? "no agreed opportunities" : "no supported benefits";
                         outcome += `<details><summary>Ponytail: ${ponytailStatus}</summary>`
                             + `<p class="review-summary">${esc(report.summary)}</p>`
-                            + benefits.map((entry) => `<div class="review-summary"><strong>${esc(entry.proposal)}</strong><p>${esc(entry.benefit)}</p><p>Source: ${esc(entry.evidence.source)}<br>Baseline: ${esc(entry.evidence.baseline)}<br>Validation/limits: ${esc(entry.evidence.validation)}</p></div>`).join("")
+                            + report.benefits.map((entry, index) => {
+                                const status = r.protocol !== "consensus-v1" ? ""
+                                    : isAgreed(index) ? "Agreed"
+                                        : groupFor(index) ? "Not agreed (not published)"
+                                            : active(r) ? "Awaiting consensus (not published)" : "Not finalized (not published)";
+                                return `<div class="review-summary"><strong>${esc(entry.proposal)}</strong>${status ? ` <span class="muted">${esc(status)}</span>` : ""}<p>${esc(entry.benefit)}</p><p>Source: ${esc(entry.evidence.source)}<br>Baseline: ${esc(entry.evidence.baseline)}<br>Validation/limits: ${esc(entry.evidence.validation)}</p></div>`;
+                            }).join("")
                             + (r.consensus?.filter((group) => group.kind === "ponytail"
                                 && group.sources.some((source) => source.model === model)
                                 && group.votes.every((vote) => vote.decision === "agree")).map((group) =>

@@ -1006,6 +1006,45 @@ test("Ponytail run details retain each contributing model's wording and evidence
     }
 });
 
+test("Ponytail run details label and retain agreed, disputed, pending, and incomplete evidence", async () => {
+    const app = await loadApp();
+    const benefit = (label: string) => ({
+        proposal: `${label} proposal`, benefit: `${label} benefit`,
+        evidence: { source: `${label} source`, baseline: `${label} baseline`, validation: `${label} validation` },
+    });
+    const result = (benefits: ReturnType<typeof benefit>[]) => ({
+        model: "model-a", state: "completed", threadIds: [], summary: "Inspected.",
+        ponytail: { status: "used", summary: "Checked opportunities.", benefits },
+    });
+    const votes = (decision: string) => [
+        { model: "model-a", decision: "agree", discussion: "Discussed.", rationale: "Supported." },
+        { model: "model-b", decision, discussion: "Discussed.", rationale: "Reviewed." },
+    ];
+    app.state.review = reviewFixture({ agentReviews: [
+        { runId: "completed", state: "completed", focus: "both", revisionId: "r1", protocol: "consensus-v1",
+            models: ["model-a", "model-b"], results: [result([benefit("Agreed"), benefit("Disputed")])],
+            consensus: [
+                { kind: "ponytail", sources: [{ model: "model-a", index: 0 }], votes: votes("agree") },
+                { kind: "ponytail", sources: [{ model: "model-a", index: 1 }], votes: votes("disagree") },
+            ] },
+        { runId: "running", state: "running", focus: "both", revisionId: "r1", protocol: "consensus-v1",
+            models: ["model-a"], results: [result([benefit("Pending")])] },
+        { runId: "partial", state: "partial", focus: "both", revisionId: "r1", protocol: "consensus-v1",
+            models: ["model-a"], results: [result([benefit("Incomplete")])] },
+    ] });
+    const html = app.run("agentReviewsHtml()");
+    assert.match(html, /Ponytail: 1 agreed opportunities/);
+    for (const [label, status] of [["Agreed", "Agreed"], ["Disputed", "Not agreed (not published)"], ["Pending", "Awaiting consensus (not published)"], ["Incomplete", "Not finalized (not published)"]]) {
+        const start = html.indexOf(`${label} proposal`);
+        assert.notEqual(start, -1, `${label} proposal is visible`);
+        const entry = html.slice(start, html.indexOf("</div>", start));
+        assert.match(entry, new RegExp(`${label} source`));
+        assert.match(entry, new RegExp(`${label} baseline`));
+        assert.match(entry, new RegExp(`${label} validation`));
+        assert.ok(entry.includes(status), `${label} is labeled ${status}`);
+    }
+});
+
 test("agreed finding exposes all reviewer evidence and votes without treating them as HTML", async () => {
     const app = await loadApp();
     const html = app.run<(finding: unknown) => string>("findingEvidenceHtml")({
