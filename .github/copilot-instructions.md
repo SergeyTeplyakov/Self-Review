@@ -10,10 +10,10 @@ base.
 
 # Language
 
-Use TypeScript for all handwritten implementation code, including the Node
-provider, browser renderer, development scripts, screenshot tooling, and tests.
-Include new code in the appropriate strict TypeScript project; do not substitute
-declaration shims, unchecked JavaScript, or blanket type-check suppressions.
+Use TypeScript instead of handwritten JavaScript. Other tools and languages are
+allowed where appropriate. Include new TypeScript code in the appropriate strict
+TypeScript project; do not substitute declaration shims, unchecked JavaScript,
+or blanket type-check suppressions.
 
 JavaScript is allowed only as generated distribution/build output, an unavoidable
 platform discovery/bootstrap entry point (keep it minimal), or an unmodified
