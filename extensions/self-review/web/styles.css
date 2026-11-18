@@ -500,6 +500,11 @@ pre {
 .composer .bar { display: none; align-items: center; gap: 8px; margin-top: 6px; }
 .composer.open .bar { display: flex; }
 .composer .bar .hint { flex: 1; color: var(--mr-muted); font-size: 0.85em; }
+.composer .dictation-status { color: var(--mr-muted); font-size: 0.88em; }
+.composer:not(.open) .dictation-status { display: none; }
+.composer .dictation-status:not(:empty) { margin-top: 4px; }
+.composer .dictation-status + .bar { flex-wrap: wrap; }
+.composer button[data-action="dictate"] { white-space: nowrap; }
 .composer .err { color: var(--mr-red); font-size: 0.88em; margin-top: 4px; }
 .composer .label { font-size: 0.88em; color: var(--mr-muted); margin-bottom: 4px; }
 

@@ -725,6 +725,8 @@ async function api(method, path, body) {
 }
 // A scope switch points this page at a different review; nothing derived from the previous one may carry over.
 function resetForReview() {
+    abortDictation();
+    dictationNotice = null;
     persistPinnedComposers();
     pinnedComposers.clear();
     composerContexts.clear();
@@ -1095,6 +1097,8 @@ const STATUS_LETTER = { modified: "M", added: "A", deleted: "D", renamed: "R" };
 function render() {
     const active = document.activeElement;
     const focusKey = active instanceof HTMLTextAreaElement ? active.dataset.composer : undefined;
+    const dictationAction = active instanceof HTMLButtonElement ? active.dataset.action : undefined;
+    const dictationFocusKey = active instanceof HTMLButtonElement && (dictationAction === "dictate" || dictationAction === "install-dictation-model") ? active.dataset.key : undefined;
     const selStart = active instanceof HTMLTextAreaElement ? active.selectionStart : null;
     const selEnd = active instanceof HTMLTextAreaElement ? active.selectionEnd : null;
     const main = $("#main");
@@ -1112,6 +1116,8 @@ function render() {
     }
     main.scrollTop = scroll;
     renderRuler();
+    if (dictation && !composerBox(dictation.key))
+        abortDictation();
     if (focusKey) {
         const el = document.querySelector(`textarea[data-composer="${CSS.escape(focusKey)}"]`);
         if (el) {
@@ -1119,6 +1125,13 @@ function render() {
             if (selStart != null)
                 el.setSelectionRange(selStart, selEnd);
         }
+    }
+    else if (dictationFocusKey) {
+        const box = composerBox(dictationFocusKey);
+        box?.classList.add("open");
+        const button = box?.querySelector(`[data-action="${dictationAction}"]:not([hidden])`)
+            ?? box?.querySelector('[data-action="dictate"]');
+        button?.focus({ preventScroll: true });
     }
 }
 function scopeToggleHtml(scope) {
@@ -1635,6 +1648,7 @@ function trapTab(e) {
 async function switchScope(scope) {
     if (state.switching || scope === scopeOf(state.review))
         return;
+    abortDictation();
     state.switching = true;
     renderTop();
     try {
@@ -1800,6 +1814,8 @@ function pinComposers() {
     const pin = (key, options) => {
         if (pinnedComposers.has(key))
             return null;
+        if (dictation?.key === key)
+            abortDictation();
         const draft = getDraft(key);
         const pending = state.pending.get(key);
         state.open.delete(key);
@@ -1845,7 +1861,7 @@ function composerHtml(key, { label, placeholder, kind, path, side, startLine, en
     // The HTML parser strips the first newline immediately after a textarea's opening tag.
     const draftHtml = (draft.startsWith("\n") ? "\n" : "") + esc(draft);
     const p = state.pending.get(key);
-    const open = alwaysOpen || state.open.has(key) || Boolean(draft) || Boolean(p);
+    const open = alwaysOpen || state.open.has(key) || Boolean(draft) || Boolean(p) || dictation?.key === key;
     if (open && (kind === "line" || kind === "change" || kind === "file") && !pinnedComposers.has(key)) {
         composerContexts.set(key, { label, placeholder, kind, path, side, startLine, endLine, alwaysOpen: true, revisionId: revisionId ?? state.review?.currentRevisionId ?? undefined });
     }
@@ -1859,6 +1875,7 @@ function composerHtml(key, { label, placeholder, kind, path, side, startLine, en
         endLine ? `data-end="${endLine}"` : "",
     ].join(" ");
     const k = esc(key);
+    const canDictate = Boolean(speechRecognition());
     const batching = deliveryMode() !== "immediate";
     const buttons = batching
         ? `<button data-action="submit" data-key="${k}" data-draft="0" title="Send this comment to Copilot right away"${p?.sending ? " disabled" : ""}>Send now</button>`
@@ -1868,7 +1885,10 @@ function composerHtml(key, { label, placeholder, kind, path, side, startLine, en
         + (label ? `<div class="label">${esc(label)}</div>` : "")
         + `<textarea data-composer="${k}" placeholder="${esc(placeholder ?? "Write a comment…")}" ${p?.sending ? "disabled" : ""}>${draftHtml}</textarea>`
         + (p?.error ? `<div class="err">${esc(p.error)}</div>` : "")
+        + `<div class="dictation-status" role="status" data-dictation-status>${esc(canDictate ? dictationStatus(key) : "On-device dictation is unavailable in this host.")}</div>`
         + `<div class="bar"><span class="hint">Markdown · Ctrl+Enter to ${batching ? "add to review" : "send"} · Esc to close</span>`
+        + (canDictate ? `<button type="button" data-action="dictate" data-key="${k}"${p?.sending ? " disabled" : ""} aria-disabled="${dictation?.key === key && dictation.phase === "stopping"}">${dictationLabel(key)}</button>` : "")
+        + (canDictate ? `<button type="button" data-action="install-dictation-model" data-key="${k}"${dictationNotice?.key === key && dictationNotice.setupLang ? "" : " hidden"}>Set up language pack</button>` : "")
         + `<button data-action="cancel" data-key="${k}">Cancel</button>`
         + `${buttons}</div>`
         + `</div>`;
@@ -2184,7 +2204,216 @@ function folderView(dir) {
     }
     return html.join("");
 }
-// ---------- Actions ----------
+function speechRecognition() {
+    const host = globalThis;
+    return [host.SpeechRecognition, host.webkitSpeechRecognition].find((Recognition) => typeof Recognition === "function" && typeof Recognition.available === "function"
+        && "processLocally" in Recognition.prototype);
+}
+let dictation = null;
+let dictationNotice = null;
+let speechPackInstalling = false;
+function composerBox(key) {
+    return document.querySelector(`.composer[data-key="${CSS.escape(key)}"]`);
+}
+function dictationLabel(key) {
+    if (dictation?.key !== key)
+        return "Dictate";
+    return dictation.phase === "checking" ? "Cancel dictation" : "Stop dictation";
+}
+function dictationStatus(key) {
+    if (dictation?.key === key) {
+        if (dictation.phase === "checking")
+            return "Checking on-device dictation…";
+        if (dictation.phase === "starting")
+            return "Starting dictation…";
+        if (dictation.phase === "stopping")
+            return "Finishing dictation…";
+        return "Listening on this device…";
+    }
+    return dictationNotice?.key === key ? dictationNotice.text : "";
+}
+function paintDictation(key) {
+    const box = composerBox(key);
+    const button = box?.querySelector('[data-action="dictate"]');
+    const setup = box?.querySelector('[data-action="install-dictation-model"]');
+    const status = box?.querySelector("[data-dictation-status]");
+    if (button) {
+        button.textContent = dictationLabel(key);
+        button.setAttribute("aria-disabled", String(dictation?.key === key && dictation.phase === "stopping"));
+    }
+    if (setup) {
+        setup.hidden = dictationNotice?.key !== key || !dictationNotice.setupLang;
+        if (setup.hidden && document.activeElement === setup)
+            button?.focus({ preventScroll: true });
+    }
+    if (status)
+        status.textContent = dictationStatus(key);
+}
+function abortDictation() {
+    const current = dictation;
+    if (!current)
+        return;
+    dictation = null;
+    if (current.phase !== "checking")
+        current.recognition.abort();
+    paintDictation(current.key);
+}
+function dictationError(code) {
+    switch (code) {
+        case "not-allowed":
+            return "Dictation was blocked by the browser or microphone permissions. You can still type.";
+        case "service-not-allowed":
+        case "language-not-supported":
+            return "The browser cannot use an on-device speech model for this language. You can still type.";
+        case "audio-capture": return "No microphone is available. You can still type.";
+        case "no-speech": return "No speech was detected. Try again or keep typing.";
+        default: return "On-device dictation could not continue. You can still type.";
+    }
+}
+async function installDictationModel(key) {
+    const Recognition = speechRecognition();
+    const lang = dictationNotice?.key === key ? dictationNotice.setupLang : undefined;
+    if (!Recognition?.install || !lang || speechPackInstalling || state.pending.get(key)?.sending)
+        return;
+    const pending = { key, text: `Setting up the on-device speech model for ${lang}…` };
+    dictationNotice = pending;
+    speechPackInstalling = true;
+    paintDictation(key);
+    let text;
+    try {
+        // Call before awaiting anything so the browser receives the setup button's user activation.
+        const installed = await Recognition.install({ langs: [lang], processLocally: true });
+        text = installed ? "Language pack setup finished. Click Dictate to check it and start."
+            : "Language pack setup was declined or could not finish. You can still type.";
+    }
+    catch (error) {
+        text = error instanceof DOMException && error.name === "NotAllowedError"
+            ? "The host or browser did not allow language pack setup. You can still type."
+            : "The browser could not set up the on-device speech model. You can still type.";
+    }
+    finally {
+        speechPackInstalling = false;
+    }
+    if (dictationNotice === pending) {
+        dictationNotice = { key, text };
+        paintDictation(key);
+    }
+}
+async function toggleDictation(key) {
+    const Recognition = speechRecognition();
+    if (!Recognition || state.pending.get(key)?.sending)
+        return;
+    if (speechPackInstalling)
+        return;
+    if (dictation?.key === key) {
+        const current = dictation;
+        if (current.phase === "checking") {
+            abortDictation();
+            return;
+        }
+        if (current.phase === "stopping")
+            return;
+        current.phase = "stopping";
+        paintDictation(key);
+        current.recognition.stop();
+        return;
+    }
+    abortDictation();
+    const previousNotice = dictationNotice;
+    dictationNotice = null;
+    if (previousNotice && previousNotice.key !== key)
+        paintDictation(previousNotice.key);
+    const finish = (text, setupLang) => {
+        dictation = null;
+        dictationNotice = { key, text, setupLang };
+        paintDictation(key);
+    };
+    let active;
+    try {
+        const recognition = new Recognition();
+        const current = { key, recognition, phase: "checking" };
+        dictation = active = current;
+        const lang = globalThis.navigator?.language || "en-US";
+        paintDictation(key);
+        const availability = await Recognition.available({ langs: [lang], processLocally: true });
+        if (dictation !== current)
+            return;
+        if (availability !== "available") {
+            if (availability === "downloadable" && Recognition.install) {
+                finish(`Set up the on-device speech model for ${lang} to dictate. Setup may download a language pack.`, lang);
+            }
+            else if (availability === "downloading") {
+                finish(`The on-device speech model for ${lang} is still downloading. Try Dictate again later or keep typing.`);
+            }
+            else {
+                finish(`On-device dictation is unavailable for ${lang} in this host. You can still type.`);
+            }
+            return;
+        }
+        recognition.lang = lang;
+        recognition.processLocally = true;
+        if (recognition.processLocally !== true) {
+            finish("The browser could not enable on-device recognition. You can still type.");
+            return;
+        }
+        recognition.continuous = true;
+        recognition.interimResults = false;
+        recognition.onstart = () => {
+            if (dictation !== current || current.phase !== "starting")
+                return;
+            current.phase = "listening";
+            paintDictation(key);
+        };
+        recognition.onresult = ({ resultIndex, results }) => {
+            if (dictation !== current)
+                return;
+            const box = composerBox(key);
+            const textarea = box?.querySelector("textarea");
+            if (!textarea || textarea.disabled) {
+                abortDictation();
+                return;
+            }
+            const segments = [];
+            for (let i = resultIndex; i < results.length; i++) {
+                const result = results[i];
+                const transcript = result.isFinal ? result[0]?.transcript.trim() : "";
+                if (transcript)
+                    segments.push(transcript);
+            }
+            if (!segments.length)
+                return;
+            // Read the live textarea so edits made while listening are never overwritten.
+            const draft = textarea.value;
+            const { selectionStart, selectionEnd, selectionDirection } = textarea;
+            textarea.value = draft + (draft && !/\s$/.test(draft) ? " " : "") + segments.join(" ");
+            if (document.activeElement === textarea && (selectionStart !== draft.length || selectionEnd !== draft.length)) {
+                textarea.setSelectionRange(selectionStart, selectionEnd, selectionDirection);
+            }
+            setDraft(key, textarea.value);
+        };
+        recognition.onerror = ({ error }) => {
+            if (dictation === current)
+                finish(dictationError(error));
+        };
+        recognition.onend = () => {
+            if (dictation === current)
+                finish("Dictation ended.");
+        };
+        current.phase = "starting";
+        paintDictation(key);
+        recognition.start();
+    }
+    catch (error) {
+        if (active && dictation !== active)
+            return;
+        if (active?.phase === "checking") {
+            finish("The browser could not check for an on-device speech model. You can still type.");
+        }
+        else {
+            finish(dictationError(error instanceof DOMException && error.name === "NotAllowedError" ? "not-allowed" : ""));
+        }
+    }
+}
 let toastTimer;
 function toast(text, error = false) {
     const el = $("#toast");
@@ -2256,6 +2485,10 @@ function revealPendingJump() {
         state.pendingJump = null;
 }
 function closeComposer(key, discard) {
+    if (dictation?.key === key)
+        abortDictation();
+    if (dictationNotice?.key === key)
+        dictationNotice = null;
     pinnedComposers.delete(key);
     composerContexts.delete(key);
     if (discard)
@@ -2277,7 +2510,7 @@ async function submit(key, draft = defaultDraft()) {
     const review = state.review;
     if (!review)
         return;
-    const box = document.querySelector(`.composer[data-key="${CSS.escape(key)}"]`);
+    const box = composerBox(key);
     const textarea = box?.querySelector("textarea");
     if (!box || !textarea)
         return;
@@ -2286,6 +2519,10 @@ async function submit(key, draft = defaultDraft()) {
         textarea.focus();
         return;
     }
+    if (dictation?.key === key)
+        abortDictation();
+    if (dictationNotice?.key === key)
+        dictationNotice = null;
     setDraft(key, textarea.value);
     const pending = state.pending.get(key) ?? { clientRequestId: uuid() };
     pending.sending = true;
@@ -2449,6 +2686,13 @@ async function onClick(e) {
                 break;
             case "cancel":
                 closeComposer(value("key"), true);
+                break;
+            case "dictate":
+                await toggleDictation(value("key"));
+                break;
+            case "install-dictation-model":
+                if (e.isTrusted)
+                    await installDictationModel(value("key"));
                 break;
             case "submit": {
                 const flag = value("draft");
@@ -2673,6 +2917,8 @@ function onKeyDown(e) {
     else if (e.key === "Escape") {
         e.preventDefault();
         if (key.startsWith("reply:") && !el.value.trim()) {
+            if (dictation?.key === key)
+                abortDictation();
             el.closest(".composer")?.classList.remove("open");
             el.blur();
         }
@@ -2696,7 +2942,7 @@ function onFocusOut(e) {
         return;
     setTimeout(() => {
         const box = el.closest(".composer");
-        if (box && !el.value.trim() && !box.contains(document.activeElement))
+        if (box && dictation?.key !== key && !el.value.trim() && !box.contains(document.activeElement))
             box.classList.remove("open");
     }, 150);
 }
@@ -2827,6 +3073,7 @@ function onMouseUp() {
     focusComposer(`line:${file.path}:${r.side}:${r.startLine}-${r.endLine}`);
 }
 // ---------- Boot ----------
+globalThis.addEventListener?.("pagehide", abortDictation);
 document.addEventListener("click", onClick);
 document.addEventListener("change", onChange);
 document.addEventListener("input", onInput);
