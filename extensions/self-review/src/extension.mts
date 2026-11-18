@@ -239,7 +239,7 @@ const actions: CanvasAction[] = [
             properties: {
                 reviewId: reviewIdProp,
                 revisionId: { type: "string" },
-                models: { type: "array", minItems: 1, maxItems: 4, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 120 } },
+                models: { type: "array", minItems: 2, maxItems: 4, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 120 } },
                 focus: { type: "string", enum: REVIEW_FOCUSES },
                 intent: { type: "string", maxLength: 4000, description: "Optional goal, acceptance criteria, spec references, or review guidance; not permission to edit." },
                 skillNames: { type: "array", maxItems: 3, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 240 }, description: "Per-run override of bundled review skills (code-review-and-quality, code-simplification, ponytail-review). Empty array explicitly opts out; omission uses saved skill defaults, which are all three until changed." },
@@ -276,7 +276,7 @@ const actions: CanvasAction[] = [
     },
     {
         name: "report_agent_review",
-        description: "Report a selected model's actual findings after the owning conversation checks the code and baseline. Include assessments, evidence, and a summary of actual coverage/verification/limits (even with no findings), or error on failure. Only confirmed actionable findings can be approved.",
+        description: "Record a selected model's initial findings and evidence after validation. Findings remain unpublished until all selected reviewers discuss and vote.",
         inputSchema: {
             type: "object",
             properties: {
@@ -332,6 +332,52 @@ const actions: CanvasAction[] = [
         handler: guarded(async (ctx) => {
             const input = inputOf(ctx);
             return agentReview.report(await reviewIdFor(ctx, input), input);
+        }),
+    },
+    {
+        name: "finalize_agent_review",
+        description: "Record every selected reviewer's discussion and final votes for every consolidated candidate, or report a discussion failure. Only unanimously agreed candidates are published.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                reviewId: reviewIdProp,
+                runId: { type: "string" },
+                error: { type: "string", minLength: 1, maxLength: 4000 },
+                participants: {
+                    type: "array", minItems: 2, maxItems: 4,
+                    items: { type: "object", properties: {
+                        model: { type: "string" }, response: { type: "string", minLength: 1, maxLength: 4000 },
+                    }, required: ["model", "response"], additionalProperties: false },
+                },
+                groups: {
+                    type: "array", maxItems: 100,
+                    items: { type: "object", properties: {
+                        kind: { type: "string", enum: ["finding", "ponytail"] },
+                        sources: { type: "array", minItems: 1, maxItems: 4, items: {
+                            type: "object", properties: {
+                                model: { type: "string" }, index: { type: "integer", minimum: 0 },
+                            }, required: ["model", "index"], additionalProperties: false,
+                        } },
+                        votes: { type: "array", minItems: 2, maxItems: 4, items: {
+                            type: "object", properties: {
+                                model: { type: "string" }, decision: { type: "string", enum: ["agree", "disagree", "uncertain"] },
+                                discussion: { type: "string", minLength: 1, maxLength: 4000 },
+                                rationale: { type: "string", minLength: 1, maxLength: 4000 },
+                            }, required: ["model", "decision", "discussion", "rationale"], additionalProperties: false,
+                        } },
+                    }, required: ["kind", "sources", "votes"], additionalProperties: false },
+                },
+            },
+            required: ["runId"],
+            oneOf: [
+                { required: ["groups", "participants"], not: { required: ["error"] } },
+                { required: ["error"], not: { anyOf: [{ required: ["groups"] }, { required: ["participants"] }] } },
+            ],
+            additionalProperties: false,
+        },
+        handler: guarded(async (ctx) => {
+            const input = inputOf(ctx);
+            return agentReview.finalize(await reviewIdFor(ctx, input), input);
         }),
     },
     {

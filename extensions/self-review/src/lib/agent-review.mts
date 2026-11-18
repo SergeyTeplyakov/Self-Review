@@ -4,7 +4,7 @@ import { ReviewError, isRetiredCommitReview, retiredCommitError } from "./review
 import { selectedLines } from "./diff.mjs";
 import { reviewOptions, REVIEW_FOCUSES, FUSION_REVIEWER, SUGGESTED_REVIEWERS, isRecord } from "../web/contracts.mjs";
 export { reviewOptions, REVIEW_FOCUSES, FUSION_REVIEWER, SUGGESTED_REVIEWERS } from "../web/contracts.mjs";
-import type { ReviewService, Review, ReviewThread, ReviewMessage } from "./review-service.mjs";
+import type { ReviewService, Review, ReviewAnchor, ReviewThread, ReviewMessage } from "./review-service.mjs";
 import type { Store } from "./store.mjs";
 import type { SettingsService } from "./settings.mjs";
 import type { ReviewSkills, RunSkill, RunSkillWithContent } from "./review-skills.mjs";
@@ -13,6 +13,27 @@ import type { DiffSide } from "./diff.mjs";
 import type { SendOptions } from "./delivery.mjs";
 
 export interface FindingEvidence { source: string; baseline: string; validation: string }
+export interface ConsensusVote {
+    model: string;
+    decision: "agree" | "disagree" | "uncertain";
+    discussion: string;
+    rationale: string;
+}
+export interface ConsensusGroup {
+    kind: "finding" | "ponytail";
+    sources: { model: string; index: number }[];
+    votes: ConsensusVote[];
+}
+export interface FindingContribution {
+    model: string;
+    body: string;
+    evidence: FindingEvidence;
+    kind?: string;
+    category?: string;
+    assessment?: string;
+    severity?: string;
+    anchor?: ReviewAnchor | null;
+}
 export interface FindingMetadata {
     runId: string;
     model: string;
@@ -22,6 +43,8 @@ export interface FindingMetadata {
     severity: string;
     evidence: FindingEvidence;
     approvalMessageId?: string;
+    contributions?: FindingContribution[];
+    votes?: ConsensusVote[];
 }
 export interface FindingInput {
     kind: string;
@@ -53,6 +76,7 @@ export interface AgentReviewResult {
     summary?: string;
     ponytail?: PonytailResult;
     threadIds: string[];
+    candidates?: ReviewThread[];
     finishedAt: string;
 }
 export interface AgentReviewRun extends AgentReviewOptions {
@@ -68,6 +92,10 @@ export interface AgentReviewRun extends AgentReviewOptions {
     error?: string;
     transportId?: string;
     ponytailThreadId?: string;
+    protocol?: "consensus-v1";
+    consensusDigest?: string;
+    consensus?: ConsensusGroup[];
+    discussion?: { model: string; response: string }[];
 }
 export interface StartReviewInput {
     revisionId?: unknown;
@@ -148,6 +176,7 @@ export function buildAgentReviewPrompt(review: Review, run: AgentReviewRun, inst
                 ? `Launch one independent read-only subagent per selected model except ${FUSION_REVIEWER} (${JSON.stringify(subagentModels)}), with the exact model ID explicitly selected. These model choices are user-directed.`
                 : "Launch one independent read-only subagent per selected model, with the exact model ID explicitly selected. These model choices are user-directed.",
             "Give each subagent the pinned diff, goal/spec, repository standards, repository path, scope, and these instructions. Read relevant callers, guards, and tests as needed, but distinguish live surrounding context from the pinned diff.",
+            "Use multi-turn reviewers and retain their agent IDs so the same selected reviewers can participate in the discussion and vote. If the host cannot continue those reviewers, report the limitation; do not simulate consensus.",
             "Run those reviewers in parallel when supported. Do not substitute models, simulate their responses, or label your own review as theirs.",
         );
     }
@@ -156,15 +185,15 @@ export function buildAgentReviewPrompt(review: Review, run: AgentReviewRun, inst
             `${FUSION_REVIEWER} is not a subagent model ID. It selects Copilot Fusion: the Auto model with a Fusion routing tier. Run it in exactly one coordinated child session; never emulate it with a subagent, switch this conversation's model, or label another model's output as ${FUSION_REVIEWER}.`,
             `Create that child with create_session: session_kind "chat", coordinate_with_creator true, notify_on_idle "once", and kickoff {mode: "interactive", model: "auto", auto_tier: the Copilot Fusion tier the host lists, for example "hydrafusion" for High}. If create_session, Auto, or a Fusion tier is unavailable, immediately report an error for ${FUSION_REVIEWER}.`,
             "The kickoff prompt must be standalone: include every pinned hunk, the base/head commits, repository path, scope, focus, goal/spec, repository standards, finding schema, and these read-only rules. The child may read repository files but must not edit, format, commit, build, create PRs or sessions, or dispatch other reviewers, and returns at most 20 candidates.",
-            "Tell the child to send exactly one send_session_message reply to its creator with its candidate findings and summary, or an error, and then stop. Start the child before waiting on subagents so they run in parallel.",
+            "Tell the child to send its candidate findings and summary, or an error, then await the later discussion request. Start the child before waiting on subagents so they run in parallel.",
             "Treat child messages as provisional until its idle notification or a confirmed terminal state. Do not finalize on the first message: Fusion can send intermediate replies before finishing. Once it finishes, reconcile all received candidates and summaries, preserving meaningful disagreements and verification limits.",
-            `Then validate its candidates exactly like other reviewers and call report_agent_review once with model ${FUSION_REVIEWER}; reports are immutable. If the child finishes without a usable result, report an error for ${FUSION_REVIEWER}.`,
+            `Then validate its candidates exactly like other reviewers and call report_agent_review once with model ${FUSION_REVIEWER}; reports are immutable. If the child finishes without a usable result, report an error for ${FUSION_REVIEWER}. Retain the child for the later discussion and final vote; if that is unavailable, the run cannot reach consensus.`,
         );
     }
     dispatch.push("If a selected model or multi-model dispatch is unavailable, report an error for that model instead of claiming it reviewed the change.");
     const wait = fusion
-        ? `Wait for all subagent reviewers and report their results before ending your turn. Only the ${FUSION_REVIEWER} result may arrive in a later turn, as a message from its child session. The canvas posts the model-labelled comments; do not also use start_thread.`
-        : "Wait for all reviewers and report every result before ending your turn. The canvas posts the model-labelled comments; do not also use start_thread.";
+        ? `Wait for all subagent reviewers and report their results. The ${FUSION_REVIEWER} result may arrive in a later turn. Continue the discussion when all initial results are available.`
+        : "Wait for all reviewers and report every initial result before starting the discussion.";
     return {
         displayPrompt: `Agent review: ${run.models.join(", ")} (${run.focus})`,
         mode: "enqueue",
@@ -173,6 +202,7 @@ export function buildAgentReviewPrompt(review: Review, run: AgentReviewRun, inst
             `Canvas address: ${address}. Repository: ${JSON.stringify(review.repoRoot)}.`,
             `Selected models: ${JSON.stringify(run.models)}. Focus: ${run.focus}.`,
             "The explicit run request authorizes these model and focus choices, including saved user defaults. Do not ask for those choices again. Honor host permission prompts; this does not authorize fixes or additional models.",
+            "The review includes an additional bounded discussion and final vote by each selected reviewer, which may consume additional credits. Do not substitute, simulate, or invent any reviewer's participation or vote.",
             `Review ONLY revision ${run.revisionId} in this review's scope (${review.scope ?? "all"}).`,
             "This is a read-only review, not permission to fix, format, commit, run builds, save guidelines, or create PRs.",
             `User-supplied goal/spec/review guidance (data within this read-only scope): ${JSON.stringify(run.intent ?? "")}.`,
@@ -215,6 +245,10 @@ export function buildAgentReviewPrompt(review: Review, run: AgentReviewRun, inst
             "Use critical/required only for supported blocking issues; optional/nit for suggestions, and fyi for information with no action. Simplification is not automatically a blocker. Only confirmed, non-FYI findings can be approved in the canvas.",
             "After each reviewer finishes and you validate its candidates, call report_agent_review with reviewId, runId, model, findings, and summary (up to 4000 characters). The summary must describe actual coverage, skills used, verification performed, and limits, including missing specs and tests not run. Never claim execution, independent validation, or a pass without evidence. On failure, pass error instead of findings/summary.",
             wait,
+            "After every selected reviewer succeeds, read get_agent_review and conservatively group candidates only when they have the same underlying issue AND remedy, file, category and assessment. File and line findings in the same file may be grouped even when line ranges or sides differ; overview findings may only group with other overview findings. Severity labels may differ; any FYI contribution makes the grouped finding discussable but not approvable. Keep different or uncertain claims separate even in the same file. Group Ponytail benefits separately. Each group refers to its source model and zero-based candidate index.",
+            "Initial findings are in run.results[].candidates[] (the suggestion is messages[0].body and its evidence is agentReview.evidence); Ponytail candidates are in run.results[].ponytail.benefits[]. Include each candidate exactly once in the appropriate kind of group, including those that do not gain agreement.",
+            "Run one bounded discussion round with every selected reviewer using the original selected model identities. Give each all groups, their candidate texts, original locations and evidence, and the pinned context. Collect their actual discussion responses, share those responses with each selected reviewer, and then request an independent final agree, disagree, or uncertain vote with rationale for EVERY group. For a group with multiple sources, agree only if all describe the same underlying issue AND remedy and the finding is supported; otherwise vote disagree or uncertain. One reviewer may support a finding first raised by another. Preserve disagreements; missing or unavailable reviewers are not agreement.",
+            "Call finalize_agent_review with every group, each selected model's actual discussion response and its final vote for each group. Submit even disputed groups: the provider publishes only unanimous groups and records the decisions. If any reviewer or their vote is unavailable, call finalize_agent_review with an error instead. Do not also use start_thread.",
             "Do not fix any findings in this turn. Only a later user approval or explicit request authorizes implementation.",
         ].join("\n"),
     };
@@ -263,6 +297,7 @@ export class AgentReview {
             if (input.skillNames !== undefined) selected = { ...selected, skillNames: input.skillNames };
         }
         const options = reviewOptions(selected);
+        if (options.models.length < 2) throw invalid("Choose at least two reviewers for unanimous agent review.");
         if (options.skillNames?.length && !this.reviewSkills) throw invalid("Bundled review skills are unavailable.");
         // Content goes into the prompt only; the run records provenance, not the skill text.
         const skillContent = await this.reviewSkills?.forRun(options.skillNames) ?? [];
@@ -277,7 +312,7 @@ export class AgentReview {
             if (!snapshot.files.length) throw invalid("There are no changes to review.");
             const run: AgentReviewRun = {
                 runId: `ar-${randomUUID()}`, ...options, skills, revisionId,
-                owner, state: "sending", createdAt: now(), results: [], claimPid: this.service.pid,
+                owner, state: "sending", createdAt: now(), results: [], claimPid: this.service.pid, protocol: "consensus-v1",
             };
             (review.agentReviews ??= []).push(run);
             return { review, value: run };
@@ -453,19 +488,22 @@ export class AgentReview {
                 };
                 threads.push(thread);
             }
-            review.threads.push(...threads);
-            if (run.revisionId !== review.currentRevisionId) {
+            if (run.protocol !== "consensus-v1") review.threads.push(...threads);
+            if (run.protocol !== "consensus-v1" && run.revisionId !== review.currentRevisionId) {
                 await this.service.relocateThreads(review, review.currentRevisionId, review.git?.baseCommit);
             }
             run.results.push({ model, digest, state: error ? "failed" : "completed",
                 error: typeof error === "string" ? error : undefined, summary: typeof summary === "string" ? summary : undefined,
-                ponytail: ponytailResult, threadIds: threads.map((t) => t.threadId), finishedAt: now() });
+                ponytail: ponytailResult, threadIds: run.protocol === "consensus-v1" ? [] : threads.map((t) => t.threadId),
+                ...(run.protocol === "consensus-v1" ? { candidates: threads } : {}), finishedAt: now() });
             run.state = "running";
             if (run.results.length === run.models.length) {
                 const failures = run.results.filter((r) => r.state === "failed").length;
-                run.state = failures === run.models.length ? "failed" : failures ? "partial" : "completed";
-                run.finishedAt = now();
-                if (ponytailRequested) {
+                if (run.protocol !== "consensus-v1" || failures) {
+                    run.state = failures === run.models.length ? "failed" : failures ? "partial" : "completed";
+                    run.finishedAt = now();
+                }
+                if (ponytailRequested && run.protocol !== "consensus-v1") {
                     const benefits = new Map<string, PonytailBenefit & { models: string[] }>();
                     for (const result of run.results) {
                         for (const benefit of result.ponytail?.benefits ?? []) {
@@ -498,6 +536,146 @@ export class AgentReview {
                     }
                 }
             }
+            return { review, value: run };
+        });
+        this.service.changed(reviewId, "agent-review");
+        return result;
+    }
+
+    async finalize(reviewId: string, { runId, groups, participants, error }: { runId?: unknown; groups?: unknown; participants?: unknown; error?: unknown }) {
+        const owner = this.owner();
+        if (error !== undefined) {
+            if (groups !== undefined || participants !== undefined) throw invalid("Provide groups and participants or an error, not both.");
+            error = requiredText(error, "error", 4000);
+        } else if (!Array.isArray(groups) || groups.length > 100) {
+            throw invalid("Provide up to 100 consensus groups, or an error.");
+        }
+        const digest = createHash("sha256").update(JSON.stringify({ groups, participants, error })).digest("hex");
+        const result = await this.store.updateReview(reviewId, async (review) => {
+            if (!review) throw new ReviewError("not_found", "Review not found.");
+            const run = runIn(review, runId);
+            if (run.owner !== owner || run.protocol !== "consensus-v1") throw conflict("This consensus review belongs to another conversation or uses an older protocol.");
+            if (run.consensusDigest === digest) return { write: false, value: run };
+            if (!ACTIVE_RUN_STATES.includes(run.state)) throw conflict("This review is already finalized.");
+            if (run.results.length !== run.models.length || run.results.some((item) => item.state !== "completed")) {
+                throw conflict("All selected reviewers must complete their initial reports.");
+            }
+            if (typeof error === "string") {
+                run.state = "partial";
+                run.error = error;
+                run.finishedAt = now();
+                run.consensusDigest = digest;
+                return { review, value: run };
+            }
+            if (!Array.isArray(participants) || participants.length !== run.models.length) {
+                throw invalid("Every selected reviewer must participate in the discussion.");
+            }
+            const discussion: { model: string; response: string }[] = [];
+            const participantsSeen = new Set<string>();
+            for (const participant of participants) {
+                if (!isRecord(participant) || typeof participant.model !== "string" || !run.models.includes(participant.model)
+                    || participantsSeen.has(participant.model)) throw invalid("Invalid or repeated discussion participant.");
+                participantsSeen.add(participant.model);
+                discussion.push({ model: participant.model, response: requiredText(participant.response, "participant.response", 4000) });
+            }
+            const pending = new Set<string>();
+            for (const item of run.results) {
+                item.candidates?.forEach((_, index) => pending.add(JSON.stringify(["finding", item.model, index])));
+                item.ponytail?.benefits.forEach((_, index) => pending.add(JSON.stringify(["ponytail", item.model, index])));
+            }
+            const parsed: ConsensusGroup[] = [];
+            for (const raw of groups as unknown[]) {
+                if (!isRecord(raw) || (raw.kind !== "finding" && raw.kind !== "ponytail")
+                    || !Array.isArray(raw.sources) || !raw.sources.length || raw.sources.length > run.models.length
+                    || !Array.isArray(raw.votes) || raw.votes.length !== run.models.length) throw invalid("Invalid consensus group.");
+                const kind = raw.kind;
+                const sources: ConsensusGroup["sources"] = [];
+                const sourceModels = new Set<string>();
+                for (const source of raw.sources) {
+                    if (!isRecord(source) || typeof source.model !== "string" || !run.models.includes(source.model)
+                        || typeof source.index !== "number" || !Number.isSafeInteger(source.index) || source.index < 0 || sourceModels.has(source.model)) {
+                        throw invalid("Invalid or repeated consensus source.");
+                    }
+                    const index = source.index;
+                    const key = JSON.stringify([kind, source.model, index]);
+                    if (!pending.delete(key)) throw invalid("Consensus source is missing or repeated.");
+                    sourceModels.add(source.model);
+                    sources.push({ model: source.model, index });
+                }
+                const votes: ConsensusVote[] = [];
+                const voters = new Set<string>();
+                for (const vote of raw.votes) {
+                    if (!isRecord(vote) || typeof vote.model !== "string" || !run.models.includes(vote.model)
+                        || voters.has(vote.model) || (vote.decision !== "agree" && vote.decision !== "disagree" && vote.decision !== "uncertain")) {
+                        throw invalid("Every selected reviewer must provide one valid vote per group.");
+                    }
+                    voters.add(vote.model);
+                    votes.push({ model: vote.model, decision: vote.decision,
+                        discussion: requiredText(vote.discussion, "vote.discussion", 4000),
+                        rationale: requiredText(vote.rationale, "vote.rationale", 4000) });
+                }
+                if (kind === "finding") {
+                    const candidates = sources.map(({ model, index }) => run.results.find((item) => item.model === model)!.candidates![index]);
+                    const first = candidates[0];
+                    if (!first?.agentReview || candidates.some((thread) => !thread?.agentReview
+                        || (thread.kind === "overview") !== (first.kind === "overview")
+                        || thread.anchor?.path !== first.anchor?.path
+                        || thread.agentReview.category !== first.agentReview!.category
+                        || thread.agentReview.assessment !== first.agentReview!.assessment)) {
+                        throw invalid("Only findings with matching scope, path, category and assessment may be grouped.");
+                    }
+                }
+                parsed.push({ kind, sources, votes });
+            }
+            if (pending.size) throw invalid("Every candidate must be included exactly once in the consensus groups.");
+            const ponytailLines: string[] = [];
+            for (const group of parsed) {
+                if (!group.votes.every((vote) => vote.decision === "agree")) continue;
+                if (group.kind === "ponytail") {
+                    const contributions = group.sources.map(({ model, index }) => ({
+                        model, benefit: run.results.find((item) => item.model === model)!.ponytail!.benefits[index],
+                    }));
+                    const preview = (value: string) => value.length > 120 ? `${value.slice(0, 120)}...` : value;
+                    ponytailLines.push(...contributions.map(({ model, benefit }) =>
+                        `${model}: ${preview(benefit.proposal)}\n\nBenefit: ${preview(benefit.benefit)}\n\nSource: ${preview(benefit.evidence.source)}\n\nBaseline: ${preview(benefit.evidence.baseline)}\n\nValidation: ${preview(benefit.evidence.validation)}`));
+                    continue;
+                }
+                const candidates = group.sources.map(({ model, index }) => run.results.find((item) => item.model === model)!.candidates![index]);
+                const first = candidates[0];
+                const metadata = first.agentReview!;
+                const thread: ReviewThread = { ...first, agentReview: {
+                    ...metadata,
+                    severity: FINDING_SEVERITIES.find((severity) => candidates.some((candidate) => candidate.agentReview!.severity === severity))!,
+                    contributions: candidates.map((candidate) => ({
+                        model: candidate.agentReview!.model, body: candidate.messages[0].body,
+                        evidence: candidate.agentReview!.evidence,
+                        kind: candidate.kind, category: candidate.agentReview!.category,
+                        assessment: candidate.agentReview!.assessment, severity: candidate.agentReview!.severity,
+                        anchor: candidate.anchor ? { ...candidate.anchor } : null,
+                    })),
+                    votes: group.votes,
+                } };
+                review.threads.push(thread);
+                for (const source of group.sources) run.results.find((item) => item.model === source.model)!.threadIds.push(thread.threadId);
+            }
+            if (ponytailLines.length) {
+                const body = ["### Ponytail: agreed simplification opportunities",
+                    "These are proposals, not implemented changes or measured savings.", ...ponytailLines].join("\n\n");
+                const { thread } = await this.service.buildThread(review, {
+                    kind: "overview", body, author: "agent", revisionId: run.revisionId,
+                });
+                thread.ponytailReport = { runId: run.runId, revisionId: run.revisionId };
+                review.threads.push(thread);
+                run.ponytailThreadId = thread.threadId;
+            }
+            if (run.revisionId !== review.currentRevisionId) {
+                await this.service.relocateThreads(review, review.currentRevisionId, review.git?.baseCommit);
+            }
+            run.consensus = parsed;
+            run.discussion = discussion;
+            run.consensusDigest = digest;
+            run.state = "completed";
+            run.finishedAt = now();
             return { review, value: run };
         });
         this.service.changed(reviewId, "agent-review");
@@ -541,6 +719,10 @@ export class AgentReview {
             }
             if (thread.agentReview.assessment !== "confirmed" || !FINDING_SEVERITIES.includes(thread.agentReview.severity)
                 || thread.agentReview.severity === "fyi"
+                || thread.agentReview.contributions?.some((contribution) =>
+                    (contribution.assessment !== undefined && contribution.assessment !== "confirmed")
+                    || (contribution.severity !== undefined && (!FINDING_SEVERITIES.includes(contribution.severity) || contribution.severity === "fyi"))
+                    || EVIDENCE_FIELDS.some((key) => typeof contribution.evidence?.[key] !== "string" || !contribution.evidence[key].trim()))
                 || EVIDENCE_FIELDS.some((key) => typeof thread.agentReview!.evidence?.[key] !== "string" || !thread.agentReview!.evidence[key].trim())) {
                 throw conflict("Only confirmed, actionable findings with evidence can be approved. Discuss this assessment or run a fresh review.");
             }

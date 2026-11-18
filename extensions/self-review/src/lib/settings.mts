@@ -3,7 +3,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as gitDefault from "./git-process.mjs";
-import { agentReviewDefaults, settingsPatch, isLearningMode, isDeliveryMode, LEARNING_MODES, DELIVERY_MODES } from "../web/contracts.mjs";
+import { agentReviewDefaults, settingsPatch, isLearningMode, isDeliveryMode, LEARNING_MODES, DELIVERY_MODES, ReviewError } from "../web/contracts.mjs";
 import type { AgentReviewDefaults, DeliveryChoice, DeliveryMode, GitRunner, LearningMode, Log, RepoSettings, SettingsStore, StoredRepoSettings } from "../../types/contracts.js";
 export { LEARNING_MODES, DELIVERY_MODES } from "../web/contracts.mjs";
 
@@ -144,6 +144,7 @@ export class SettingsService {
     /** @param {unknown} defaults */
     async updateAgentReview(defaults: unknown): Promise<AgentReviewDefaults | null> {
         const value = defaults === null ? null : this.validateAgentReview(defaults);
+        if (value && value.models.length < 2) throw new ReviewError("invalid_input", "Choose at least two reviewers for unanimous agent review.");
         await this.store.updateSettings((settings) => {
             if (value === null) delete settings.agentReview;
             else settings.agentReview = value;

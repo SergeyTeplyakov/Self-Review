@@ -14,11 +14,28 @@ import type { Snapshot } from "../src/lib/git.mjs";
 import type { Log } from "../types/contracts.js";
 import type { AgentReview as AgentReviewType } from "../src/lib/agent-review.mjs";
 import type { ReviewSkills as ReviewSkillsType } from "../src/lib/review-skills.mjs";
-import type { AgentFileContent } from "../src/lib/agent-review.mjs";
+import type { AgentFileContent, ConsensusGroup, ConsensusVote } from "../src/lib/agent-review.mjs";
 
 const models: string[] = ["gpt-review-test", "mai-review-test"];
 const input = { models, focus: "both", revisionId: "r1" };
 const summary = "Read the pinned diff and both versions of notes.md. Source inspection only; no tests run and no external skills used.";
+const agreed = (reviewers: string[]): ConsensusVote[] => reviewers.map((model) => ({
+    model, decision: "agree", discussion: "Reviewed the candidate and evidence.", rationale: "The recommendation is useful and supported.",
+}));
+const participants = (reviewers: string[]) => reviewers.map((model) => ({ model, response: "Discussed all candidates." }));
+
+async function finalizeAll(agent: AgentReviewType, reviewId: string, runId: string, groups?: ConsensusGroup[]) {
+    const run = (await agent.input(reviewId, { runId })).run;
+    const all = groups ?? run.results.flatMap((result) => [
+        ...(result.candidates ?? []).map((_, index) => ({
+            kind: "finding" as const, sources: [{ model: result.model, index }], votes: agreed(run.models),
+        })),
+        ...(result.ponytail?.benefits ?? []).map((_, index) => ({
+            kind: "ponytail" as const, sources: [{ model: result.model, index }], votes: agreed(run.models),
+        })),
+    ]);
+    return agent.finalize(reviewId, { runId, groups: all, participants: participants(run.models) });
+}
 
 test("bundled review skills are on by default, supply their pinned text to the run, and record only provenance", async (t) => {
     const f = await fixture(t);
@@ -177,6 +194,9 @@ test("per-review skill overrides do not change defaults and Ponytail creates one
     await f.agent.report("review", { ...report, ponytail });
     assert.equal((await f.service.getReview("review")).threads.length, 0, "wait for all reviewers before the consolidated note");
     await f.agent.report("review", { ...report, model: models[1], ponytail });
+    await finalizeAll(f.agent, "review", run.runId, [{
+        kind: "ponytail", sources: models.map((model) => ({ model, index: 0 })), votes: agreed(models),
+    }]);
     const review = await f.service.getReview("review");
     assert.equal(review.threads.length, 1, "duplicate opportunities combine into one top-level note");
     const thread = required(first(review.threads));
@@ -185,7 +205,8 @@ test("per-review skill overrides do not change defaults and Ponytail creates one
     assert.equal(thread.agentReview, undefined, "a benefits report cannot be approved as a fix");
     assert.equal(thread.ponytailReport?.runId, run.runId);
     assert.match(first(thread.messages).body, /Avoid maintaining two equivalent/);
-    assert.match(first(thread.messages).body, /gpt-review-test, mai-review-test/);
+    assert.match(first(thread.messages).body, /gpt-review-test/);
+    assert.match(first(thread.messages).body, /mai-review-test/);
     await assert.rejects(f.agent.approve("review", thread.threadId, "r1"), /Only agent review findings/);
     await f.agent.report("review", { ...report, model: models[1], ponytail });
     assert.equal((await f.service.getReview("review")).threads.length, 1, "report retries do not duplicate the note");
@@ -203,6 +224,22 @@ test("Ponytail absence and failure are visible without fabricating a top-level b
     const results = required(first(review.agentReviews)).results;
     assert.equal(results[0]?.ponytail?.status, "used");
     assert.equal(results[1]?.ponytail?.status, "unavailable");
+});
+
+test("Ponytail opportunities are not published when any reviewer is uncertain", async (t) => {
+    const f = await fixture(t);
+    setReviewSkills(f.agent, new ReviewSkills({ store: f.store }));
+    const run = await f.agent.start("review", { ...input, skillNames: ["ponytail-review"] }, "c");
+    const ponytail = { status: "used", summary: "Inspected the diff.", benefits: [
+        { proposal: "Reuse the helper.", benefit: "Avoid duplicate maintenance.", evidence: finding.evidence },
+    ] };
+    for (const model of models) await f.agent.report("review", { runId: run.runId, model, findings: [], summary, ponytail });
+    const votes = agreed(models);
+    votes[1] = { ...required(votes[1]), decision: "uncertain" };
+    await finalizeAll(f.agent, "review", run.runId, [{
+        kind: "ponytail", sources: models.map((model) => ({ model, index: 0 })), votes,
+    }]);
+    assert.equal((await f.service.getReview("review")).threads.length, 0);
 });
 
 test("empty skill override opts out despite saved defaults", async (t) => {
@@ -231,9 +268,10 @@ test("saved-default runs use the same validated, revision-pinned pipeline and ne
     assert.equal(run.intent, "Keep API behavior.");
     assert.match(required(f.sent[0]).prompt ?? "", /Do not ask for those choices again/);
     assert.match(required(f.sent[0]).prompt ?? "", /Honor host permission prompts/);
-    await settings.updateAgentReview({ models: ["another-model"], focus: "review", skipDialog: false });
+    await assert.rejects(settings.updateAgentReview({ models: ["another-model"], focus: "review", skipDialog: false }), /at least two reviewers/);
+    await f.store.updateSettings((stored) => { stored.agentReview = { models: ["another-model"], focus: "review", intent: "", skipDialog: true }; });
     assert.deepEqual(required(first((await f.service.getReview("review")).agentReviews)).models, models, "changing preferences cannot alter a queued run");
-    await assert.rejects(f.agent.start("review", request, "c"), /already has an active/);
+    await assert.rejects(f.agent.start("review", request, "c"), /at least two reviewers/);
     assert.equal(f.sent.length, 1);
 });
 
@@ -251,12 +289,13 @@ test("maximum Ponytail evidence stays available without overflowing the single o
             })) },
         });
     }
+    await finalizeAll(f.agent, "review", run.runId);
     const review = await f.service.getReview("review");
     assert.equal(review.threads.length, 1);
     const note = first(review.threads);
     const firstMessage = first(note.messages);
     assert.ok(firstMessage.body.length <= 20000);
-    assert.match(firstMessage.body, /full text in run report/);
+    assert.match(firstMessage.body, /\.\.\./);
     const benefit = first(first(required(first(review.agentReviews)).results).ponytail?.benefits);
     assert.equal(benefit.evidence.validation.length, 2000, "saved evidence remains complete");
 });
@@ -295,7 +334,7 @@ test("multi-model review queues only after an explicit start and excludes manual
     assert.match(prompt.prompt, /Zero confirmed findings/);
     assert.match(prompt.prompt, /Do not launch an extra validator model/);
     assert.match(prompt.prompt, /Preserve outputs, errors, side effects, ordering, and prose meaning/);
-    assert.match(prompt.prompt, /Wait for all reviewers and report every result before ending your turn/);
+    assert.match(prompt.prompt, /Wait for all reviewers and report every initial result before starting the discussion/);
     assert.doesNotMatch(prompt.prompt, /copilot-fusion|create_session/, "Fusion dispatch is only added when selected");
     const inventory = await f.agent.input("review", { runId: run.runId });
     assert.equal(inventory.run.state, "running");
@@ -329,15 +368,14 @@ test("copilot-fusion runs in one coordinated child session and its result may ar
     assert.match(prompt, /validate its candidates exactly like other reviewers/);
     assert.match(prompt, /call report_agent_review once with model copilot-fusion; reports are immutable/);
     assert.match(prompt, /If the child finishes without a usable result, report an error for copilot-fusion/);
-    assert.match(prompt, /Only the copilot-fusion result may arrive in a later turn/);
+    assert.match(prompt, /copilot-fusion result may arrive in a later turn/);
     assert.doesNotMatch(prompt, /report every result before ending your turn/);
     assert.equal((await f.agent.report("review", { runId: run.runId, model: models[0], findings: [], summary })).state, "running", "the run waits for Fusion");
-    assert.equal((await f.agent.report("review", { runId: run.runId, model: FUSION_REVIEWER, findings: [finding], summary })).state, "completed");
+    assert.equal((await f.agent.report("review", { runId: run.runId, model: FUSION_REVIEWER, findings: [finding], summary })).state, "running");
+    await finalizeAll(f.agent, "review", run.runId);
     assert.deepEqual((await f.service.getReview("review")).threads.map((thread) => thread.agentReview?.model), [FUSION_REVIEWER]);
     const solo = await fixture(t);
-    await solo.agent.start("review", { ...input, models: [FUSION_REVIEWER] }, "c");
-    assert.doesNotMatch(required(solo.sent[0]).prompt ?? "", /subagent per selected model/, "a Fusion-only run launches no subagents");
-    assert.match(required(solo.sent[0]).prompt ?? "", /exactly one coordinated child session/);
+    await assert.rejects(solo.agent.start("review", { ...input, models: [FUSION_REVIEWER] }, "c"), /at least two reviewers/);
 });
 
 test("invalid models, focus, stale revisions, empty changes, and concurrent runs are rejected", async (t) => {
@@ -357,13 +395,15 @@ test("invalid models, focus, stale revisions, empty changes, and concurrent runs
     await assert.rejects(f.agent.start("review", { ...input, revisionId: "r2" }, "c"), /no changes/);
 });
 
-test("model results create independent labelled suggestions but never send fixes", async (t) => {
+test("distinct model findings remain separate after unanimous agreement and never send fixes", async (t) => {
     const f = await fixture(t);
     const run = await f.agent.start("review", input, "c");
     const firstReport = { runId: run.runId, model: models[0], findings: [finding], summary };
     assert.equal((await f.agent.report("review", firstReport)).state, "running");
     const second = { runId: run.runId, model: models[1], findings: [{ ...finding, category: "simplification", severity: "optional" }], summary };
-    assert.equal((await f.agent.report("review", second)).state, "completed");
+    assert.equal((await f.agent.report("review", second)).state, "running");
+    assert.equal((await f.service.getReview("review")).threads.length, 0);
+    await finalizeAll(f.agent, "review", run.runId);
     const review = await f.service.getReview("review");
     assert.equal(review.threads.length, 2, "same line is not evidence that two findings are the same issue");
     assert.deepEqual(review.threads.map((thread) => thread.agentReview?.model), models);
@@ -383,6 +423,250 @@ test("model results create independent labelled suggestions but never send fixes
         send: async () => "unused",
     });
     assert.equal((await resumed.input("review", { runId: run.runId })).run.state, "completed", "results survive provider reconstruction");
+});
+
+test("consensus combines equivalent findings but keeps distinct findings in the same file separate", async (t) => {
+    const f = await fixture(t);
+    const run = await f.agent.start("review", input, "c");
+    const equivalent = { ...finding, kind: "file", category: "simplification", severity: "optional",
+        body: "Reuse the shared formatter instead of keeping a duplicate." };
+    const distinct = { ...equivalent, body: "Remove the redundant second conversion instead." };
+    await f.agent.report("review", { runId: run.runId, model: models[0], findings: [equivalent, distinct], summary });
+    await f.agent.report("review", { runId: run.runId, model: models[1], findings: [
+        { ...equivalent, body: "Reuse the existing formatter rather than duplicating it.",
+            evidence: { ...finding.evidence, validation: "Compared the two formatter implementations." } },
+        { ...distinct, body: "Eliminate the extra second conversion." },
+    ], summary });
+    const grouped: ConsensusGroup[] = [
+        { kind: "finding", sources: models.map((model) => ({ model, index: 0 })), votes: agreed(models) },
+        { kind: "finding", sources: models.map((model) => ({ model, index: 1 })), votes: agreed(models) },
+    ];
+    await assert.rejects(f.agent.finalize("review", { runId: run.runId, groups: grouped, participants: participants(models).slice(0, 1) }), /participate/);
+    await assert.rejects(f.agent.finalize("review", { runId: run.runId, groups: [grouped[0]], participants: participants(models) }), /Every candidate/);
+    assert.equal((await f.service.getReview("review")).threads.length, 0);
+    await finalizeAll(f.agent, "review", run.runId, grouped);
+    const review = await f.service.getReview("review");
+    assert.equal(review.threads.length, 2);
+    const firstThread = first(review.threads);
+    assert.deepEqual(firstThread.agentReview?.contributions?.map((item) => item.model), models);
+    assert.equal(firstThread.agentReview?.contributions?.[1]?.body, "Reuse the existing formatter rather than duplicating it.");
+    assert.equal(firstThread.agentReview?.votes?.length, 2);
+    assert.equal(required(review.threads[1]).messages[0].body, distinct.body);
+    await f.agent.approve("review", firstThread.threadId, "r1");
+    await f.agent.approve("review", firstThread.threadId, "r1");
+    assert.equal((await f.service.getReview("review")).threads[0].messages.length, 2);
+    await finalizeAll(f.agent, "review", run.runId, grouped);
+    assert.equal((await f.service.getReview("review")).threads.length, 2);
+});
+
+test("disagreement or missing reviewers never publishes a candidate", async (t) => {
+    const f = await fixture(t);
+    const run = await f.agent.start("review", input, "c");
+    await f.agent.report("review", { runId: run.runId, model: models[0], findings: [finding], summary });
+    await f.agent.report("review", { runId: run.runId, model: models[1], findings: [], summary });
+    const votes = agreed(models);
+    votes[1] = { ...required(votes[1]), decision: "disagree" };
+    const groups: ConsensusGroup[] = [{ kind: "finding", sources: [{ model: models[0], index: 0 }], votes }];
+    await assert.rejects(f.agent.finalize("review", { runId: run.runId, groups: [{ ...groups[0], votes: votes.slice(0, 1) }], participants: participants(models) }), /Invalid consensus group|Every selected/);
+    await finalizeAll(f.agent, "review", run.runId, groups);
+    const review = await f.service.getReview("review");
+    assert.equal(review.threads.length, 0);
+    assert.equal(first(required(review.agentReviews)).consensus?.[0]?.votes[1]?.decision, "disagree");
+    const missing = await fixture(t);
+    const failed = await missing.agent.start("review", input, "c");
+    await missing.agent.report("review", { runId: failed.runId, model: models[0], findings: [finding], summary });
+    assert.equal((await missing.agent.report("review", { runId: failed.runId, model: models[1], error: "Reviewer unavailable" })).state, "partial");
+    assert.equal((await missing.service.getReview("review")).threads.length, 0);
+});
+
+test("overlapping equivalent findings with different severities share one action and retain source metadata", async (t) => {
+    const f = await fixture(t);
+    f.snapshot.files = parseUnifiedDiff("diff --git a/notes.md b/notes.md\n--- a/notes.md\n+++ b/notes.md\n@@ -1 +1,3 @@\n-old\n+new one\n+new two\n+new three\n");
+    f.snapshot.fingerprint = "overlap";
+    await f.service.refresh("review");
+    const run = await f.agent.start("review", { ...input, revisionId: "r2" }, "c");
+    await f.agent.report("review", { runId: run.runId, model: models[0],
+        findings: [{ ...finding, startLine: 1, endLine: 2, severity: "optional" }], summary });
+    await f.agent.report("review", { runId: run.runId, model: models[1],
+        findings: [{ ...finding, startLine: 2, endLine: 3, severity: "required",
+            body: "Restore the same constraint.", evidence: { ...finding.evidence, source: "notes.md:2-3" } }], summary });
+    const group: ConsensusGroup = { kind: "finding", sources: models.map((model) => ({ model, index: 0 })), votes: agreed(models) };
+    await finalizeAll(f.agent, "review", run.runId, [group]);
+    const review = await f.service.getReview("review");
+    assert.equal(review.threads.length, 1);
+    const thread = first(review.threads);
+    assert.equal(thread.agentReview?.severity, "required");
+    assert.match(JSON.stringify(thread.agentReview?.contributions), /"severity":"optional"/);
+    assert.match(JSON.stringify(thread.agentReview?.contributions), /"startLine":2,"endLine":3/);
+    assert.equal(thread.agentReview?.contributions?.[1]?.evidence.source, "notes.md:2-3");
+    const approval = await f.agent.approve("review", thread.threadId, "r2");
+    const context = await f.service.promptContext("review", thread.threadId);
+    const message = required(context.thread.messages.find((item) => item.messageId === approval.messageId));
+    const prompt = buildCommentPrompt({ ...context, message, instanceId: "c", learning: "off" }).prompt;
+    assert.match(prompt, /"severity": "optional"/);
+    assert.match(prompt, /"startLine": 2/);
+    assert.match(prompt, /"source": "notes.md:2-3"/);
+});
+
+test("FYI contributions cannot become approvable when grouped with actionable findings", async (t) => {
+    const f = await fixture(t);
+    const run = await f.agent.start("review", input, "c");
+    await f.agent.report("review", { runId: run.runId, model: models[0], findings: [finding], summary });
+    await f.agent.report("review", { runId: run.runId, model: models[1], findings: [{ ...finding, kind: "file", severity: "fyi" }], summary });
+    const group: ConsensusGroup = { kind: "finding", sources: models.map((model) => ({ model, index: 0 })), votes: agreed(models) };
+    await finalizeAll(f.agent, "review", run.runId, [group]);
+    const thread = first((await f.service.getReview("review")).threads);
+    assert.equal(thread.agentReview?.severity, "required");
+    assert.equal(thread.agentReview?.contributions?.[1]?.severity, "fyi");
+    await assert.rejects(f.agent.approve("review", thread.threadId, "r1"), /Only confirmed, actionable/);
+    assert.equal((await f.service.getReview("review")).threads[0].messages.length, 1);
+});
+
+test("unanimously equivalent findings on disjoint lines retain both original anchors", async (t) => {
+    const f = await fixture(t);
+    f.snapshot.files = parseUnifiedDiff("diff --git a/notes.md b/notes.md\n--- a/notes.md\n+++ b/notes.md\n@@ -1 +1,3 @@\n-old\n+new one\n+new two\n+new three\n");
+    f.snapshot.fingerprint = "separate";
+    await f.service.refresh("review");
+    const run = await f.agent.start("review", { ...input, revisionId: "r2" }, "c");
+    await f.agent.report("review", { runId: run.runId, model: models[0], findings: [{ ...finding, startLine: 1 }], summary });
+    const second = { ...finding, startLine: 3, body: "Restore the same constraint.",
+        evidence: { ...finding.evidence, source: "notes.md:3" } };
+    await f.agent.report("review", { runId: run.runId, model: models[1], findings: [second], summary });
+    const candidates = (await f.agent.input("review", { runId: run.runId })).run.results.map((result) => first(result.candidates));
+    const group: ConsensusGroup = { kind: "finding", sources: models.map((model) => ({ model, index: 0 })), votes: agreed(models) };
+    await finalizeAll(f.agent, "review", run.runId, [group]);
+    const threads = (await f.service.getReview("review")).threads;
+    assert.equal(threads.length, 1);
+    const contributions = required(first(threads).agentReview?.contributions);
+    assert.deepEqual(contributions.map((item) => item.anchor), candidates.map((candidate) => candidate.anchor));
+    assert.deepEqual(contributions[1].evidence, second.evidence);
+    const approval = await f.agent.approve("review", first(threads).threadId, "r2");
+    const context = await f.service.promptContext("review", first(threads).threadId);
+    const message = required(context.thread.messages.find((item) => item.messageId === approval.messageId));
+    const prompt = buildCommentPrompt({ ...context, message, instanceId: "c", learning: "off" }).prompt;
+    assert.match(prompt, /"startLine": 3/);
+    assert.match(prompt, /"source": "notes.md:3"/);
+    assert.match(prompt, /"selectedLines": \[\s*"new three"/);
+});
+
+test("equivalent file and line findings share one action regardless of source order", async (t) => {
+    for (const fileFirst of [true, false]) {
+        const f = await fixture(t);
+        const run = await f.agent.start("review", input, "c");
+        const fileFinding = { ...finding, kind: "file", body: "Restore the original constraint in this file." };
+        const reports = fileFirst ? [fileFinding, finding] : [finding, fileFinding];
+        for (const [index, model] of models.entries()) {
+            await f.agent.report("review", { runId: run.runId, model, findings: [reports[index]], summary });
+        }
+        const candidates = (await f.agent.input("review", { runId: run.runId })).run.results.map((result) => first(result.candidates));
+        const group: ConsensusGroup = { kind: "finding", sources: models.map((model) => ({ model, index: 0 })), votes: agreed(models) };
+        await finalizeAll(f.agent, "review", run.runId, [group]);
+        const threads = (await f.service.getReview("review")).threads;
+        assert.equal(threads.length, 1);
+        assert.deepEqual(first(threads).agentReview?.contributions?.map((item) => item.kind), reports.map((item) => item.kind));
+        assert.deepEqual(first(threads).agentReview?.contributions?.map((item) => item.anchor), candidates.map((candidate) => candidate.anchor));
+        await f.agent.approve("review", first(threads).threadId, "r1");
+    }
+});
+
+test("disagreement or uncertainty prevents publishing a mixed-location group", async (t) => {
+    for (const decision of ["disagree", "uncertain"] as const) {
+        const f = await fixture(t);
+        const run = await f.agent.start("review", input, "c");
+        assert.match(f.sent[0].prompt ?? "", /agree only if all describe the same underlying issue AND remedy/);
+        await f.agent.report("review", { runId: run.runId, model: models[0], findings: [finding], summary });
+        await f.agent.report("review", { runId: run.runId, model: models[1], findings: [{ ...finding, kind: "file" }], summary });
+        const votes = agreed(models);
+        votes[1] = { ...required(votes[1]), decision };
+        const group: ConsensusGroup = { kind: "finding", sources: models.map((model) => ({ model, index: 0 })), votes };
+        await finalizeAll(f.agent, "review", run.runId, [group]);
+        const review = await f.service.getReview("review");
+        assert.equal(review.threads.length, 0);
+        assert.equal(first(required(review.agentReviews)).consensus?.[0]?.votes[1]?.decision, decision);
+    }
+});
+
+test("equivalent findings on opposite diff sides preserve each side", async (t) => {
+    const f = await fixture(t);
+    const run = await f.agent.start("review", input, "c");
+    await f.agent.report("review", { runId: run.runId, model: models[0], findings: [finding], summary });
+    await f.agent.report("review", { runId: run.runId, model: models[1], findings: [{ ...finding, side: "old" }], summary });
+    const group: ConsensusGroup = { kind: "finding", sources: models.map((model) => ({ model, index: 0 })), votes: agreed(models) };
+    await finalizeAll(f.agent, "review", run.runId, [group]);
+    const thread = first((await f.service.getReview("review")).threads);
+    assert.deepEqual(thread.agentReview?.contributions?.map((item) => item.anchor?.side), ["new", "old"]);
+    await f.agent.approve("review", thread.threadId, "r1");
+});
+
+test("findings in different files or overview scopes cannot be grouped", async (t) => {
+    for (const mismatch of ["file", "overview"]) {
+        const f = await fixture(t);
+        f.snapshot.files = parseUnifiedDiff("diff --git a/notes.md b/notes.md\n--- a/notes.md\n+++ b/notes.md\n@@ -1 +1 @@\n-old\n+new\n"
+            + "diff --git a/other.md b/other.md\n--- a/other.md\n+++ b/other.md\n@@ -1 +1 @@\n-old\n+new\n");
+        f.snapshot.fingerprint = `scope-${mismatch}`;
+        await f.service.refresh("review");
+        const run = await f.agent.start("review", { ...input, revisionId: "r2" }, "c");
+        await f.agent.report("review", { runId: run.runId, model: models[0], findings: [finding], summary });
+        const second = mismatch === "file" ? { ...finding, path: "other.md" } : { ...finding, kind: "overview" };
+        await f.agent.report("review", { runId: run.runId, model: models[1], findings: [second], summary });
+        const group: ConsensusGroup = { kind: "finding", sources: models.map((model) => ({ model, index: 0 })), votes: agreed(models) };
+        await assert.rejects(finalizeAll(f.agent, "review", run.runId, [group]), /matching scope, path/);
+        assert.equal((await f.service.getReview("review")).threads.length, 0);
+    }
+});
+
+test("distinct claims remain separate without explicit consolidation even when their lines overlap", async (t) => {
+    const f = await fixture(t);
+    f.snapshot.files = parseUnifiedDiff("diff --git a/notes.md b/notes.md\n--- a/notes.md\n+++ b/notes.md\n@@ -1 +1,4 @@\n-old\n+one\n+two\n+three\n+four\n");
+    f.snapshot.fingerprint = "overlap-chain";
+    await f.service.refresh("review");
+    const reviewers = ["a", "b", "c"];
+    const run = await f.agent.start("review", { ...input, models: reviewers, revisionId: "r2" }, "c");
+    for (const [index, model] of reviewers.entries()) {
+        await f.agent.report("review", { runId: run.runId, model,
+            findings: [{ ...finding, startLine: index + 1, endLine: index + 2, body: `Distinct recommendation ${index + 1}.` }], summary });
+    }
+    await finalizeAll(f.agent, "review", run.runId);
+    assert.equal((await f.service.getReview("review")).threads.length, 3);
+});
+
+test("incompatible assessments, missing votes, and interrupted discussion fail closed", async (t) => {
+    const f = await fixture(t);
+    const run = await f.agent.start("review", input, "c");
+    await f.agent.report("review", { runId: run.runId, model: models[0], findings: [finding], summary });
+    await f.agent.report("review", { runId: run.runId, model: models[1], findings: [{ ...finding, assessment: "unverified" }], summary });
+    const group: ConsensusGroup = { kind: "finding", sources: models.map((model) => ({ model, index: 0 })), votes: agreed(models) };
+    await assert.rejects(finalizeAll(f.agent, "review", run.runId, [group]), /assessment/);
+    assert.equal((await f.service.getReview("review")).threads.length, 0);
+    const incomplete = await f.agent.finalize("review", { runId: run.runId, error: "Reviewer unavailable for discussion." });
+    assert.equal(incomplete.state, "partial");
+    assert.equal((await f.service.getReview("review")).threads.length, 0);
+    await assert.rejects(finalizeAll(f.agent, "review", run.runId, [group]), /already finalized/);
+});
+
+test("conflicting assessments remain separate and unverified findings cannot be approved", async (t) => {
+    const f = await fixture(t);
+    const run = await f.agent.start("review", input, "c");
+    await f.agent.report("review", { runId: run.runId, model: models[0], findings: [finding], summary });
+    await f.agent.report("review", { runId: run.runId, model: models[1], findings: [{ ...finding, assessment: "unverified" }], summary });
+    await finalizeAll(f.agent, "review", run.runId);
+    const threads = (await f.service.getReview("review")).threads;
+    assert.equal(threads.length, 2);
+    await assert.rejects(f.agent.approve("review", required(threads[1]).threadId, "r1"), /Only confirmed/);
+});
+
+test("in-progress legacy runs retain their original reporting behavior", async (t) => {
+    const f = await fixture(t);
+    const run = await f.agent.start("review", input, "c");
+    await f.store.updateReview("review", (review) => {
+        const saved = first(required(required(review).agentReviews));
+        delete saved.protocol;
+        return { review: required(review) };
+    });
+    await f.agent.report("review", { runId: run.runId, model: models[0], findings: [finding], summary });
+    assert.equal((await f.service.getReview("review")).threads.length, 1);
+    const done = await f.agent.report("review", { runId: run.runId, model: models[1], findings: [], summary });
+    assert.equal(done.state, "completed");
 });
 
 test("results require the requested model, owning session, valid scope, and pinned diff locations", async (t) => {
@@ -434,8 +718,9 @@ test("clean, partial, failed, and closed reviews are distinct", async (t) => {
     assert.equal(run.state, "partial");
     assert.equal(first(run.results).state, "completed");
     assert.equal(required(run.results[1]).error, "Model unavailable");
-    run = await f.agent.start("review", { ...input, models: [models[0]] }, "c");
-    run = await f.agent.report("review", { runId: run.runId, model: models[0], error: "No model-selectable subagent tool" });
+    run = await f.agent.start("review", input, "c");
+    await f.agent.report("review", { runId: run.runId, model: models[0], error: "No model-selectable subagent tool" });
+    run = await f.agent.report("review", { runId: run.runId, model: models[1], error: "Reviewer unavailable" });
     assert.equal(run.state, "failed");
     run = await f.agent.start("review", input, "c");
     assert.equal((await f.agent.close("review", run.runId)).state, "closed");
@@ -453,7 +738,7 @@ test("delivery failures and dead sending claims are explicit, and early results 
         await early.agent.report("review", { runId: run.runId, model: models[0], findings: [], summary });
         return "early";
     } });
-    assert.equal((await early.agent.start("review", { ...input, models: [models[0]] }, "c")).state, "completed");
+    assert.equal((await early.agent.start("review", input, "c")).state, "running");
     await early.store.updateReview("review", (review) => {
         const current = required(review);
         first(required(current.agentReviews)).state = "sending";
@@ -467,7 +752,9 @@ test("delivery failures and dead sending claims are explicit, and early results 
 test("approval is explicit and idempotent; stale results remain discussable but cannot be approved", async (t) => {
     const f = await fixture(t);
     const run = await f.agent.start("review", input, "c");
-    await f.agent.report("review", { runId: run.runId, model: models[0], findings: [finding], summary });
+    await f.agent.report("review", { runId: run.runId, model: models[0], findings: [finding, { ...finding, kind: "file" }], summary });
+    await f.agent.report("review", { runId: run.runId, model: models[1], findings: [], summary });
+    await finalizeAll(f.agent, "review", run.runId);
     const thread = first((await f.service.getReview("review")).threads);
     const [a, b] = await Promise.all([f.agent.approve("review", thread.threadId, "r1"), f.agent.approve("review", thread.threadId, "r1")]);
     assert.equal(a.messageId, b.messageId);
@@ -490,7 +777,6 @@ test("approval is explicit and idempotent; stale results remain discussable but 
     assert.match(buildCommentPrompt({ ...ctx, message: discussion.message, instanceId: "c", learning: "off" }).prompt, /without implementing/);
     f.snapshot.fingerprint = "two";
     await f.service.refresh("review");
-    await f.agent.report("review", { runId: run.runId, model: models[1], findings: [{ ...finding, kind: "file" }], summary });
     const stale = (await f.service.getReview("review")).threads[1];
     assert.equal(stale.agentReview?.revisionId, "r1");
     await assert.rejects(f.agent.approve("review", stale.threadId, "r2"), /older diff/);
@@ -499,10 +785,12 @@ test("approval is explicit and idempotent; stale results remain discussable but 
 
 test("pre-existing, rejected, unverified, informational and legacy findings stay discussable but cannot be approved", async (t) => {
     const f = await fixture(t);
-    const run = await f.agent.start("review", { ...input, models: [models[0]] }, "c");
+    const run = await f.agent.start("review", input, "c");
     const findings = ["confirmed", "pre-existing", "rejected", "unverified"].map((assessment) => ({ ...finding, assessment }));
     findings.push({ ...finding, severity: "fyi" });
     await f.agent.report("review", { runId: run.runId, model: models[0], findings, summary });
+    await f.agent.report("review", { runId: run.runId, model: models[1], findings: [], summary });
+    await finalizeAll(f.agent, "review", run.runId);
     const review = await f.service.getReview("review");
     for (const thread of review.threads.slice(1)) {
         await assert.rejects(f.agent.approve("review", thread.threadId, "r1"), /Only confirmed, actionable findings with evidence/);
@@ -597,7 +885,7 @@ test("review context exposes the baseline and caller guard; known outcomes persi
         sessionId: () => "session",
         send: async () => "queued",
     });
-    let run = await agent.start(reviewId, { ...input, models: [models[0]], intent: "Check CONTRACT.md, including the equality boundary." }, "c");
+    let run = await agent.start(reviewId, { ...input, intent: "Check CONTRACT.md, including the equality boundary." }, "c");
     const read = (extra: { side?: unknown; startLine?: unknown; hunkIndex?: unknown }) =>
         agent.input(reviewId, { runId: run.runId, path: "quota.mjs", ...extra });
     const old = await read({ side: "old" });
@@ -631,6 +919,8 @@ test("review context exposes the baseline and caller guard; known outcomes persi
             assessed("rejected", "A different actor can allocate from this account.", "Both versions preserve the owner check.", "The reachable allocate caller checks actor against account.owner before invoking canAllocate; the claim is disproved."),
         ],
     });
+    await agent.report(reviewId, { runId: run.runId, model: models[1], findings: [], summary });
+    await finalizeAll(agent, reviewId, run.runId);
     const threads = (await service.getReview(reviewId)).threads;
     assert.deepEqual(threads.map((thread) => thread.agentReview?.assessment), ["confirmed", "pre-existing", "rejected"]);
     await agent.approve(reviewId, first(threads).threadId, "r1");
@@ -645,8 +935,10 @@ test("review context exposes the baseline and caller guard; known outcomes persi
     const pinnedOld = availableContent((await read({ side: "old" })).content);
     assert.match(required(pinnedOld.lines[1]), /<=/, "base evidence remains pinned after local edits");
     await service.refresh(reviewId);
-    run = await agent.start(reviewId, { ...input, models: [models[0]], revisionId: (await service.getReview(reviewId)).currentRevisionId }, "c");
-    const clean = await agent.report(reviewId, { runId: run.runId, model: models[0], findings: [], summary: "Simulated clean-diff result: no new defects; the old charge issue remains. Source inspection only; tests not run." });
+    run = await agent.start(reviewId, { ...input, revisionId: (await service.getReview(reviewId)).currentRevisionId }, "c");
+    await agent.report(reviewId, { runId: run.runId, model: models[0], findings: [], summary: "Simulated clean-diff result: no new defects; the old charge issue remains. Source inspection only; tests not run." });
+    await agent.report(reviewId, { runId: run.runId, model: models[1], findings: [], summary });
+    const clean = await finalizeAll(agent, reviewId, run.runId);
     assert.equal(clean.state, "completed");
     assert.deepEqual(first(clean.results).threadIds, [], "a clean diff must not fabricate a new finding");
 });
@@ -771,6 +1063,8 @@ test("HTTP start, model reporting, approval, and discussion use the real deliver
     assert.equal(res.status, 200);
     const run = await res.json();
     await f.agent.report("review", { runId: run.runId, model: models[0], findings: [finding, { ...finding, assessment: "unverified" }], summary });
+    await f.agent.report("review", { runId: run.runId, model: models[1], findings: [], summary });
+    await finalizeAll(f.agent, "review", run.runId);
     const thread = (await f.service.getReview("review")).threads[0];
     const unverified = (await f.service.getReview("review")).threads[1];
     assert.equal(fixes.length, 0);
