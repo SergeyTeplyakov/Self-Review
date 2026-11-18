@@ -75,6 +75,11 @@ type ReviewMessage = {
     clientRequestId?: string;
 };
 type FindingEvidence = { source?: string; baseline?: string; validation?: string };
+type FindingContribution = {
+    model: string; body: string; evidence: FindingEvidence;
+    kind?: string; category?: string; assessment?: string; severity?: string; anchor?: ThreadAnchor | null;
+};
+type ConsensusVote = { model: string; decision: "agree" | "disagree" | "uncertain"; discussion: string; rationale: string };
 type FindingReport = {
     model: string;
     category: string;
@@ -84,6 +89,8 @@ type FindingReport = {
     revisionId: string;
     approvalMessageId?: string | null;
     runId: string;
+    contributions?: FindingContribution[];
+    votes?: ConsensusVote[];
 };
 type ReviewThread = {
     threadId: string;
@@ -122,6 +129,7 @@ type AgentReviewResult = {
     threadIds: string[];
     error?: string | null;
     summary?: string | null;
+    candidates?: unknown[];
     ponytail?: {
         status: string;
         summary: string;
@@ -139,6 +147,12 @@ type AgentReviewRun = {
     revisionId: string;
     models: string[];
     results: AgentReviewResult[];
+    protocol?: "consensus-v1";
+    consensus?: Array<{
+        kind: "finding" | "ponytail";
+        sources: Array<{ model: string; index: number }>;
+        votes: ConsensusVote[];
+    }>;
     intent?: string | null;
     skills?: Array<{ name: string; release?: string | null }>;
     error?: string | null;
@@ -353,6 +367,14 @@ function isFinding(value: unknown): value is FindingReport {
         || typeof value.assessment !== "string" || typeof value.severity !== "string"
         || typeof value.revisionId !== "string" || typeof value.runId !== "string"
         || !isOptionalString(value.approvalMessageId)) return false;
+    if (value.contributions !== undefined && (!Array.isArray(value.contributions) || !value.contributions.every((item) =>
+        isRecord(item) && typeof item.model === "string" && typeof item.body === "string" && isRecord(item.evidence)
+        && isOptionalString(item.evidence.source) && isOptionalString(item.evidence.baseline) && isOptionalString(item.evidence.validation)
+        && isOptionalString(item.kind) && isOptionalString(item.category) && isOptionalString(item.assessment) && isOptionalString(item.severity)
+        && (item.anchor === undefined || item.anchor === null || isAnchor(item.anchor))))) return false;
+    if (value.votes !== undefined && (!Array.isArray(value.votes) || !value.votes.every((vote) =>
+        isRecord(vote) && typeof vote.model === "string" && ["agree", "disagree", "uncertain"].includes(String(vote.decision))
+        && typeof vote.discussion === "string" && typeof vote.rationale === "string"))) return false;
     if (value.evidence === undefined || value.evidence === null) return true;
     return isRecord(value.evidence) && isOptionalString(value.evidence.source)
         && isOptionalString(value.evidence.baseline) && isOptionalString(value.evidence.validation);
@@ -385,9 +407,18 @@ function isAgentReviewRun(value: unknown): value is AgentReviewRun {
         || !Array.isArray(value.results) || !isOptionalString(value.intent) || !isOptionalString(value.error)) return false;
     if (value.skills !== undefined && (!Array.isArray(value.skills) || !value.skills.every((skill) =>
         isRecord(skill) && typeof skill.name === "string" && isOptionalString(skill.release)))) return false;
+    if (value.protocol !== undefined && value.protocol !== "consensus-v1") return false;
+    if (value.consensus !== undefined && (!Array.isArray(value.consensus) || !value.consensus.every((group) =>
+        isRecord(group) && (group.kind === "finding" || group.kind === "ponytail")
+        && Array.isArray(group.sources) && group.sources.every((source) => isRecord(source)
+            && typeof source.model === "string" && Number.isSafeInteger(source.index))
+        && Array.isArray(group.votes) && group.votes.every((vote) => isRecord(vote)
+            && typeof vote.model === "string" && ["agree", "disagree", "uncertain"].includes(String(vote.decision))
+            && typeof vote.discussion === "string" && typeof vote.rationale === "string")))) return false;
     return value.results.every((result) => {
         if (!isRecord(result) || typeof result.model !== "string" || !Array.isArray(result.threadIds)
             || !result.threadIds.every((id) => typeof id === "string")
+            || (result.candidates !== undefined && !Array.isArray(result.candidates))
             || !isOptionalString(result.error) || !isOptionalString(result.summary)) return false;
         if (result.ponytail === undefined || result.ponytail === null) return true;
         return isRecord(result.ponytail) && typeof result.ponytail.status === "string"
@@ -1363,10 +1394,10 @@ function renderTop() {
         const running = r.agentReviews?.some((run) => ["sending", "queued", "running"].includes(run.state));
         const defaults = state.agentReviewSettings;
         const hint = defaults?.skipDialog
-            ? `Run with saved defaults: ${defaults.models.join(", ")} (${defaults.focus}). May consume credits.`
-            : "Configure and run a read-only agentic review. May consume credits.";
+            ? `Run with saved defaults: ${defaults.models.join(", ")} (${defaults.focus}). Review, discussion and voting calls may consume credits.`
+            : "Configure and run a read-only review, discussion and vote. These calls may consume credits.";
         workflows.push(`<section class="review-lane agent-review-lane" aria-labelledby="agentic-review-title">`
-            + `<div class="review-lane-heading"><h2 id="agentic-review-title">Agentic review</h2><p class="muted">Independent, read-only model review. May consume credits.</p></div>`
+            + `<div class="review-lane-heading"><h2 id="agentic-review-title">Agentic review</h2><p class="muted">Read-only review, discussion and voting by selected models may consume credits. Only unanimous findings are published.</p></div>`
             + `<div class="review-lane-actions">`
             + `<button class="primary agent-review-launch" data-action="agent-review" title="${esc(hint)}"${running || state.startingReview ? " disabled" : ""}>${running ? "Agentic review running" : state.startingReview ? "Queuing review..." : "Run agentic review"}</button>`
             + `<button data-action="agent-review-configure" title="Configure reviewers, focus, guidance, review skills, and user-wide defaults">Review settings</button>`
@@ -1543,10 +1574,10 @@ function agentReviewDialogHtml(d: AgentReviewDialog): string {
     return `<div class="modal-backdrop" data-action="dialog-backdrop"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby="dialog-desc">`
         + (d.settingsOnly
             ? `<h2 id="dialog-title">Agent review settings</h2><p id="dialog-desc">Configure reviewers, focus, guidance, and review skills. Saving never starts a review; use Run agentic review in the toolbar.</p>`
-            : `<h2 id="dialog-title">Agentic review</h2><p id="dialog-desc">Review ${esc(d.revisionId)} (${esc(d.scope)}). Each selected model reviews independently and may consume credits. No files are changed until you approve a suggestion or explicitly request a fix.</p>`)
+            : `<h2 id="dialog-title">Agentic review</h2><p id="dialog-desc">Review ${esc(d.revisionId)} (${esc(d.scope)}). Selected models review independently, discuss, and vote; these additional calls may consume credits. Only unanimous findings are published. An unavailable reviewer prevents publication. No files are changed until you approve a suggestion or explicitly request a fix.</p>`)
         + reviewTabsHtml(d)
         + `<div role="tabpanel" id="review-panel-general" aria-labelledby="review-tab-general"${d.tab === "general" ? "" : " hidden"}>`
-        + `<label class="review-field">Reviewers (one to four model IDs, comma-separated)<input name="review-models" value="${esc(d.models)}" maxlength="483" autocomplete="off"${d.saving ? " disabled" : ""}></label>`
+        + `<label class="review-field">Reviewers (two to four model IDs, comma-separated)<input name="review-models" value="${esc(d.models)}" maxlength="483" autocomplete="off"${d.saving ? " disabled" : ""}></label>`
         + `<p class="muted">Use exact model IDs available in your Copilot session, or copilot-fusion to run Copilot Fusion in a child session that reports back later. An unavailable reviewer is reported as a failure, never silently replaced.</p>`
         + `<label class="review-field"><span id="review-focus-label">Focus</span><select name="review-focus" aria-labelledby="review-focus-label"${d.saving ? " disabled" : ""}>${options.map(([value, label]) => `<option value="${value}"${d.focus === value ? " selected" : ""}>${label}</option>`).join("")}</select></label>`
         + `<label class="review-field">Goal, spec, or review guidance (optional)<textarea name="review-intent" maxlength="4000" rows="3" placeholder="Acceptance criteria, a spec reference, or focused review guidance"${d.saving ? " disabled" : ""}>${esc(d.intent)}</textarea></label>`
@@ -1650,7 +1681,7 @@ function applyReviewSkills(): void {
 async function runAgentReview(): Promise<void> {
     if (!state.agentReviewAvailable || !state.review || state.dialog || state.startingReview
         || state.review.agentReviews?.some((run) => ["sending", "queued", "running"].includes(run.state))) return;
-    if (!state.agentReviewSettings?.skipDialog || state.agentReviewSettingsError) {
+    if (!state.agentReviewSettings?.skipDialog || state.agentReviewSettings.models.length < 2 || state.agentReviewSettingsError) {
         openAgentReview();
         return;
     }
@@ -1664,7 +1695,7 @@ async function runAgentReview(): Promise<void> {
             toast("The review scope or revision changed. Confirm the current review before starting.");
             return;
         }
-        if (!state.agentReviewSettings?.skipDialog || state.agentReviewSettingsError) {
+        if (!state.agentReviewSettings?.skipDialog || state.agentReviewSettings.models.length < 2 || state.agentReviewSettingsError) {
             openAgentReview();
             return;
         }
@@ -1702,6 +1733,8 @@ function agentReviewsHtml(): string {
     const active = (r: AgentReviewRun) => ["sending", "queued", "running"].includes(r.state);
     return `<h3>Review runs</h3><p class="muted">Assessments and verification are reported by the coordinating agent, not independently attested by the canvas.</p>${[...runs].reverse().map((r) => `<div class="card agent-review-run">`
         + `<strong>${esc(r.focus)}: ${esc(r.state)}</strong> <span class="pill">${agentComments().filter((thread) => thread.agentReview.runId === r.runId).length} agent comments</span> <span class="muted">${esc(r.revisionId)}${r.revisionId !== review?.currentRevisionId ? " (older diff)" : ""}</span>`
+        + (r.consensus?.some((group) => group.votes.some((vote) => vote.decision !== "agree"))
+            ? `<p class="muted">${r.consensus.filter((group) => group.votes.some((vote) => vote.decision !== "agree")).length} candidates did not reach unanimous agreement and were not published.</p>` : "")
         + (r.intent ? `<p class="review-summary">Goal / spec / guidance: ${esc(r.intent)}</p>` : "")
         + (r.skills?.length ? `<p class="review-summary">Bundled skills supplied: ${esc(r.skills.map((skill) => skill.release ? `${skill.name} (${skill.release})` : skill.name).join(", "))}. See actual use and limits in each result.</p>` : "")
         + (r.error ? `<p class="err">${esc(r.error)}</p>` : "")
@@ -1718,13 +1751,37 @@ function agentReviewsHtml(): string {
                         const key = typeof assessment === "string" && Object.hasOwn(FINDING_ASSESSMENTS, assessment) ? assessment : "unverified";
                         counts[key] = (counts[key] ?? 0) + 1;
                     }
-                    outcome = result.threadIds.length ? Object.keys(FINDING_ASSESSMENTS).filter((key) => counts[key]).map((key) => `${counts[key]} ${key}`).join(", ") : "No findings reported";
+                    outcome = result.threadIds.length ? Object.keys(FINDING_ASSESSMENTS).filter((key) => counts[key]).map((key) => `${counts[key]} ${key}`).join(", ")
+                        : r.protocol === "consensus-v1" && active(r) ? "Awaiting discussion and consensus"
+                            : r.protocol === "consensus-v1" ? "No agreed findings published" : "No findings reported";
                     outcome += `<details><summary>Coverage and verification</summary><p class="review-summary">${esc(result.summary ?? "No coverage or verification summary recorded.")}</p></details>`;
                     if (result.ponytail) {
                         const report = result.ponytail;
-                        outcome += `<details><summary>Ponytail: ${report.status === "used" ? report.benefits.length ? `${report.benefits.length} supported opportunities` : "no supported benefits" : "unavailable / not loaded"}</summary>`
+                        const groupFor = (index: number) => r.consensus?.find((group) => group.kind === "ponytail"
+                            && group.sources.some((source) => source.model === model && source.index === index));
+                        const isAgreed = (index: number) => {
+                            const group = groupFor(index);
+                            return !!group && group.votes.length === r.models.length && group.votes.every((vote) => vote.decision === "agree");
+                        };
+                        const agreedCount = r.protocol === "consensus-v1"
+                            ? report.benefits.filter((_, index) => isAgreed(index)).length : report.benefits.length;
+                        const ponytailStatus = report.status !== "used" ? "unavailable / not loaded"
+                            : r.protocol === "consensus-v1" && active(r) ? "awaiting consensus"
+                                : agreedCount ? `${agreedCount} ${r.protocol === "consensus-v1" ? "agreed" : "supported"} opportunities`
+                                    : r.protocol === "consensus-v1" ? "no agreed opportunities" : "no supported benefits";
+                        outcome += `<details><summary>Ponytail: ${ponytailStatus}</summary>`
                             + `<p class="review-summary">${esc(report.summary)}</p>`
-                            + report.benefits.map((entry) => `<div class="review-summary"><strong>${esc(entry.proposal)}</strong><p>${esc(entry.benefit)}</p><p>Source: ${esc(entry.evidence.source)}<br>Baseline: ${esc(entry.evidence.baseline)}<br>Validation/limits: ${esc(entry.evidence.validation)}</p></div>`).join("")
+                            + report.benefits.map((entry, index) => {
+                                const status = r.protocol !== "consensus-v1" ? ""
+                                    : isAgreed(index) ? "Agreed"
+                                        : groupFor(index) ? "Not agreed (not published)"
+                                            : active(r) ? "Awaiting consensus (not published)" : "Not finalized (not published)";
+                                return `<div class="review-summary"><strong>${esc(entry.proposal)}</strong>${status ? ` <span class="muted">${esc(status)}</span>` : ""}<p>${esc(entry.benefit)}</p><p>Source: ${esc(entry.evidence.source)}<br>Baseline: ${esc(entry.evidence.baseline)}<br>Validation/limits: ${esc(entry.evidence.validation)}</p></div>`;
+                            }).join("")
+                            + (r.consensus?.filter((group) => group.kind === "ponytail"
+                                && group.sources.some((source) => source.model === model)
+                                && group.votes.every((vote) => vote.decision === "agree")).map((group) =>
+                                `<p>${group.votes.map((vote) => `${esc(vote.model)}: ${esc(vote.decision)} — ${esc(vote.rationale)}`).join("<br>")}</p>`).join("") ?? "")
                             + `</details>`;
                     }
                 }
@@ -2084,6 +2141,17 @@ function findingApprovalIssue(finding: FindingReport): string {
     if (fields.some((key) => typeof finding.evidence?.[key] !== "string" || !finding.evidence[key]?.trim())) {
         return "Evidence is missing; run a fresh review or use Discuss.";
     }
+    if (finding.contributions?.some((item) => item.assessment !== undefined && item.assessment !== "confirmed")) {
+        return "A reviewer did not confirm this finding; discuss the assessment.";
+    }
+    if (finding.contributions?.some((item) => item.severity !== undefined
+        && (!Object.hasOwn(FINDING_SEVERITIES, item.severity) || item.severity === "fyi"))) {
+        return "A reviewer marked this finding FYI or non-actionable; use Discuss.";
+    }
+    if (finding.contributions?.some((item) => fields.some((key) =>
+        typeof item.evidence?.[key] !== "string" || !item.evidence[key]?.trim()))) {
+        return "Reviewer evidence is missing; run a fresh review or use Discuss.";
+    }
     return "";
 }
 
@@ -2092,7 +2160,17 @@ function findingEvidenceHtml(finding: FindingReport | null | undefined): string 
     return `<details class="finding-evidence"><summary>Evidence and verification</summary><dl>`
         + ([["source", "Source / requirement"], ["baseline", "Baseline comparison"], ["validation", "Validation / limits"]] as const).map(([key, label]) =>
             `<dt>${label}</dt><dd>${typeof finding.evidence?.[key] === "string" ? md(finding.evidence[key]) : "Not recorded"}</dd>`).join("")
-        + `</dl></details>`;
+        + `</dl>`
+        + (finding.contributions?.map((item) => `<section><strong>${esc(item.model)}</strong>`
+            + (item.severity || item.assessment ? `<p>${esc(item.assessment ?? "Not recorded")} / ${esc(item.severity ?? "Not recorded")}</p>` : "")
+            + (item.anchor ? `<p>${esc(item.anchor.path)}${item.anchor.startLine != null ? ` · ${esc(item.anchor.side ?? "new")} ${esc(lineLabel(item.anchor))}` : ""}</p>` : "")
+            + `${md(item.body)}<dl>`
+            + ([["source", "Source / requirement"], ["baseline", "Baseline comparison"], ["validation", "Validation / limits"]] as const).map(([key, label]) =>
+                `<dt>${label}</dt><dd>${typeof item.evidence[key] === "string" ? md(item.evidence[key]) : "Not recorded"}</dd>`).join("")
+            + `</dl></section>`).join("") ?? "")
+        + (finding.votes?.length ? `<h4>Reviewer discussion and votes</h4>${finding.votes.map((vote) =>
+            `<p><strong>${esc(vote.model)}: ${esc(vote.decision)}</strong><br>${esc(vote.discussion)}<br>${esc(vote.rationale)}</p>`).join("")}` : "")
+        + `</details>`;
 }
 
 const replyKey = (threadId: string) => `reply:${threadId}`;
@@ -2123,7 +2201,7 @@ function threadHtml(t: ReviewThread, { showLocation = false }: { showLocation?: 
     const options = STATUSES.map((s) => `<option value="${s}"${s === t.status ? " selected" : ""}>${s === "wontfix" ? "won't fix" : s}</option>`).join("");
     const head = `<div class="thread-head">`
         + `<span class="badge kind">${t.kind === "change" ? "change" : t.kind}</span>`
-        + (t.agentReview ? `<span class="badge" title="Reported reviewer model">${esc(t.agentReview.model)} / ${esc(t.agentReview.category)}</span>` : "")
+        + (t.agentReview ? `<span class="badge" title="Reported reviewer models">${esc(t.agentReview.contributions?.map((item) => item.model).join(", ") || t.agentReview.model)} / ${esc(t.agentReview.category)}</span>` : "")
         + (t.agentReview ? `<span class="badge" title="Assessment reported by the coordinating agent">${esc(FINDING_ASSESSMENTS[t.agentReview.assessment] ?? "Unverified")}</span><span class="badge">${esc(FINDING_SEVERITIES[t.agentReview.severity] ?? "Severity not reported")}</span>` : "")
         + `<span class="loc">${showLocation ? `<button class="link" data-action="jump" data-thread="${esc(t.threadId)}">${esc(locLabel(t))}</button>` : esc(locLabel(t))}`
         + (moved && anchor ? ` <span class="muted" title="Line numbers changed since ${esc(anchor.revisionId)}">(originally ${esc(lineLabel(anchor))} in ${esc(anchor.revisionId)})</span>` : "")

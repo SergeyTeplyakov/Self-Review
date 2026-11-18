@@ -541,7 +541,7 @@ test("bundled skill loading failures keep unsaved choices and can be retried", a
 });
 
 test("skill defaults require explicit opt-in; Save defaults never starts a review and choices reach one-click runs", async () => {
-    const defaults = { models: ["model-a"], focus: "review", intent: "", skipDialog: true };
+    const defaults = { models: ["model-a", "model-b"], focus: "review", intent: "", skipDialog: true };
     const { app, posts, click } = await skillsApp(bundledCatalog(), { defaults });
     await click("agent-review-configure");
     await settle();
@@ -739,7 +739,7 @@ test("one-click run skips the dialog, uses the current revision, and guards repe
     app.run("loadState = async () => {}");
     app.state.review = reviewFixture();
     app.state.agentReviewAvailable = true;
-    app.state.agentReviewSettings = { models: ["model-a"], focus: "both", intent: "", skipDialog: true };
+    app.state.agentReviewSettings = { models: ["model-a", "model-b"], focus: "both", intent: "", skipDialog: true };
     const first = clicker(app)("agent-review");
     await clicker(app)("agent-review");
     assert.equal(app.state.dialog, null);
@@ -750,19 +750,29 @@ test("one-click run skips the dialog, uses the current revision, and guards repe
     assert.equal(app.state.startingReview, false);
 });
 
+test("legacy one-model defaults open the dialog instead of starting a review", async () => {
+    const app = await loadApp();
+    app.state.review = reviewFixture();
+    app.state.agentReviewAvailable = true;
+    app.state.agentReviewSettings = { models: ["model-a"], focus: "both", skipDialog: true };
+    await clicker(app)("agent-review");
+    assert.equal(dialog(app).models, "model-a");
+    assert.match(app.node("#dialog").innerHTML, /two to four model IDs/);
+});
+
 test("one-click run reloads defaults and requires the same scope and revision", async () => {
     const app = await loadApp();
     app.run('loadState = async () => { state.agentReviewSettings = { models: ["updated-model"], focus: "review", skipDialog: false }; }');
     app.state.review = reviewFixture();
     app.state.agentReviewAvailable = true;
-    app.state.agentReviewSettings = { models: ["stale-model"], focus: "both", skipDialog: true };
+    app.state.agentReviewSettings = { models: ["stale-model", "model-b"], focus: "both", skipDialog: true };
     await clicker(app)("agent-review");
     assert.equal(app.state.dialog?.type, "agent-review");
     assert.equal(dialog(app).models, "updated-model");
     assert.equal(app.state.startingReview, false);
 
     app.state.dialog = null;
-    app.state.agentReviewSettings = { models: ["model-a"], focus: "both", skipDialog: true };
+    app.state.agentReviewSettings = { models: ["model-a", "model-b"], focus: "both", skipDialog: true };
     app.run('loadState = async () => { state.review = { ...state.review, reviewId: "other-scope" }; }');
     await clicker(app)("agent-review");
     assert.equal(app.state.dialog, null);
@@ -770,7 +780,7 @@ test("one-click run reloads defaults and requires the same scope and revision", 
     assert.match(app.node("#toast").textContent, /scope or revision changed/);
 
     app.state.review = reviewFixture();
-    app.state.agentReviewSettings = { models: ["model-a"], focus: "both", skipDialog: true };
+    app.state.agentReviewSettings = { models: ["model-a", "model-b"], focus: "both", skipDialog: true };
     app.run('loadState = async () => { state.review = { ...state.review, currentRevisionId: "r2" }; }');
     await clicker(app)("agent-review");
     assert.equal(app.state.dialog, null);
@@ -837,7 +847,7 @@ test("one-click failures surface errors and release the button even if reloading
         app.run(reloadFails ? 'loadState = async () => { throw new Error("State reload failed"); }' : "loadState = async () => {}");
         app.state.review = reviewFixture();
         app.state.agentReviewAvailable = true;
-        app.state.agentReviewSettings = { models: ["model-a"], focus: "both", skipDialog: true };
+        app.state.agentReviewSettings = { models: ["model-a", "model-b"], focus: "both", skipDialog: true };
         await clicker(app)("agent-review");
         assert.equal(app.state.startingReview, false);
         assert.equal(app.state.dialog, null);
@@ -967,6 +977,103 @@ test("agent review results distinguish findings, assessments, limits, and missin
     assert.match(html, /older diff/);
     assert.match(html, /does not stop agents already running/);
     assert.doesNotMatch(html, /<bad-model>|<failed>|<coverage>|<goal>/);
+});
+
+test("Ponytail run details retain each contributing model's wording and evidence", async () => {
+    const app = await loadApp();
+    const models = ["model-a", "model-b"];
+    app.state.review = reviewFixture({
+        agentReviews: [{
+            runId: "ar-one", state: "completed", focus: "both", revisionId: "r1", protocol: "consensus-v1", models,
+            results: models.map((model, index) => ({
+                model, state: "completed", threadIds: [], summary: "Inspected the diff.",
+                ponytail: { status: "used", summary: "Checked opportunities.", benefits: [{
+                    proposal: `Proposal ${index}`, benefit: `Benefit ${index}`,
+                    evidence: { source: `Source ${index}`, baseline: `Baseline ${index}`, validation: `Validation ${index}` },
+                }] },
+            })),
+            consensus: [{
+                kind: "ponytail", sources: models.map((model) => ({ model, index: 0 })),
+                votes: models.map((model) => ({ model, decision: "agree", discussion: "Discussed.", rationale: "Supported." })),
+            }],
+        }],
+    });
+    const html = app.run("agentReviewsHtml()");
+    for (const index of [0, 1]) {
+        for (const field of ["Proposal", "Benefit", "Source", "Baseline", "Validation"]) {
+            assert.match(html, new RegExp(`${field} ${index}`));
+        }
+    }
+});
+
+test("Ponytail run details label and retain agreed, disputed, pending, and incomplete evidence", async () => {
+    const app = await loadApp();
+    const benefit = (label: string) => ({
+        proposal: `${label} proposal`, benefit: `${label} benefit`,
+        evidence: { source: `${label} source`, baseline: `${label} baseline`, validation: `${label} validation` },
+    });
+    const result = (benefits: ReturnType<typeof benefit>[]) => ({
+        model: "model-a", state: "completed", threadIds: [], summary: "Inspected.",
+        ponytail: { status: "used", summary: "Checked opportunities.", benefits },
+    });
+    const votes = (decision: string) => [
+        { model: "model-a", decision: "agree", discussion: "Discussed.", rationale: "Supported." },
+        { model: "model-b", decision, discussion: "Discussed.", rationale: "Reviewed." },
+    ];
+    app.state.review = reviewFixture({ agentReviews: [
+        { runId: "completed", state: "completed", focus: "both", revisionId: "r1", protocol: "consensus-v1",
+            models: ["model-a", "model-b"], results: [result([benefit("Agreed"), benefit("Disputed")])],
+            consensus: [
+                { kind: "ponytail", sources: [{ model: "model-a", index: 0 }], votes: votes("agree") },
+                { kind: "ponytail", sources: [{ model: "model-a", index: 1 }], votes: votes("disagree") },
+            ] },
+        { runId: "running", state: "running", focus: "both", revisionId: "r1", protocol: "consensus-v1",
+            models: ["model-a"], results: [result([benefit("Pending")])] },
+        { runId: "partial", state: "partial", focus: "both", revisionId: "r1", protocol: "consensus-v1",
+            models: ["model-a"], results: [result([benefit("Incomplete")])] },
+    ] });
+    const html = app.run("agentReviewsHtml()");
+    assert.match(html, /Ponytail: 1 agreed opportunities/);
+    for (const [label, status] of [["Agreed", "Agreed"], ["Disputed", "Not agreed (not published)"], ["Pending", "Awaiting consensus (not published)"], ["Incomplete", "Not finalized (not published)"]]) {
+        const start = html.indexOf(`${label} proposal`);
+        assert.notEqual(start, -1, `${label} proposal is visible`);
+        const entry = html.slice(start, html.indexOf("</div>", start));
+        assert.match(entry, new RegExp(`${label} source`));
+        assert.match(entry, new RegExp(`${label} baseline`));
+        assert.match(entry, new RegExp(`${label} validation`));
+        assert.ok(entry.includes(status), `${label} is labeled ${status}`);
+    }
+});
+
+test("agreed finding exposes all reviewer evidence and votes without treating them as HTML", async () => {
+    const app = await loadApp();
+    const html = app.run<(finding: unknown) => string>("findingEvidenceHtml")({
+        model: "model-a", category: "issue", assessment: "confirmed", severity: "required",
+        runId: "run", revisionId: "r1", evidence: { source: "source", baseline: "base", validation: "checked" },
+        contributions: [
+            { model: "model-a", body: "Original", evidence: { source: "source", baseline: "base", validation: "checked" } },
+            { model: "model-b", body: "<script>alert(1)</script>", evidence: { source: "other", baseline: "old", validation: "verified" },
+                assessment: "confirmed", severity: "optional", anchor: { revisionId: "r1", path: "a.ts", side: "new", startLine: 2, endLine: 3 } },
+        ],
+        votes: [{ model: "model-b", decision: "agree", discussion: "<discussion>", rationale: "<reason>" }],
+    });
+    assert.match(html, /model-a/);
+    assert.match(html, /model-b/);
+    assert.match(html, /confirmed \/ optional/);
+    assert.match(html, /a\.ts.*new.*2/);
+    assert.match(html, /&lt;script&gt;/);
+    assert.match(html, /&lt;discussion&gt;/);
+    assert.doesNotMatch(html, /<script>|<discussion>|<reason>/);
+});
+
+test("FYI contribution disables approval even when the grouped severity is actionable", async () => {
+    const app = await loadApp();
+    const issue = app.run<(finding: unknown) => string>("findingApprovalIssue")({
+        assessment: "confirmed", severity: "required",
+        evidence: { source: "source", baseline: "baseline", validation: "validation" },
+        contributions: [{ model: "model-b", severity: "fyi", evidence: { source: "source", baseline: "baseline", validation: "validation" } }],
+    });
+    assert.match(issue, /FYI/);
 });
 
 test("model findings have Approve and Discuss controls; stale, closed, and approved findings cannot be approved again", async () => {

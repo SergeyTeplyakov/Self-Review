@@ -2,7 +2,7 @@ import { isRecord, REVIEW_FOCUSES, SUGGESTED_REVIEWERS } from "../web/contracts.
 export const agentReviewSettingsSchema = {
     type: "object",
     properties: {
-        models: { type: "array", minItems: 1, maxItems: 4, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 120 } },
+        models: { type: "array", minItems: 2, maxItems: 4, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 120 } },
         focus: { type: "string", enum: REVIEW_FOCUSES },
         intent: { type: "string", maxLength: 4000 },
         skipDialog: { type: "boolean", description: "An explicit Run agentic review click uses these defaults without reopening configuration. Does not auto-start reviews or authorize fixes." },
