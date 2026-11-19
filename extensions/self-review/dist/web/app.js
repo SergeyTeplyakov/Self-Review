@@ -614,8 +614,40 @@ function highlightFile(file) {
     highlightedFiles.set(file, rows);
     return rows;
 }
-const MD_RENDER_TOKENS = /\\[!-\/:-@[-`{-~]|`+|\*\*([^*\n]+)\*\*|!?\[/g;
-const MD_RENDER_LINK = /!?\[((?:\\.|[^\\\]\n])*)\]\(((?:\\[!-\/:-@[-`{-~]|[^\\()\s]|\((?:\\[!-\/:-@[-`{-~]|[^\\()\s])*\))*)(?:\s+(?:"[^"]*"|'[^']*'))?\s*\)/y;
+const MD_RENDER_TOKENS = /\\[!-\/:-@[-`{-~]|`+|\*\*|!?\[/g;
+const MD_RENDER_DESTINATION = /\(((?:\\[!-\/:-@[-`{-~]|[^\\()\s]|\((?:\\[!-\/:-@[-`{-~]|[^\\()\s])*\))*)(?:\s+(?:"[^"]*"|'[^']*'))?\s*\)/y;
+function closingCodeRun(text, from, length) {
+    const runs = /`+|\n/g;
+    runs.lastIndex = from;
+    for (let run = runs.exec(text); run && run[0] !== "\n"; run = runs.exec(text)) {
+        if (run[0].length === length)
+            return run;
+    }
+    return null;
+}
+function closingInlineDelimiter(text, from, kind) {
+    const delimiters = /\\[!-\/:-@[-`{-~]|`+|\*\*|[\[\]\n]/g;
+    delimiters.lastIndex = from;
+    let depth = 1;
+    for (let match = delimiters.exec(text); match && match[0] !== "\n"; match = delimiters.exec(text)) {
+        const [token] = match;
+        if (token.startsWith("`")) {
+            const close = closingCodeRun(text, delimiters.lastIndex, token.length);
+            if (close)
+                delimiters.lastIndex = close.index + close[0].length;
+        }
+        else if (kind === "bold" && token === "**") {
+            return match.index;
+        }
+        else if (kind === "label") {
+            if (token === "[")
+                depth++;
+            if (token === "]" && --depth === 0)
+                return match.index;
+        }
+    }
+    return -1;
+}
 function externalMarkdownUrl(destination) {
     const url = destination.replace(/\\([!-\/:-@[-`{-~])/g, "$1");
     if (!/^https?:\/\//i.test(url) || !URL.canParse(url))
@@ -630,35 +662,45 @@ function inline(text, allowLinks = true) {
     let html = "";
     let offset = 0;
     for (let match = tokens.exec(text); match; match = tokens.exec(text)) {
-        const [token, bold] = match;
+        const [token] = match;
         html += esc(text.slice(offset, match.index));
         if (token.startsWith("\\"))
             html += esc(token.slice(1));
         else if (token.startsWith("`")) {
-            const end = /`+/g;
-            end.lastIndex = tokens.lastIndex;
-            let close = end.exec(text);
-            while (close && close[0].length !== token.length)
-                close = end.exec(text);
+            const close = closingCodeRun(text, tokens.lastIndex, token.length);
             if (close) {
                 html += `<code>${esc(text.slice(tokens.lastIndex, close.index))}</code>`;
-                tokens.lastIndex = end.lastIndex;
+                tokens.lastIndex = close.index + close[0].length;
             }
             else
                 html += esc(token);
         }
-        else if (bold !== undefined)
-            html += `<strong>${inline(bold, allowLinks)}</strong>`;
+        else if (token === "**") {
+            const close = closingInlineDelimiter(text, tokens.lastIndex, "bold");
+            if (close > tokens.lastIndex) {
+                html += `<strong>${inline(text.slice(tokens.lastIndex, close), allowLinks)}</strong>`;
+                tokens.lastIndex = close + token.length;
+            }
+            else
+                html += esc(token);
+        }
+        else if (allowLinks) {
+            const close = closingInlineDelimiter(text, tokens.lastIndex, "label");
+            MD_RENDER_DESTINATION.lastIndex = close + 1;
+            const link = close < 0 ? null : MD_RENDER_DESTINATION.exec(text);
+            if (link) {
+                const end = MD_RENDER_DESTINATION.lastIndex;
+                const href = token === "[" && link[1] ? externalMarkdownUrl(link[1]) : undefined;
+                html += href
+                    ? `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer" data-markdown-link>${inline(text.slice(tokens.lastIndex, close), false)}</a>`
+                    : esc(text.slice(match.index, end));
+                tokens.lastIndex = end;
+            }
+            else
+                html += esc(token);
+        }
         else {
-            MD_RENDER_LINK.lastIndex = match.index;
-            const link = MD_RENDER_LINK.exec(text);
-            const [source, label, destination] = link ?? [];
-            const href = allowLinks && token.startsWith("[") && destination ? externalMarkdownUrl(destination) : undefined;
-            html += href && label !== undefined
-                ? `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer" data-markdown-link>${inline(label, false)}</a>`
-                : esc(source ?? token);
-            if (source)
-                tokens.lastIndex = match.index + source.length;
+            html += esc(token);
         }
         offset = tokens.lastIndex;
     }

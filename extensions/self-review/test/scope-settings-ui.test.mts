@@ -175,6 +175,19 @@ test("very long Markdown lines fall back to escaped text", async () => {
     assert.equal(app.run(`md(${JSON.stringify(line)})`), `<div class="md"><p>${line.replace("<literal>", "&lt;literal&gt;")}</p></div>`);
 });
 
+test("reply Markdown respects code inside bold and balanced link labels", async () => {
+    const app = await loadApp();
+    const body = "**Use `** [#31](https://example.test/)` literally**\n"
+        + "[`T[]`](https://example.test/types) [array[i]](https://example.test/arrays) "
+        + "[`x]` and \\[y\\]](https://example.test/brackets)";
+    const html = app.run(`md(${JSON.stringify(body)})`);
+    assert.ok(html.includes("<strong>Use <code>** [#31](https://example.test/)</code> literally</strong>"));
+    assert.equal(html.match(/<a\b/g)?.length, 3);
+    assert.ok(html.includes("data-markdown-link><code>T[]</code></a>"));
+    assert.ok(html.includes("data-markdown-link>array[i]</a>"));
+    assert.ok(html.includes("data-markdown-link><code>x]</code> and [y]</a>"));
+});
+
 test("agent reply keeps non-web destinations, raw HTML and code inert", async () => {
     const app = await loadApp();
     const body = [
