@@ -1,4 +1,5 @@
-import { appendFile, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -90,7 +91,20 @@ try {
     })();
 
     await waitFor(() => events.includes("hello"), "Canvas SSE hello was not received.");
-    await runBuild();
+    const dist = path.dirname(webRoot);
+    const distFiles = await readdir(dist, { recursive: true, withFileTypes: true });
+    const liveFiles = distFiles.filter((entry) => entry.isFile()).map((entry) => path.join(entry.parentPath, entry.name));
+    const originalStats = await Promise.all(liveFiles.map((file) => stat(file)));
+    let finished = false;
+    const build = runBuild().finally(() => { finished = true; });
+    await Promise.all([build, (async () => {
+        while (!finished) {
+            await Promise.all(liveFiles.map((file) => stat(file)));
+            await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+    })()]);
+    assert.deepEqual((await Promise.all(liveFiles.map((file) => stat(file)))).map((file) => file.mtimeMs),
+        originalStats.map((file) => file.mtimeMs), "an identical rebuild does not touch live files");
     const renderer = await readFile(path.join(webRoot, "app.js"), "utf8");
     const rendererSource = await readFile(path.join(extensionRoot, "src", "web", "app.ts"), "utf8");
     const rendererMarker = "FOLDER_VIEW_ROW_BUDGET";

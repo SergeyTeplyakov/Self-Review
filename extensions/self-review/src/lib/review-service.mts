@@ -498,7 +498,7 @@ export class ReviewService extends EventEmitter {
     readonly log: Log;
     readonly pid: number;
     readonly isProcessAlive: (pid: number) => boolean;
-    private readonly refreshes: Map<string, { again: boolean; promise?: Promise<RefreshResult> }>;
+    private readonly refreshes: Map<string, { again: boolean; promise?: Promise<RefreshResult | null> }>;
     private readonly refreshErrors = new Map<string, string>();
     /**
      * @param {object} p
@@ -665,22 +665,25 @@ export class ReviewService extends EventEmitter {
     }
 
     // Coalesces overlapping refreshes; a refresh requested mid-capture triggers one more pass.
-    refresh(reviewId: string): Promise<RefreshResult> {
+    refresh(reviewId: string): Promise<RefreshResult>;
+    refresh(reviewId: string, isCurrent: () => boolean): Promise<RefreshResult | null>;
+    refresh(reviewId: string, isCurrent?: () => boolean): Promise<RefreshResult | null> {
         const running = this.refreshes.get(reviewId);
         if (running?.promise) {
+            if (isCurrent) return running.promise.then(() => isCurrent() ? this.refresh(reviewId, isCurrent) : null);
             running.again = true;
             return running.promise;
         }
-        const entry: { again: boolean; promise?: Promise<RefreshResult> } = { again: false };
+        const entry: { again: boolean; promise?: Promise<RefreshResult | null> } = { again: false };
         this.refreshes.set(reviewId, entry);
         this.refreshErrors.delete(reviewId);
         entry.promise = (async () => {
             try {
-                let result;
-                do {
+                let result = isCurrent ? await this.captureRevision(reviewId, isCurrent) : await this.refreshOnce(reviewId);
+                while (entry.again) {
                     entry.again = false;
                     result = await this.refreshOnce(reviewId);
-                } while (entry.again);
+                }
                 return result;
             } catch (error) {
                 this.refreshErrors.set(reviewId, errorMessage(error));
@@ -694,7 +697,14 @@ export class ReviewService extends EventEmitter {
         return entry.promise;
     }
 
-    async refreshOnce(reviewId: string): Promise<RefreshResult> {
+    refreshOnce(reviewId: string): Promise<RefreshResult> {
+        return this.captureRevision(reviewId);
+    }
+
+    private captureRevision(reviewId: string): Promise<RefreshResult>;
+    private captureRevision(reviewId: string, isCurrent: () => boolean): Promise<RefreshResult | null>;
+    private async captureRevision(reviewId: string, isCurrent?: () => boolean): Promise<RefreshResult | null> {
+        if (isCurrent && !isCurrent()) return null;
         const before = await this.getReview(reviewId);
         if (isRetiredCommitReview(before)) throw retiredCommitError(before);
         let snapshot;
@@ -709,10 +719,13 @@ export class ReviewService extends EventEmitter {
                 scope: scopeOf(before),
             });
         } catch (err) {
+            if (isCurrent && !isCurrent()) return null;
             throw new ReviewError("git_error", errorMessage(err));
         }
 
-        const result = await this.store.updateReview(reviewId, async (review) => {
+        if (isCurrent && !isCurrent()) return null;
+        const result = await this.store.updateReview<RefreshResult | null>(reviewId, async (review) => {
+            if (isCurrent && !isCurrent()) return { write: false, value: null };
             if (!review) throw notFound(`Review ${reviewId} not found.`);
             const git = {
                 branch: snapshot.branch,
@@ -728,7 +741,6 @@ export class ReviewService extends EventEmitter {
             if (!latest || latest.fingerprint !== snapshot.fingerprint) {
                 revisionId = `r${review.revisions.length + 1}`;
                 const stats = snapshot.files.reduce((a, f) => ({ additions: a.additions + f.additions, deletions: a.deletions + f.deletions }), { additions: 0, deletions: 0 });
-                await this.store.writeSnapshot(reviewId, revisionId, { revisionId, ...snapshot });
                 review.revisions.push({
                     revisionId,
                     fingerprint: snapshot.fingerprint,
@@ -744,8 +756,11 @@ export class ReviewService extends EventEmitter {
             review.git = git;
             review.branch = snapshot.branch;
             const moved = await this.relocateThreads(review, revisionId!, snapshot.baseCommit);
+            if (isCurrent && !isCurrent()) return { write: false, value: null };
+            if (created) await this.store.writeSnapshot(reviewId, revisionId!, { revisionId, ...snapshot });
             return { review, value: { revisionId: revisionId!, created, moved } };
         });
+        if (!result) return null;
         if (result.created || result.moved) this.changed(reviewId, "revision");
         else this.changed(reviewId, "git");
         return result;

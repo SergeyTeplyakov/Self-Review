@@ -1,11 +1,11 @@
 import { test } from "node:test";
 import type { TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { Delivery, ReviewService, ReviewWatcher, Store, runGit, startReviewServer } from "./modules.mjs";
+import { captureSnapshot, Delivery, ReviewService, ReviewWatcher, Store, runGit, startReviewServer } from "./modules.mjs";
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 async function until(predicate: () => boolean | Promise<boolean>): Promise<void> {
@@ -31,11 +31,69 @@ async function fixture(t: TestContext) {
     const logs: string[] = [];
     const watcher = new ReviewWatcher({
         getReview: (id) => service.getReview(id),
-        refresh: async (id) => { refreshes++; return service.refresh(id); },
+        refresh: async (id, current) => { refreshes++; return service.refresh(id, current); },
     }, (text) => logs.push(text), 100);
     t.after(async () => { await watcher.close(); await rm(tmp, { recursive: true, force: true }); });
     return { tmp, repo, git, service, id, watcher, logs, count: () => refreshes };
 }
+
+test("pending and all match Git's inventory and patch without counting CRLF index stat mismatches", async (t) => {
+    const f = await fixture(t);
+    const git = (...args: string[]) => f.git("-c", "core.autocrlf=true", ...args);
+    const generated = path.join(f.repo, "generated.txt");
+    const dist = "extensions/self-review/dist";
+    const testFile = "extensions/self-review/test/handwritten.test.mts";
+    await mkdir(path.join(f.repo, dist), { recursive: true });
+    await mkdir(path.dirname(path.join(f.repo, testFile)), { recursive: true });
+    await writeFile(path.join(f.repo, dist, "artifact.js"), "old output\n");
+    await writeFile(path.join(f.repo, testFile), "old test\n");
+    await writeFile(generated, "one\r\ntwo\r\n");
+    await git("add", ".");
+    await git("commit", "-qm", "add CRLF worktree file");
+    await git("switch", "-qc", "feature");
+    await writeFile(path.join(f.repo, ".gitattributes"), "generated.txt text eol=lf\n");
+    await git("add", ".gitattributes");
+    await git("commit", "-qm", "canonical line endings");
+    await writeFile(generated, "one\ntwo\n");
+    assert.match((await git("status", "--porcelain")).stdout, /^ M generated\.txt\r?$/m);
+    await writeFile(path.join(f.repo, "file.ts"), "edited\n");
+    await writeFile(path.join(f.repo, testFile), "new test\n");
+    await writeFile(path.join(f.repo, dist, "artifact.js"), "new output\n");
+    await writeFile(path.join(f.repo, "staged.ts"), "staged\n");
+    await git("add", "staged.ts");
+    await writeFile(path.join(f.repo, "new.ts"), "untracked\n");
+    const gitPaths = ["--", ".", `:(exclude)${dist}`];
+    const mergeBase = (await git("merge-base", "main", "HEAD")).stdout.trim();
+    const head = (await git("rev-parse", "HEAD")).stdout.trim();
+    assert.notEqual(mergeBase, head);
+    const indexPath = path.join(f.repo, ".git", "index");
+    const indexBefore = await readFile(indexPath);
+    for (const scope of ["pending", "all"] as const) {
+        const base = scope === "all" ? mergeBase : head;
+        const snapshot = await captureSnapshot({ repoRoot: f.repo, base: "main", scope, exclude: [dist] });
+        assert.equal(snapshot.baseCommit, base);
+        const tracked = (await git("diff", "--name-status", base, ...gitPaths)).stdout.trim().split(/\r?\n/);
+        const untracked = (await git("ls-files", "--others", "--exclude-standard", ...gitPaths)).stdout.trim().split(/\r?\n/);
+        const statusLetter: Record<string, string> = { modified: "M", added: "A", deleted: "D" };
+        assert.deepEqual(snapshot.files.map((file) => `${statusLetter[file.status]}\t${file.path}`).sort(),
+            [...tracked, ...untracked.map((file) => `A\t${file}`)].sort());
+        assert.deepEqual(snapshot.uncommittedFiles.sort(), [testFile, "file.ts", "new.ts", "staged.ts"]);
+        assert.ok(snapshot.files.some((file) => file.path === testFile), "the dist exclusion keeps handwritten tests");
+        assert.equal(snapshot.files.some((file) => file.path === ".gitattributes"), scope === "all");
+        for (const file of snapshot.files.filter((file) => !file.untracked)) {
+            const gitPatch = (await git("diff", "--no-color", base, "--", file.path)).stdout.split(/\r?\n/);
+            const gitEdits = gitPatch.slice(gitPatch.findIndex((line) => line.startsWith("@@")) + 1)
+                .filter((line) => line.startsWith("+") || line.startsWith("-"));
+            const snapshotEdits = file.hunks.flatMap((hunk) => hunk.rows.flatMap((row) =>
+                row.t === "ctx" ? [] : [(row.t === "add" ? "+" : "-") + row.s]));
+            assert.deepEqual(snapshotEdits, gitEdits, `${scope}: ${file.path}`);
+        }
+    }
+    assert.deepEqual(await readFile(indexPath), indexBefore, "review captures never rewrite the index");
+    await writeFile(generated, "one\nchanged\n");
+    const changed = await captureSnapshot({ repoRoot: f.repo, base: null, scope: "pending", exclude: [dist] });
+    assert.deepEqual(changed.uncommittedFiles.sort(), [testFile, "file.ts", "generated.txt", "new.ts", "staged.ts"]);
+});
 
 test("debounce waits for the last event and releases every watcher and pending timer on close", async (t) => {
     const f = await fixture(t);
@@ -65,14 +123,16 @@ test("debounce waits for the last event and releases every watcher and pending t
     await refreshed;
     assert.equal(calls, 2, "the burst produces exactly one refresh");
     await writeFile(path.join(f.repo, "file.ts"), "changed during continuous watcher noise\n");
-    const boundedRefresh = new Promise<void>((resolve) => { notify = resolve; });
+    const settledRefresh = new Promise<void>((resolve) => { notify = resolve; });
     source.change("file.ts");
-    for (let i = 0; i < 15; i++) {
-        t.mock.timers.tick(100);
-        source.change("ignored-output.log");
+    for (let i = 0; i < 20; i++) {
+        t.mock.timers.tick(99);
+        source.change("file.ts");
     }
-    await boundedRefresh;
-    assert.equal(calls, 3, "continuous events cannot postpone a relevant refresh beyond the maximum wait");
+    assert.equal(calls, 2, "even a long burst cannot force a refresh before it settles");
+    t.mock.timers.tick(100);
+    await settledRefresh;
+    assert.equal(calls, 3);
     source.fail(new Error("watch failed"));
     assert.ok(source.closed);
     assert.match(f.logs[0] ?? "", /watch failed.*Manual Refresh remains available/);
@@ -81,6 +141,41 @@ test("debounce waits for the last event and releases every watcher and pending t
     t.mock.timers.tick(500);
     assert.equal(calls, 3, "close cancels the queued refresh");
     assert.ok([...sources.values()].every((entry) => entry.closed));
+});
+
+test("a write during capture discards the transient revision and publishes the settled checkout", async (t) => {
+    const f = await fixture(t);
+    const file = path.join(f.repo, "file.ts");
+    let checkout: ((file: string) => void) | undefined;
+    let mutateDuringCapture = false;
+    const service = new ReviewService({
+        store: f.service.store,
+        git: {
+            ...f.service.git,
+            captureSnapshot: async (options) => {
+                const snapshot = await f.service.git.captureSnapshot(options);
+                if (mutateDuringCapture && snapshot.files.some((entry) => entry.status === "deleted")) {
+                    mutateDuringCapture = false;
+                    await writeFile(file, "replacement\n");
+                    checkout?.("file.ts");
+                }
+                return snapshot;
+            },
+        },
+    });
+    const watcher = new ReviewWatcher(service, (text) => f.logs.push(text), 10, (root, change) => {
+        if (root === f.repo) checkout = change;
+        return { close() {} };
+    });
+    t.after(() => watcher.close());
+    await watcher.setReview(f.id);
+    assert.ok(checkout);
+    mutateDuringCapture = true;
+    await rm(file);
+    checkout("file.ts");
+    await until(async () => (await service.getSnapshot(f.id)).files[0]?.status === "modified");
+    assert.equal((await service.getReview(f.id)).currentRevisionId, "r2", "the deletion never became a revision");
+    assert.deepEqual(f.logs, []);
 });
 
 test("checkout edits preserve review options and ignore output and Git noise", async (t) => {

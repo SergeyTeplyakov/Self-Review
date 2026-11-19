@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { copyFileSync, cpSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { distributionBuildId, normalizeDistributionLineEndings } from "./distribution-fingerprint.mjs";
@@ -9,13 +9,6 @@ const extensionRoot = path.join(repositoryRoot, "extensions", "self-review");
 const distributionRoot = path.join(extensionRoot, "dist");
 const toolsDistributionRoot = path.join(repositoryRoot, ".build", "extensions", "self-review");
 const compiler = path.join(repositoryRoot, "node_modules", "typescript", "bin", "tsc");
-
-function clearDirectory(directory: string) {
-    mkdirSync(directory, { recursive: true });
-    for (const entry of readdirSync(directory)) {
-        rmSync(path.join(directory, entry), { recursive: true, force: true });
-    }
-}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -28,46 +21,74 @@ function distributionFiles(directory: string): string[] {
     });
 }
 
-mkdirSync(distributionRoot, { recursive: true });
-const webOutput = path.join(distributionRoot, "web");
-mkdirSync(webOutput, { recursive: true });
-for (const entry of readdirSync(distributionRoot)) {
-    const entryPath = path.join(distributionRoot, entry);
-    if (entry === "web") clearDirectory(webOutput);
-    else rmSync(entryPath, { recursive: true, force: true });
+function publishDirectory(staged: string, destination: string) {
+    const obsolete: string[] = [];
+    function install(source: string, target: string) {
+        mkdirSync(target, { recursive: true });
+        const previous = new Map(readdirSync(target, { withFileTypes: true }).map((entry) => [entry.name, entry]));
+        // Publish the build identity last, while keeping existing directories watched.
+        const entries = readdirSync(source, { withFileTypes: true }).sort((a, b) =>
+            Number(a.name === "version.json") - Number(b.name === "version.json"));
+        for (const entry of entries) {
+            const from = path.join(source, entry.name);
+            const to = path.join(target, entry.name);
+            const old = previous.get(entry.name);
+            previous.delete(entry.name);
+            if (entry.isDirectory()) install(from, to);
+            else if (!old?.isFile() || !readFileSync(from).equals(readFileSync(to))) renameSync(from, to);
+        }
+        obsolete.push(...[...previous.keys()].map((name) => path.join(target, name)));
+    }
+    install(staged, destination);
+    for (const entry of obsolete) rmSync(entry, { recursive: true, force: true });
 }
 
-for (const project of ["tsconfig.node.build.json", "tsconfig.web.build.json"]) {
-    execFileSync(process.execPath, [
-        compiler,
-        "-p",
-        path.join("extensions", "self-review", project),
-    ], { cwd: repositoryRoot, stdio: "inherit" });
+function build(staged: string) {
+    const webOutput = path.join(staged, "web");
+    for (const [project, output] of [
+        ["tsconfig.node.build.json", staged],
+        ["tsconfig.web.build.json", webOutput],
+    ]) {
+        execFileSync(process.execPath, [
+            compiler, "-p", path.join(extensionRoot, project), "--outDir", output,
+        ], { cwd: repositoryRoot, stdio: "inherit" });
+    }
+
+    for (const asset of ["index.html", "styles.css"]) {
+        copyFileSync(path.join(extensionRoot, "web", asset), path.join(webOutput, asset));
+    }
+    for (const directory of ["bundled-skills", "review-commands"]) {
+        cpSync(path.join(extensionRoot, directory), path.join(staged, directory), { recursive: true });
+    }
+
+    const marketplace: unknown = JSON.parse(readFileSync(path.join(repositoryRoot, ".github", "plugin", "marketplace.json"), "utf8"));
+    const selfReviewPlugin = isRecord(marketplace) && Array.isArray(marketplace.plugins)
+        ? marketplace.plugins.find((plugin) => isRecord(plugin) && plugin.name === "self-review-canvas")
+        : undefined;
+    if (!isRecord(selfReviewPlugin) || typeof selfReviewPlugin.version !== "string" || !selfReviewPlugin.version.trim()) {
+        throw new Error("The Self-Review plugin metadata has no valid version.");
+    }
+    const files = distributionFiles(staged);
+    normalizeDistributionLineEndings(files);
+    const buildId = distributionBuildId(staged, files);
+    writeFileSync(path.join(staged, "version.json"), `${JSON.stringify({
+        version: selfReviewPlugin.version,
+        buildId,
+    }, null, 2)}\n`);
 }
 
-mkdirSync(webOutput, { recursive: true });
-for (const asset of ["index.html", "styles.css"]) {
-    copyFileSync(path.join(extensionRoot, "web", asset), path.join(webOutput, asset));
+const stagingRoot = mkdtempSync(path.join(repositoryRoot, ".build", "self-review-dist-"));
+try {
+    const staged = path.join(stagingRoot, "dist");
+    const stagedTools = path.join(stagingRoot, "tools");
+    build(staged);
+    cpSync(staged, stagedTools, { recursive: true });
+    const entry = path.join(stagingRoot, "extension.mjs");
+    copyFileSync(path.join(extensionRoot, "extension.mjs"), entry);
+    const toolsEntry = path.join(toolsDistributionRoot, "extension.mjs");
+    if (!existsSync(toolsEntry) || !readFileSync(entry).equals(readFileSync(toolsEntry))) renameSync(entry, toolsEntry);
+    publishDirectory(stagedTools, path.join(toolsDistributionRoot, "dist"));
+    publishDirectory(staged, distributionRoot);
+} finally {
+    rmSync(stagingRoot, { recursive: true, force: true });
 }
-cpSync(path.join(extensionRoot, "bundled-skills"), path.join(distributionRoot, "bundled-skills"), { recursive: true });
-cpSync(path.join(extensionRoot, "review-commands"), path.join(distributionRoot, "review-commands"), { recursive: true });
-
-const marketplace: unknown = JSON.parse(readFileSync(path.join(repositoryRoot, ".github", "plugin", "marketplace.json"), "utf8"));
-const selfReviewPlugin = isRecord(marketplace) && Array.isArray(marketplace.plugins)
-    ? marketplace.plugins.find((plugin) => isRecord(plugin) && plugin.name === "self-review-canvas")
-    : undefined;
-if (!isRecord(selfReviewPlugin) || typeof selfReviewPlugin.version !== "string" || !selfReviewPlugin.version.trim()) {
-    throw new Error("The Self-Review plugin metadata has no valid version.");
-}
-const files = distributionFiles(distributionRoot);
-normalizeDistributionLineEndings(files);
-const buildId = distributionBuildId(distributionRoot, files);
-writeFileSync(path.join(distributionRoot, "version.json"), `${JSON.stringify({
-    version: selfReviewPlugin.version,
-    buildId,
-}, null, 2)}\n`);
-
-mkdirSync(toolsDistributionRoot, { recursive: true });
-rmSync(path.join(toolsDistributionRoot, "dist"), { recursive: true, force: true });
-copyFileSync(path.join(extensionRoot, "extension.mjs"), path.join(toolsDistributionRoot, "extension.mjs"));
-cpSync(distributionRoot, path.join(toolsDistributionRoot, "dist"), { recursive: true });

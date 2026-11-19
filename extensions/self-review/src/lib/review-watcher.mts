@@ -7,7 +7,6 @@ import type { Log } from "../../types/contracts.js";
 import type { ReviewService } from "./review-service.mjs";
 
 const DEBOUNCE_MS = 350;
-const MAX_DEBOUNCE_MS = 1500;
 const gitInput = (name: string) => !name.endsWith(".lock")
     && (/^(HEAD|index|packed-refs|config|shallow|info\/exclude)$/.test(name) || name.startsWith("refs/")
         || (name.startsWith("modules/") && (/\/(HEAD|index|packed-refs|config|shallow|info\/exclude)$/.test(name) || name.includes("/refs/"))));
@@ -39,7 +38,6 @@ const createDirectoryWatcher: WatchDirectory = (root, changed, failed) => {
 export class ReviewWatcher {
     private watchers: Array<Pick<FSWatcher, "close">> = [];
     private timer: ReturnType<typeof setTimeout> | undefined;
-    private maxTimer: ReturnType<typeof setTimeout> | undefined;
     private generation = 0;
     private reviewId: string | null = null;
     private candidates = new Map<string, { file: string; git: boolean }>();
@@ -47,7 +45,9 @@ export class ReviewWatcher {
     private running: Promise<void> = Promise.resolve();
 
     constructor(
-        private readonly service: Pick<ReviewService, "getReview" | "refresh">,
+        private readonly service: Pick<ReviewService, "getReview"> & {
+            refresh(reviewId: string, isCurrent: () => boolean): Promise<unknown>;
+        },
         private readonly log: Log,
         private readonly debounceMs = DEBOUNCE_MS,
         private readonly watchDirectory: WatchDirectory = createDirectoryWatcher,
@@ -87,12 +87,18 @@ export class ReviewWatcher {
             }
             let known = initialFiles;
             if (generation !== this.generation || this.closed) return;
+            let eventVersion = 0;
+            let needsRefresh = true;
+            const refresh = async (version: number) => {
+                const isCurrent = () => generation === this.generation && !this.closed && eventVersion === version;
+                if (!needsRefresh || !isCurrent()) return;
+                await this.service.refresh(reviewId, isCurrent);
+                if (isCurrent()) needsRefresh = false;
+            };
             const add = (root: string, metadata: boolean) => {
                 const flush = () => {
-                    clearTimeout(this.timer);
-                    clearTimeout(this.maxTimer);
                     this.timer = undefined;
-                    this.maxTimer = undefined;
+                    const version = eventVersion;
                     const candidates = this.candidates;
                     this.candidates = new Map();
                     // Serialize checks as well as refreshes: read notifications must not race signature updates.
@@ -191,20 +197,20 @@ export class ReviewWatcher {
                             }
                             known = next;
                         }
-                        if (relevant && generation === this.generation && !this.closed) await this.service.refresh(reviewId);
+                        needsRefresh ||= relevant;
+                        await refresh(version);
                     }).catch((error: unknown) => this.warn(error));
                 };
                 const watcher = this.watchDirectory(root, (filename) => {
                     if (generation !== this.generation || this.closed) return;
                     const file = filename?.replace(/\\/g, "/") ?? "";
                     if (metadata ? file && !gitInput(file) : file.split("/").includes(".git")) return;
+                    eventVersion++;
                     const absolute = path.join(root, file);
                     this.candidates.set(absolute, { file, git: metadata });
                     clearTimeout(this.timer);
                     this.timer = setTimeout(flush, this.debounceMs);
-                    if (this.maxTimer === undefined) this.maxTimer = setTimeout(flush, Math.max(MAX_DEBOUNCE_MS, this.debounceMs));
                     this.timer.unref();
-                    this.maxTimer.unref();
                 }, (error) => {
                     this.warn(error);
                     watcher.close();
@@ -214,7 +220,7 @@ export class ReviewWatcher {
             add(review.repoRoot, false);
             for (const dir of new Set(dirs.stdout.trim().split(/\r?\n/))) add(dir, true);
             // Close the capture-to-watch gap, using the existing coalesced refresh.
-            await this.service.refresh(reviewId);
+            await refresh(eventVersion);
         } catch (error) {
             if (generation === this.generation) {
                 this.release();
@@ -230,9 +236,7 @@ export class ReviewWatcher {
     private release(): void {
         this.generation++;
         clearTimeout(this.timer);
-        clearTimeout(this.maxTimer);
         this.timer = undefined;
-        this.maxTimer = undefined;
         for (const watcher of this.watchers) watcher.close();
         this.watchers = [];
         this.candidates.clear();
