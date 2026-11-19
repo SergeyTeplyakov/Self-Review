@@ -1060,6 +1060,7 @@ let refreshing = false;
 let loadError = "";
 let refreshError = "";
 let serverRefresh: StateResponse["refresh"];
+let renderedStatusHtml = "";
 
 function renderLoadStatus(): void {
     const status = $("#review-status");
@@ -1075,7 +1076,10 @@ function renderLoadStatus(): void {
         : error ? `${failureLabel}: ${esc(error)}. ${state.review ? "Showing the last loaded data." : ""}` : "";
     const retry = error && !pending ? `<button type="button" data-action="refresh">Retry</button>` : "";
     const html = message ? `<span class="review-status-message">${message}</span>${retry}` : "";
-    if (status.innerHTML !== html) status.innerHTML = html;
+    if (renderedStatusHtml !== html) {
+        status.innerHTML = html;
+        renderedStatusHtml = html;
+    }
 }
 
 async function loadState() {

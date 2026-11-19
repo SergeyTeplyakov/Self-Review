@@ -579,6 +579,7 @@ async function nav(page: Page, view: string, filePath?: string) {
 async function checkRefreshLayout(browser: Browser, url: string) {
     const page = await browser.newPage({ viewport: { width: 480, height: 750 } });
     try {
+        await page.clock.install();
         await page.goto(url);
         const status = page.locator("#review-status");
         const refresh = page.locator('#top [data-action="refresh"]');
@@ -592,7 +593,7 @@ async function checkRefreshLayout(browser: Browser, url: string) {
             await status.filter({ hasText: "Showing the last loaded data" }).waitFor();
             assert.deepEqual(await geometry(), original, "refresh progress must not shift the review");
             if (fail) {
-                await route.fulfill({ status: 500, json: { error: { message: "Long capture error ".repeat(20) } } });
+                await route.fulfill({ status: 500, json: { error: { message: "Long capture error: bad revision 'origin/main'. ".repeat(20) } } });
             } else {
                 await route.continue();
             }
@@ -602,6 +603,14 @@ async function checkRefreshLayout(browser: Browser, url: string) {
         await retry.waitFor();
         assert.match((await status.textContent()) ?? "", /Long capture error/);
         assert.deepEqual(await geometry(), original, "a long error must not shift the review");
+        const errorMessage = status.locator(".review-status-message");
+        const offset = await errorMessage.evaluate((element) => {
+            element.scrollTop = element.scrollHeight;
+            return element.scrollTop;
+        });
+        assert.ok(offset > 0, "the long refresh error must scroll");
+        await page.clock.fastForward(30_000);
+        assert.equal(await errorMessage.evaluate((element) => element.scrollTop), offset, "an unchanged error must retain its scroll position");
         fail = false;
         await retry.click();
         await page.locator("#toast").filter({ hasText: "Refreshed from the working tree" }).waitFor();

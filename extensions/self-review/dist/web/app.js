@@ -834,6 +834,7 @@ let refreshing = false;
 let loadError = "";
 let refreshError = "";
 let serverRefresh;
+let renderedStatusHtml = "";
 function renderLoadStatus() {
     const status = $("#review-status");
     if (!status)
@@ -849,8 +850,10 @@ function renderLoadStatus() {
         : error ? `${failureLabel}: ${esc(error)}. ${state.review ? "Showing the last loaded data." : ""}` : "";
     const retry = error && !pending ? `<button type="button" data-action="refresh">Retry</button>` : "";
     const html = message ? `<span class="review-status-message">${message}</span>${retry}` : "";
-    if (status.innerHTML !== html)
+    if (renderedStatusHtml !== html) {
         status.innerHTML = html;
+        renderedStatusHtml = html;
+    }
 }
 async function loadState() {
     clearTimeout(reloadTimer);
