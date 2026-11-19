@@ -2333,7 +2333,9 @@ async function submit(key, draft = defaultDraft()) {
     pending.sending = true;
     pending.error = null;
     state.pending.set(key, pending);
-    const submittedKey = () => [...state.pending].find(([, entry]) => entry === pending)?.[0] ?? key;
+    const submittedKey = () => state.review?.reviewId === review.reviewId
+        ? [...state.pending].find(([, entry]) => entry === pending)?.[0]
+        : undefined;
     render();
     try {
         let res;
@@ -2358,6 +2360,8 @@ async function submit(key, draft = defaultDraft()) {
             });
         }
         const sentKey = submittedKey();
+        if (sentKey === undefined)
+            return;
         setDraft(sentKey, "");
         setDraftImages(sentKey, []);
         pinnedComposers.delete(sentKey);
@@ -2377,6 +2381,8 @@ async function submit(key, draft = defaultDraft()) {
         }
     }
     catch (err) {
+        if (submittedKey() === undefined)
+            return;
         pending.sending = false;
         pending.error = errorMessage(err);
         render();

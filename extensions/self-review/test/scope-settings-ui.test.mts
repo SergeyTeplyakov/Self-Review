@@ -1315,6 +1315,29 @@ test("an in-flight submission completes the migrated draft without deleting a ne
     assert.equal(app.run(`getDraft("line:file.ts:new:2-2")`), "new feedback");
 });
 
+test("a completed send cannot clear text or image drafts after switching reviews", async () => {
+    let finishPost: (value: unknown) => void = () => { throw new Error("POST not started"); };
+    const app = await loadApp({
+        CSS: { escape: (value: string) => value },
+        fetch: async () => new Promise((resolve) => { finishPost = resolve; }),
+    });
+    app.state.review = reviewFixture();
+    const textarea = { value: "Original text", dataset: { composer: "overview:new" } };
+    const box = Object.assign(new MockElement(), {
+        dataset: { key: "overview:new", kind: "overview" },
+        querySelector: (selector: string) => selector === "textarea" ? textarea : null,
+    });
+    app.document.querySelector = (selector: string) => selector.startsWith(".composer") ? box : app.node(selector);
+    app.run(`render = () => {}; loadState = async () => {}; setDraftImages("overview:new", ["original-image"])`);
+    const submitted = app.run<Promise<void>>(`submit("overview:new")`);
+    app.state.review = reviewFixture({ reviewId: "another-review" });
+    app.run(`state.pending.clear(); setDraft("overview:new", "Keep this"); setDraftImages("overview:new", ["keep-image"])`);
+    finishPost(jsonResponse({}));
+    await submitted;
+    assert.equal(app.run(`getDraft("overview:new")`), "Keep this");
+    assert.equal(app.run(`JSON.stringify(getDraftImages("overview:new"))`), '["keep-image"]');
+});
+
 test("pinned composer text and original revision survive reload and scope switches", async () => {
     let activeReview = reviewFixture();
     const fetch: MockFetch = async (url) => {
