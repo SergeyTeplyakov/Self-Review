@@ -143,7 +143,9 @@ body { display: flex; flex-direction: column; overflow: hidden; }
     flex-wrap: wrap;
     gap: 8px;
     min-width: 0;
+    max-height: 100%;
     max-width: 70%;
+    overflow: auto;
 }
 
 button, select, textarea, input { font: inherit; color: inherit; }
@@ -189,7 +191,7 @@ button.agent-review-launch { padding: 7px 14px; font-weight: 600; }
 .review-settings-menu { position: relative; }
 .review-settings-menu > summary { display: inline-flex; align-items: center; cursor: pointer; list-style: none; border: 1px solid var(--mr-border); border-radius: var(--mr-radius); padding: 5px 10px; }
 .review-settings-menu > summary::-webkit-details-marker { display: none; }
-.review-settings-options { position: absolute; z-index: 2; top: calc(100% + 4px); right: 0; display: flex; min-width: max-content; flex-direction: column; gap: 4px; padding: 4px; border: 1px solid var(--mr-border); border-radius: var(--mr-radius); background: var(--mr-bg); box-shadow: 0 4px 12px rgb(0 0 0 / 18%); }
+.review-settings-options { position: absolute; z-index: 3; top: calc(100% + 4px); right: 0; display: flex; min-width: max-content; flex-direction: column; gap: 4px; padding: 4px; border: 1px solid var(--mr-border); border-radius: var(--mr-radius); background: var(--mr-bg); box-shadow: 0 4px 12px rgb(0 0 0 / 18%); }
 .review-settings-options button { width: 100%; text-align: left; white-space: nowrap; }
 .agent-reviews-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .agent-reviews-heading h2 { margin: 0; }

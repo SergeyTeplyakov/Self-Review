@@ -21,6 +21,7 @@ interface MockNode {
     tagName?: string;
     dataset?: Record<string, string>;
     closest?: (selector: string) => MockNode | null;
+    querySelector?: (selector: string) => unknown;
     contains?: (node: MockNode | null) => boolean;
     classList?: { toggle: (name: string, force?: boolean) => boolean };
 }
@@ -743,6 +744,17 @@ test("the page provides every container the scope and learning controls render i
     assert.ok(html.indexOf('id="review-status-controls"') < html.indexOf('id="review-status"'), "left footer controls must precede right-aligned refresh status");
 });
 
+test("settings and footer controls stay usable above file headers and within the footer", async () => {
+    const css = await readFile(new URL("../dist/web/styles.css", import.meta.url), "utf8");
+    const settingsMenu = required(css.match(/\.review-settings-options\s*\{([^}]*)\}/s))[1];
+    const fileHeader = required(css.match(/\.file-head\s*\{([^}]*)\}/s))[1];
+    const footerControls = required(css.match(/\.review-status-controls\s*\{([^}]*)\}/s))[1];
+    const zIndex = (rule: string) => Number(required(rule.match(/z-index:\s*(\d+)/))[1]);
+    assert.ok(zIndex(settingsMenu) > zIndex(fileHeader), "the settings menu must paint above sticky file headers");
+    assert.match(footerControls, /max-height:\s*100%/);
+    assert.match(footerControls, /overflow:\s*auto/);
+});
+
 test("agent review is opt-in and its dialog collects models, focus, and guidance with optional Addy skills", async () => {
     const app = await loadApp();
     app.state.review = reviewFixture();
@@ -995,16 +1007,22 @@ test("saving user defaults remains available after the review scope or revision 
 test("one-click failures surface errors and release the button even if reloading state fails", async () => {
     for (const reloadFails of [false, true]) {
         const app = await loadApp({ fetch: async () => jsonResponse({ error: { message: "Review could not be queued" } }, 500) });
-        app.run(reloadFails ? 'loadState = async () => { throw new Error("State reload failed"); }' : "loadState = async () => {}");
+        app.run(reloadFails
+            ? 'window.loadCount = 0; loadState = async () => { window.loadCount++; if (window.loadCount > 1) throw new Error("State reload failed"); renderMain(); }'
+            : "loadState = async () => { renderMain(); }");
         app.state.review = reviewFixture();
+        app.state.view = { type: "agent-comments" };
         app.state.agentReviewAvailable = true;
         app.state.agentReviewSettings = { models: ["model-a", "model-b"], focus: "both", skipDialog: true };
+        app.run("renderMain()");
+        app.node("#main").scrollTop = 42;
         await clicker(app)("agent-review");
         assert.equal(app.state.startingReview, false);
         assert.equal(app.state.dialog, null);
-        const reviews = app.run<string>("agentCommentsView()");
+        const reviews = app.node("#main").innerHTML;
         assert.match(reviews, /data-action="agent-review"[^>]*>Run agentic review/);
         assert.doesNotMatch(reviews, /data-action="agent-review"[^>]*disabled/);
+        assert.equal(app.node("#main").scrollTop, 42, "redrawing the launcher preserves the current main-view scroll position");
         assert.equal(app.node("#toast").textContent, reloadFails ? "State reload failed" : "Review could not be queued");
         assert.match(app.node("#toast").className, /error/);
     }
@@ -1747,6 +1765,10 @@ test("the banner, Configure checkbox, and dismissal persist auto-save settings a
     assert.equal(dialog(app).delivery, "immediate");
     await app.run("onChange")({ target: Object.assign(new MockElement("INPUT"), { name: "autoSaveLearnedRules", checked: true }) });
     await app.run("onChange")({ target: { name: "delivery", value: "batch" } });
+    const settingsMenu = app.node(".review-settings-menu");
+    const settingsSummary = app.node(".review-settings-menu > summary");
+    app.node('[data-action="configure"]').closest = (selector) => selector === "details:not([open])" ? settingsMenu : null;
+    settingsMenu.querySelector = (selector) => selector === "summary" ? settingsSummary : null;
     await click("dialog-save");
     assert.deepEqual(posts.at(-1), ["POST", "/api/settings", { autoSaveLearnedRules: true, delivery: "batch" }]);
     assert.equal(app.state.dialog, null);
@@ -1755,7 +1777,7 @@ test("the banner, Configure checkbox, and dismissal persist auto-save settings a
     assert.equal(app.node("#dialog").innerHTML, "");
     assert.match(app.node("#review-status-controls").innerHTML, /Delivery: Batch<\/span>.*Auto-save learned rules: On/);
     assert.equal(app.node("#toast").textContent, "Saved. Auto-save learned rules: On · Delivery: Batch");
-    assert.equal(app.focused.at(-1), '[data-action="configure"]');
+    assert.equal(app.focused.at(-1), ".review-settings-menu > summary", "focus returns to the visible Settings summary after the menu collapses");
 
     await click("configure");
     failure = "disk full";

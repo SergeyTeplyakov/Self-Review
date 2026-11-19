@@ -1595,7 +1595,9 @@ function dialogHtml(): string {
 }
 
 function focusIn(selector: string): void {
-    $(selector)?.focus?.();
+    const target = $(selector);
+    const closedMenu = target?.closest("details:not([open])");
+    (closedMenu?.querySelector?.("summary") ?? target)?.focus?.();
 }
 
 // The dialog is rendered on its own so re-renders of the page never disturb its focus or radio state.
@@ -1824,6 +1826,10 @@ async function runAgentReview(): Promise<void> {
     } finally {
         state.startingReview = false;
         renderTop();
+        const main = $("#main");
+        const scrollTop = main?.scrollTop ?? 0;
+        renderMain();
+        if (main) main.scrollTop = scrollTop;
         await loadState();
     }
 }
