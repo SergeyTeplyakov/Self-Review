@@ -1597,7 +1597,7 @@ test("the Configure dialog opens on the saved mode, keeps the page inert behind 
     app.run("openConfigure()");
     assert.equal(dialog(app).autoSaveLearnedRules, true);
     assert.match(app.node("#dialog").innerHTML, /name="autoSaveLearnedRules" checked/);
-    for (const id of ["#top", "#banner", "#layout"]) assert.equal(app.node(id).inert, true, id);
+    for (const id of ["#top", "#banner", "#layout", "#review-status-slot"]) assert.equal(app.node(id).inert, true, id);
     assert.equal(app.focused.at(-1), '#dialog input[name="autoSaveLearnedRules"]');
     const opened = app.state.dialog;
     app.run("openConfigure()");
@@ -1634,7 +1634,7 @@ test("the Configure dialog opens on the saved mode, keeps the page inert behind 
     assert.equal(app.state.dialog, null);
     assert.equal(prevented, 3);
     assert.equal(app.node("#dialog").innerHTML, "");
-    for (const id of ["#top", "#banner", "#layout"]) assert.equal(app.node(id).inert, false, id);
+    for (const id of ["#top", "#banner", "#layout", "#review-status-slot"]) assert.equal(app.node(id).inert, false, id);
     assert.equal(app.focused.at(-1), '[data-action="configure"]', "focus returns to the button that opened the dialog");
 
     app.run("openConfigure()");

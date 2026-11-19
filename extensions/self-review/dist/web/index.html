@@ -10,12 +10,14 @@
 <body>
     <header id="top"><span class="muted">Loading review…</span></header>
     <div id="banner" role="region" aria-label="Guideline learning" hidden></div>
-    <div id="review-status" class="review-status muted" role="status" aria-live="polite" hidden></div>
     <div id="layout">
         <nav id="side" aria-label="Review navigation"></nav>
         <main id="main" tabindex="-1"></main>
         <div id="ruler" aria-hidden="true"></div>
     </div>
+    <footer id="review-status-slot" role="status" aria-live="polite">
+        <div id="review-status" class="review-status muted" hidden></div>
+    </footer>
     <div id="dialog"></div>
     <div id="toast" role="status" aria-live="polite" hidden></div>
     <script type="module" src="app.js"></script>

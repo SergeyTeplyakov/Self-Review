@@ -51,7 +51,7 @@ Select lines on either side of the diff to start a thread.
 
 The overview has the PR-style description the agent drafted, the overall discussion, and every thread with its delivery state. Revision snapshots still anchor threads and agent reviews but are not listed on the overview.
 
-A status strip indicates when the review and Overview are loading or refreshing; existing content stays visible as last-loaded data while updates arrive. Failed loads remain visible with **Retry**, without discarding your navigation or comment drafts. A missing description means no draft has been saved, not that generation is underway: ask Copilot in the Overview discussion to write one. Descriptions based on an earlier diff are explicitly labeled until the agent updates them.
+A fixed-height footer shows when the review and Overview are loading or refreshing without moving the file tree, Overview, or controls. The last loaded review stays visible while updates arrive. Errors remain in the footer with **Retry**, without discarding your navigation or comment drafts. A missing description means no draft has been saved, not that generation is underway: ask Copilot in the Overview discussion to write one. Descriptions based on an earlier diff are explicitly labeled until the agent updates them.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/overview-dark.png">
@@ -273,6 +273,8 @@ npm run render
 ```
 
 Pass `-- --keep` to `npm run render` to leave the demo review running and print its URL.
+
+Run `npm run render -- --check-refresh-layout` from `docs/screenshots` after building to check that the file tree, Overview pane, and Refresh button stay in place during refresh, an error, and a successful retry. This opt-in check uses the same browser prerequisites and does not regenerate screenshots.
 
 ## Status
 
