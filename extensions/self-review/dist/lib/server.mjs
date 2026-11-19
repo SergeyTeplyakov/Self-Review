@@ -2,6 +2,7 @@
 // Bound to 127.0.0.1 on an ephemeral port; every /api call needs the per-instance token,
 // and POSTs need it as a header (cross-origin pages cannot set it without a preflight we never answer).
 import { createServer } from "node:http";
+import { execFile } from "node:child_process";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { watch } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
@@ -97,7 +98,38 @@ function recordBody(value) {
 function isReviewScope(value) {
     return typeof value === "string" && SCOPES.some((scope) => scope === value);
 }
-export async function startReviewServer({ instanceId, getReviewId, service, delivery, webRoot, log = () => { }, settings, onReviewChange, agentReview, reviewSkills, findPullRequest = findOpenPullRequest, }) {
+function openInDefaultBrowser(url) {
+    let executable;
+    let args;
+    let env = process.env;
+    if (process.platform === "win32" && process.env.SystemRoot) {
+        executable = path.join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+        // Pass the URL as data, never as part of the PowerShell command line.
+        args = ["-NoProfile", "-NonInteractive", "-Command",
+            "$ErrorActionPreference = 'Stop'; $p = [System.Diagnostics.ProcessStartInfo]::new($env:SELF_REVIEW_BROWSER_URL); $p.UseShellExecute = $true; [void][System.Diagnostics.Process]::Start($p)"];
+        env = { ...env, SELF_REVIEW_BROWSER_URL: url };
+    }
+    else if (process.platform === "darwin") {
+        executable = "/usr/bin/open";
+        args = [url];
+    }
+    else if (process.platform === "linux") {
+        executable = "xdg-open";
+        args = [url];
+    }
+    else {
+        return Promise.reject(new Error("No default-browser launcher is available."));
+    }
+    return new Promise((resolve, reject) => {
+        execFile(executable, args, { env, windowsHide: true, timeout: 10_000 }, (error) => {
+            if (error)
+                reject(error);
+            else
+                resolve();
+        });
+    });
+}
+export async function startReviewServer({ instanceId, getReviewId, service, delivery, webRoot, log = () => { }, settings, onReviewChange, agentReview, reviewSkills, findPullRequest = findOpenPullRequest, openCommentLink = openInDefaultBrowser, }) {
     const settingsHttp = new SettingsHttp(settings, log);
     const reviewWatcher = new ReviewWatcher(service, log);
     const token = randomBytes(24).toString("base64url");
@@ -260,6 +292,20 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
             return send(res, 200, { imageId });
         }
         const body = recordBody(await readJsonBody(req));
+        if (parts[0] === "open-comment-link" && parts.length === 1) {
+            if (pageReview !== reviewId)
+                throw new HttpError(409, "conflict", "Refresh the canvas before opening a comment link.");
+            if (typeof body.url !== "string" || !/^https?:\/\//i.test(body.url) || !URL.canParse(body.url)) {
+                throw new HttpError(400, "invalid_input", "Only valid HTTP(S) comment links can be opened.");
+            }
+            try {
+                await openCommentLink(new URL(body.url).href);
+            }
+            catch {
+                throw new HttpError(502, "browser_error", "Could not open the link in the default browser.");
+            }
+            return send(res, 200, { ok: true });
+        }
         if (parts[0] === "review-skills" && parts.length === 1) {
             if (!reviewSkills)
                 throw new HttpError(501, "unsupported", "Bundled review skills are not available.");

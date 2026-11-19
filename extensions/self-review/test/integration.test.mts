@@ -369,6 +369,42 @@ function request(
     });
 }
 
+test("comment links use the browser launcher only for authenticated web URLs in the active review", async () => {
+    const opened: string[] = [];
+    const server = await startReviewServer({
+        instanceId: "comment-links", getReviewId: () => reviewId, service, delivery, webRoot: WEB_ROOT,
+        openCommentLink: async (url) => {
+            if (url === "https://failure.example/") throw new Error("launcher unavailable");
+            opened.push(url);
+        },
+    });
+    try {
+        const url = new URL(server.url);
+        const port = Number(url.port);
+        const token = required(url.searchParams.get("t"));
+        const headers = { "Content-Type": "application/json", "X-MR-Token": token, "X-MR-Review": reviewId };
+        const pathName = "/api/open-comment-link";
+        const post = (body: { url: string }, extra: Record<string, string> = {}) =>
+            request(port, { method: "POST", pathName, headers: { ...headers, ...extra }, body });
+        const body = { url: "HTTPS://example.test/a?x=1&y=two#section" };
+        assert.equal((await request(port, { pathName: `${pathName}?t=${token}` })).status, 404);
+        assert.equal((await post(body, { "X-MR-Token": "invalid" })).status, 403);
+        assert.equal((await post(body, { Origin: "https://example.test" })).status, 403);
+        assert.equal((await post(body, { "X-MR-Review": "old-review" })).status, 409);
+        for (const url of ["https://", "//example.test/path", "file:///temp/notes"]) {
+            assert.equal((await post({ url })).status, 400);
+        }
+        assert.deepEqual(opened, []);
+        assert.equal((await post(body)).status, 200);
+        assert.deepEqual(opened, ["https://example.test/a?x=1&y=two#section"]);
+        const failure = await post({ url: "https://failure.example/" });
+        assert.equal(failure.status, 502);
+        assert.match(failure.text, /Could not open the link in the default browser/);
+    } finally {
+        await server.close();
+    }
+});
+
 test("HTTP server enforces token/host/origin and delivers posted comments", async () => {
     const server = await startReviewServer({ instanceId: "inst-1", getReviewId: () => reviewId, service, delivery, webRoot: WEB_ROOT });
     try {

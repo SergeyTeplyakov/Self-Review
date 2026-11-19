@@ -614,13 +614,33 @@ function highlightFile(file) {
     highlightedFiles.set(file, rows);
     return rows;
 }
-function inline(text) {
-    return text
-        .split(/(`[^`\n]+`)/)
-        .map((part) => (part.length > 1 && part.startsWith("`") && part.endsWith("`")
-        ? `<code>${esc(part.slice(1, -1))}</code>`
-        : esc(part).replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")))
-        .join("");
+const MD_RENDER_INLINE = new RegExp(/\\[!-\/:-@[-`{-~]|`[^`\n]+`|\*\*([^*\n]+)\*\*/.source + "|" + MD_LINK.source, "g");
+function externalMarkdownUrl(destination) {
+    if (!/^https?:\/\//i.test(destination) || !URL.canParse(destination))
+        return undefined;
+    return new URL(destination).href;
+}
+function inline(text, allowLinks = true) {
+    let html = "";
+    let offset = 0;
+    for (const match of text.matchAll(MD_RENDER_INLINE)) {
+        const [token, bold, label, destination] = match;
+        html += esc(text.slice(offset, match.index));
+        if (token.startsWith("\\"))
+            html += esc(token.slice(1));
+        else if (token.startsWith("`"))
+            html += `<code>${esc(token.slice(1, -1))}</code>`;
+        else if (bold !== undefined)
+            html += `<strong>${inline(bold, allowLinks)}</strong>`;
+        else {
+            const href = allowLinks && token.startsWith("[") && destination ? externalMarkdownUrl(destination) : undefined;
+            html += href && label !== undefined
+                ? `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer" data-markdown-link>${inline(label, false)}</a>`
+                : esc(token);
+        }
+        offset = match.index + token.length;
+    }
+    return html + esc(text.slice(offset));
 }
 function md(text) {
     const out = [];
@@ -629,7 +649,7 @@ function md(text) {
     let list = null;
     const flush = () => {
         if (para.length)
-            out.push(`<p>${para.map(inline).join("<br>")}</p>`);
+            out.push(`<p>${para.map((line) => inline(line)).join("<br>")}</p>`);
         para = [];
         if (list)
             out.push(`</${list}>`);
@@ -2394,6 +2414,19 @@ function dataValue(element, name) {
 async function onClick(e) {
     if (!(e.target instanceof Element))
         return;
+    const commentLink = e.target.closest("a[data-markdown-link][href]");
+    if (commentLink?.tagName === "A") {
+        e.preventDefault();
+        try {
+            await api("POST", "open-comment-link", { url: commentLink.href });
+        }
+        catch (error) {
+            toast(errorMessage(error), true);
+        }
+        return;
+    }
+    if (e.type === "auxclick")
+        return;
     const target = e.target.closest("[data-action]");
     if (!target || target instanceof HTMLSelectElement)
         return;
@@ -2987,6 +3020,10 @@ function onMouseUp() {
 }
 // ---------- Boot ----------
 document.addEventListener("click", onClick);
+document.addEventListener("auxclick", (e) => {
+    if (e.button === 1)
+        void onClick(e);
+});
 document.addEventListener("change", onChange);
 document.addEventListener("input", onInput);
 document.addEventListener("paste", onPaste);

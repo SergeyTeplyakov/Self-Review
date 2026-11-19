@@ -68,6 +68,7 @@ export async function loadApp(context: vm.Context) {
         createSettingsApi,
         REVIEW_COMMANDS,
         reviewCommandSuggestions,
+        URL,
         Element: MockElement,
         HTMLElement: MockElement,
         HTMLInputElement: MockInputElement,
