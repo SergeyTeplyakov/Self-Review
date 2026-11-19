@@ -160,6 +160,21 @@ test("agent reply renders Markdown issue links as external anchors", async () =>
     assert.ok(html.includes('<a href="http://example.test/a(b)?x=1&amp;y=2" target="_blank" rel="noopener noreferrer" data-markdown-link><strong>docs &amp; notes</strong></a>'));
 });
 
+test("reply Markdown respects matching code delimiters and escaped URL punctuation", async () => {
+    const app = await loadApp();
+    const body = "``literal ` [not a link](https://example.test/)`` and [ref](https://example.test/a\\(b\\))";
+    const html = app.run(`md(${JSON.stringify(body)})`);
+    assert.ok(html.includes("<code>literal ` [not a link](https://example.test/)</code>"));
+    assert.equal(html.match(/<a\b/g)?.length, 1);
+    assert.match(html, /href="https:\/\/example\.test\/a\(b\)"/);
+});
+
+test("very long Markdown lines fall back to escaped text", async () => {
+    const app = await loadApp();
+    const line = "[details](https://example.test/) " + "x".repeat(5000) + " <literal>";
+    assert.equal(app.run(`md(${JSON.stringify(line)})`), `<div class="md"><p>${line.replace("<literal>", "&lt;literal&gt;")}</p></div>`);
+});
+
 test("agent reply keeps non-web destinations, raw HTML and code inert", async () => {
     const app = await loadApp();
     const body = [
