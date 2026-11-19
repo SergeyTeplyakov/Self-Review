@@ -17,6 +17,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium, type Browser, type Page } from "playwright-core";
+import assert from "node:assert/strict";
 import type { ReviewService as ReviewServiceContract } from "../../extensions/self-review/src/lib/review-service.mjs";
 import {
     AgentReview, Delivery, ReviewService, ReviewSkills, SettingsService, Store, runGit, startReviewServer,
@@ -27,6 +28,7 @@ const HERE = path.join(REPOSITORY_ROOT, "docs", "screenshots");
 const WEB_ROOT = path.join(HERE, "..", "..", "extensions", "self-review", "dist", "web");
 const OUT = path.join(HERE, "..", "images");
 const KEEP = process.argv.includes("--keep");
+const CHECK_REFRESH = process.argv.includes("--check-refresh-layout");
 const only = process.argv.find((arg) => arg.startsWith("--only="))?.slice("--only=".length).split(",");
 const WIDTH = 1320;
 const THEMES: Array<"light" | "dark"> = ["light", "dark"];
@@ -574,6 +576,42 @@ async function nav(page: Page, view: string, filePath?: string) {
     await page.waitForTimeout(250);
 }
 
+async function checkRefreshLayout(browser: Browser, url: string) {
+    const page = await browser.newPage({ viewport: { width: 480, height: 750 } });
+    try {
+        await page.goto(url);
+        const status = page.locator("#review-status");
+        const refresh = page.locator('#top [data-action="refresh"]');
+        const file = page.locator('#side [data-view="file"]').first();
+        await file.waitFor();
+        await status.waitFor({ state: "hidden" });
+        const geometry = () => Promise.all([file, page.locator("#main"), refresh].map((element) => element.boundingBox()));
+        const original = await geometry();
+        let fail = true;
+        await page.route("**/api/refresh", async (route) => {
+            await status.filter({ hasText: "Showing the last loaded data" }).waitFor();
+            assert.deepEqual(await geometry(), original, "refresh progress must not shift the review");
+            if (fail) {
+                await route.fulfill({ status: 500, json: { error: { message: "Long capture error ".repeat(20) } } });
+            } else {
+                await route.continue();
+            }
+        });
+        await refresh.click();
+        const retry = status.getByRole("button", { name: "Retry" });
+        await retry.waitFor();
+        assert.match((await status.textContent()) ?? "", /Long capture error/);
+        assert.deepEqual(await geometry(), original, "a long error must not shift the review");
+        fail = false;
+        await retry.click();
+        await page.locator("#toast").filter({ hasText: "Refreshed from the working tree" }).waitFor();
+        await status.waitFor({ state: "hidden" });
+        assert.deepEqual(await geometry(), original, "successful retry must restore idle without shifting the review");
+    } finally {
+        await page.close();
+    }
+}
+
 // Sizes the viewport to the content of both panes (up to maxHeight) so the shot has no scrolling
 // and no trailing whitespace. scrollHeight is unusable here: it never drops below the pane height.
 async function fitHeight(page: Page, maxHeight: number) {
@@ -582,7 +620,8 @@ async function fitHeight(page: Page, maxHeight: number) {
         if (!(main instanceof HTMLElement)) throw new Error("Main content pane is missing.");
         const bottoms = [...main.children].map((el) => el.getBoundingClientRect().bottom + main.scrollTop);
         bottoms.push(...[...document.querySelectorAll("#side .nav-item")].map((el) => el.getBoundingClientRect().bottom));
-        return Math.ceil(Math.max(...bottoms) + 16);
+        const statusHeight = document.querySelector("#review-status-slot")?.getBoundingClientRect().height ?? 0;
+        return Math.ceil(Math.max(...bottoms) + 16 + statusHeight);
     });
     await page.setViewportSize({ width: WIDTH, height: Math.min(needed, maxHeight) });
     await page.waitForTimeout(250);
@@ -777,10 +816,15 @@ try {
     });
     await mkdir(OUT, { recursive: true });
     browser = await launchBrowser();
-    for (const theme of THEMES) {
-        console.log(`${theme}:`);
-        await capture(browser, server.url, theme, resetLearning);
-        if ((await service.getReview(seeded.reviewId)).agentReviews?.length) throw new Error("Screenshots must not start reviews.");
+    if (CHECK_REFRESH) {
+        await checkRefreshLayout(browser, server.url);
+        console.log("Refresh layout stable during progress, error, and retry.");
+    } else {
+        for (const theme of THEMES) {
+            console.log(`${theme}:`);
+            await capture(browser, server.url, theme, resetLearning);
+            if ((await service.getReview(seeded.reviewId)).agentReviews?.length) throw new Error("Screenshots must not start reviews.");
+        }
     }
     if (KEEP) {
         console.log(`\nDemo review: ${server.url}\nRepo: ${path.join(tmp, "orders-api")}\nPress Ctrl+C to stop.`);

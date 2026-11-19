@@ -1070,9 +1070,12 @@ function renderLoadStatus(): void {
     const failureLabel = loadError ? "Could not load the current review" : "Could not refresh from the working tree";
     status.hidden = !pending && !error;
     status.className = error && !pending ? "review-status del" : "review-status muted";
-    status.innerHTML = pending
+    const message = pending
         ? state.review ? "Refreshing review and Overview... Showing the last loaded data." : "Loading review and Overview..."
-        : error ? `${failureLabel}: ${esc(error)}. ${state.review ? "Showing the last loaded data. " : ""}<button data-action="refresh">Retry</button>` : "";
+        : error ? `${failureLabel}: ${esc(error)}. ${state.review ? "Showing the last loaded data." : ""}` : "";
+    const retry = error && !pending ? `<button type="button" data-action="refresh">Retry</button>` : "";
+    const html = message ? `<span class="review-status-message">${message}</span>${retry}` : "";
+    if (status.innerHTML !== html) status.innerHTML = html;
 }
 
 async function loadState() {
@@ -1138,7 +1141,8 @@ function scheduleReload() {
         reloadPending = false;
         return;
     }
-    reloadTimer = window.setTimeout(() => loadState().catch((err: unknown) => toast(errorMessage(err), true)), 120);
+    // loadState already reports failures in the persistent status footer.
+    reloadTimer = window.setTimeout(() => loadState().catch(() => undefined), 120);
 }
 
 async function refreshReview(): Promise<void> {
@@ -1586,7 +1590,7 @@ function renderDialog() {
     const dialog = $("#dialog");
     if (!dialog) return;
     dialog.innerHTML = dialogHtml();
-    for (const id of ["#top", "#banner", "#layout"]) {
+    for (const id of ["#top", "#banner", "#layout", "#review-status-slot"]) {
         const el = $(id);
         if (el) el.inert = Boolean(state.dialog);
     }
@@ -2931,8 +2935,8 @@ async function onClick(e: MouseEvent): Promise<void> {
                 break;
         }
     } catch (err: unknown) {
-        toast(errorMessage(err), true);
         if (action === "refresh") target.removeAttribute("disabled");
+        else toast(errorMessage(err), true);
     }
 }
 
