@@ -6,6 +6,7 @@
 //   cd docs/screenshots
 //   npm install
 //   node render.mjs           render every shot into docs/images
+//   node render.mjs --only=comment,batch  write only the selected shots
 //   node render.mjs --keep    also keep the demo review running and print its URL
 //
 // Uses an installed Edge or Chrome when available (set MR_BROWSER_CHANNEL to pick one).
@@ -26,6 +27,7 @@ const HERE = path.join(REPOSITORY_ROOT, "docs", "screenshots");
 const WEB_ROOT = path.join(HERE, "..", "..", "extensions", "self-review", "dist", "web");
 const OUT = path.join(HERE, "..", "images");
 const KEEP = process.argv.includes("--keep");
+const only = process.argv.find((arg) => arg.startsWith("--only="))?.slice("--only=".length).split(",");
 const WIDTH = 1320;
 const THEMES: Array<"light" | "dark"> = ["light", "dark"];
 
@@ -428,7 +430,10 @@ async function seed(tmp: string) {
         log: () => {},
         reviewIds: () => [reviewId],
     });
-    reviewId = await service.ensureReview({ repoPath: repo, base: "main", title: "Retry transient failures in HttpClient" });
+    reviewId = await service.ensureReview({
+        repoPath: repo, base: "main", title: "Retry transient failures in HttpClient",
+        exclude: [".github/copilot-instructions.md"],
+    });
 
     // Backdate everything afterwards so the UI shows a plausible timeline instead of "just now".
     const minutesAgo = new Map();
@@ -454,6 +459,7 @@ async function seed(tmp: string) {
     ) => {
         const { message } = await service.addMessage(reviewId, threadId, { author: "agent", ...input });
         minutesAgo.set(message.messageId, minutes);
+        return message;
     };
     const nextRevision = async (files: Record<string, string | null>, minutes: number) => {
         await writeFiles(repo, files);
@@ -466,7 +472,7 @@ async function seed(tmp: string) {
     await service.updateDescription(reviewId, { body: DESCRIPTION(false), expectedVersion: 0 });
     await reply(40, overall.threadId, {
         outcome: "answered",
-        body: "Drafted it above: purpose, behavior, verification and risks. I'll keep it in sync as the diff changes. Short descriptions look like a personal preference, so I proposed it as a guideline: say yes and I'll save it to your own instructions.",
+        body: "Drafted it above: purpose, behavior, verification and risks. Short descriptions look like a personal preference, so I proposed a guideline below.",
         lessons: [{ scope: "personal", rule: "Keep PR descriptions short: purpose, behavior change, verification, risks.", status: "proposed" }],
     });
 
@@ -480,23 +486,27 @@ async function seed(tmp: string) {
     });
 
     await nextRevision(R2, 27);
-    await reply(26, jitter.threadId, {
+    const jitterRule = "Retries use exponential backoff with full jitter and honor `Retry-After`.";
+    const jitterReply = await reply(26, jitter.threadId, {
         outcome: "changed",
         body: "Switched to full jitter: the delay is now uniform in `[0, min(base * 2^n, maxDelayMs)]`. `Retry-After` (seconds or HTTP-date) wins when the server sends it.",
         verification: "`npm test -- retry`: 5 passed",
-        lessons: [{ scope: "repo", rule: "Retries use exponential backoff with full jitter and honor `Retry-After`.", savedTo: ".github/copilot-instructions.md" }],
+        lessons: [{ scope: "repo", rule: jitterRule }],
     });
+    await service.saveLesson(reviewId, jitterReply.lessonIds![0], { scope: "repo", rule: jitterRule });
     await service.setThreadStatus(reviewId, jitter.threadId, "resolved");
 
     const clamp = await onLine(15, R2, "src/http/retry.ts", "const retryAfter = error instanceof HttpError",
         "Clamp this. A server that sends `Retry-After: 3600` would stall the request for an hour.");
     await nextRevision(R3, 9);
-    await reply(8, clamp.threadId, {
+    const clampRule = "Clamp server-supplied delays such as `Retry-After` to the configured maximum.";
+    const clampReply = await reply(8, clamp.threadId, {
         outcome: "changed",
         body: "`Retry-After` is now clamped to `maxDelayMs`, the same cap as the computed backoff. Added a test for a one-hour value.",
         verification: "`npm test -- retry`: 6 passed",
-        lessons: [{ scope: "repo", rule: "Clamp server-supplied delays such as `Retry-After` to the configured maximum.", savedTo: ".github/copilot-instructions.md" }],
+        lessons: [{ scope: "repo", rule: clampRule }],
     });
+    await service.saveLesson(reviewId, clampReply.lessonIds![0], { scope: "repo", rule: clampRule });
     await service.updateDescription(reviewId, { body: DESCRIPTION(true), expectedVersion: 1 });
 
     const idempotent = await onLine(3, R3, "src/http/retry.ts", "export async function withRetry",
@@ -590,17 +600,18 @@ async function capture(
     await page.goto(url);
     await page.locator("#side .nav-item").first().waitFor();
     const shot = async (name: string, clip?: { x: number; y: number; width: number; height: number }) => {
+        if (only && !only.includes(name)) return;
         const target = path.join(OUT, `${name}-${theme}.png`);
         await page.screenshot({ path: target, clip });
         console.log(`  ${path.relative(process.cwd(), target)}`);
     };
 
-    // A repository with no learning setting opens with a notice. Choosing Suggest from it dismisses the notice for good.
+    // Choosing manual saving in the notice dismisses it for this repository.
     await page.locator("#banner:not([hidden])").waitFor();
     const banner = await page.locator("#banner").boundingBox();
     if (!banner) throw new Error("Learning banner is not visible.");
     await shot("banner", { x: 0, y: 0, width: WIDTH, height: Math.ceil(banner.y + banner.height) });
-    await page.locator('#banner [data-action="learning-set"][data-mode="suggest"]').click();
+    await page.locator('#banner [data-action="learning-set"][data-enabled="false"]').click();
     await page.locator("#banner").waitFor({ state: "hidden" });
     await page.locator("#toast").waitFor({ state: "hidden" });
 
@@ -622,7 +633,29 @@ async function capture(
     await composer.waitFor();
     await composer.focus();
     await page.keyboard.type("Log each attempt with its status code, so retry storms show up on the dashboard.");
+    await composer.evaluate(async (field) => {
+        const fixture = document.createElement("canvas");
+        fixture.width = 200;
+        fixture.height = 85;
+        const ctx = fixture.getContext("2d");
+        if (!ctx) throw new Error("Cannot draw the clipboard fixture.");
+        ctx.fillStyle = "#182230";
+        ctx.fillRect(0, 0, fixture.width, fixture.height);
+        ctx.fillStyle = "#dbeafe";
+        ctx.font = "16px monospace";
+        ctx.fillText("Retry dashboard", 10, 28);
+        ctx.fillText("503 · attempt 2", 10, 56);
+        const png = await new Promise<Blob | null>((resolve) => fixture.toBlob(resolve, "image/png"));
+        if (!png) throw new Error("Cannot encode the clipboard fixture.");
+        const clipboardData = new DataTransfer();
+        clipboardData.items.add(new File([png], "dashboard.png", { type: png.type }));
+        field.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData }));
+    });
+    const preview = page.locator(".composer .comment-images img");
+    await preview.waitFor();
+    await preview.evaluate((image: HTMLImageElement) => image.decode());
     await shot("comment");
+    await page.getByRole("button", { name: "Remove attached image 1" }).click();
 
     await page.keyboard.press("Escape");
     await nav(page, "overview");

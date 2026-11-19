@@ -18,6 +18,7 @@ const settingsHttp = await loadModule<typeof import("../src/lib/settings-http.mj
 const store = await loadModule<typeof import("../src/lib/store.mjs")>("../dist/lib/store.mjs");
 const contracts = await loadModule<typeof import("../src/web/contracts.mjs")>("../dist/web/contracts.mjs");
 const settingsApi = await loadModule<typeof import("../src/web/settings-api.mjs")>("../dist/web/settings-api.mjs");
+const reviewCommands = await loadModule<typeof import("../src/web/review-commands.mjs")>("../dist/web/review-commands.mjs");
 const completionGuidance = await loadModule<typeof import("../src/lib/completion-guidance.mjs")>("../dist/lib/completion-guidance.mjs");
 const reviewWatcher = await loadModule<typeof import("../src/lib/review-watcher.mjs")>("../dist/lib/review-watcher.mjs");
 
@@ -27,7 +28,7 @@ export const { Delivery } = delivery;
 export const { parseUnifiedDiff, synthesizeAddedFile, hunkAnchorRange, selectedLines, hunkExcerpt } = diff;
 export const git = gitModule;
 export const { runGit, captureSnapshot, readWorkingFile, safeJoin } = gitModule;
-export const { buildCommentPrompt, marker } = prompt;
+export const { buildCommentPrompt, buildBatchPrompt, marker } = prompt;
 export const { findOpenPullRequest } = pullRequest;
 export const { ReviewService, computeReviewId, scopeOf } = reviewService;
 export const { ReviewSkills } = reviewSkillsModule;
@@ -38,6 +39,7 @@ export const { SettingsHttp } = settingsHttp;
 export const { Store, migrateLegacyDataRoot, defaultDataRoot } = store;
 export const { agentReviewDefaults, reviewOptions, settingsDocument, settingsPatch } = contracts;
 export const { createSettingsApi } = settingsApi;
+export const { REVIEW_COMMANDS, reviewCommandSuggestions, parseReviewCommand } = reviewCommands;
 export const { completionHooks, COMPLETION_REVIEW_GUIDANCE } = completionGuidance;
 export const { ReviewWatcher } = reviewWatcher;
 

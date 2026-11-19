@@ -14,6 +14,7 @@ interface ReviewUpdate<T> {
     review?: Review | null;
     value?: T;
     write?: boolean;
+    journalLessons?: Iterable<Lesson>;
 }
 type InstanceMap = Record<string, string | { reviewId: string; returnReviewId?: string | null }>;
 const errorCode = (error: unknown) => error && typeof error === "object" && "code" in error ? error.code : undefined;
@@ -191,11 +192,13 @@ export class Store {
     async updateReview<T = void>(reviewId: string, mutate: (review: Review | null) => ReviewUpdate<T> | Promise<ReviewUpdate<T>>): Promise<T> {
         return this.lock(`review:${reviewId}`, async () => {
             const current = await this.readReview(reviewId);
-            const { review, value, write = true } = (await mutate(current)) ?? {};
+            const { review, value, write = true, journalLessons = [] } = (await mutate(current)) ?? {};
             if (write && review) {
                 review.updatedAt = new Date().toISOString();
                 await writeJsonAtomic(this.reviewFile(reviewId), review);
             }
+            // Keep journal entries in the same order as committed versions of this review.
+            for (const lesson of journalLessons) await this.appendLesson(lesson);
             return value as T;
         });
     }

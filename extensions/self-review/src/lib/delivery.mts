@@ -3,6 +3,7 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { buildBatchPrompt, buildCommentPrompt } from "./prompt.mjs";
+import { readCommentImage } from "./comment-images.mjs";
 import type { ReviewService, DraftClaim } from "./review-service.mjs";
 import type { Log } from "../../types/contracts.js";
 
@@ -32,7 +33,7 @@ export class Delivery extends EventEmitter {
     readonly send: (options: SendOptions) => Promise<string>;
     readonly log: Log;
     readonly reviewIds: () => Iterable<string>;
-    readonly learning: (repoRoot: string) => Promise<string>;
+    readonly autoSaveLearnedRules: (repoRoot: string) => Promise<boolean>;
     readonly sessionId: () => string | undefined;
     readonly fallbackOwner: string;
     busy: boolean | null;
@@ -47,19 +48,19 @@ export class Delivery extends EventEmitter {
      * @param {(options: object) => Promise<string>} p.send session.send
      * @param {(msg: string, level?: string) => void} p.log
      * @param {() => Iterable<string>} p.reviewIds reviews to settle when the agent goes idle
-     * @param {(repoRoot: string) => Promise<string>} [p.learning] guideline-learning mode for a repository; failures fall back to off
+     * @param {(repoRoot: string) => Promise<boolean>} [p.autoSaveLearnedRules]
      * @param {() => string | undefined} [p.sessionId] conversation that processes the comments this instance sends
      */
-    constructor({ service, send, log = () => {}, reviewIds = () => [], learning = async () => "off", sessionId = () => undefined }: {
+    constructor({ service, send, log = () => {}, reviewIds = () => [], autoSaveLearnedRules = async () => false, sessionId = () => undefined }: {
         service: ReviewService; send: (options: SendOptions) => Promise<string>; log?: Log; reviewIds?: () => Iterable<string>;
-        learning?: (repoRoot: string) => Promise<string>; sessionId?: () => string | undefined;
+        autoSaveLearnedRules?: (repoRoot: string) => Promise<boolean>; sessionId?: () => string | undefined;
     }) {
         super();
         this.service = service;
         this.send = send;
         this.log = log;
         this.reviewIds = reviewIds;
-        this.learning = learning;
+        this.autoSaveLearnedRules = autoSaveLearnedRules;
         this.sessionId = sessionId;
         this.fallbackOwner = `delivery-${randomUUID()}`;
         this.busy = null;
@@ -99,10 +100,10 @@ export class Delivery extends EventEmitter {
 
     async repoLearning(repoRoot: string) {
         try {
-            return await this.learning(repoRoot);
+            return await this.autoSaveLearnedRules(repoRoot);
         } catch (err) {
             this.log(`self-review: could not read the learning setting, using off: ${errorMessage(err)}`, "warning");
-            return "off";
+            return false;
         }
     }
 
@@ -113,13 +114,21 @@ export class Delivery extends EventEmitter {
             const threadIds = [...new Set(claims.map((c) => c.threadId))];
             const contexts = [];
             for (const threadId of threadIds) contexts.push(await this.service.promptContext(reviewId, threadId));
-            const learning = await this.repoLearning(contexts[0].review.repoRoot);
+            const autoSaveLearnedRules = await this.repoLearning(contexts[0].review.repoRoot);
+            const attachments: NonNullable<SendOptions["attachments"]> = [];
+            for (const claim of claims) {
+                const message = contexts.find((ctx) => ctx.thread.threadId === claim.threadId)?.thread.messages.find((m) => m.messageId === claim.messageId);
+                for (const [index, id] of (message?.imageIds ?? []).entries()) {
+                    const { bytes, mimeType } = await readCommentImage(this.service.store, reviewId, id);
+                    attachments.push({ type: "blob", data: bytes.toString("base64"), mimeType, displayName: `${claim.messageId}-image-${index + 1}` });
+                }
+            }
             let built;
             if (claims.length === 1) {
                 const ctx = contexts[0];
                 const message = ctx.thread.messages.find((m) => m.messageId === claims[0].messageId);
                 if (!message) throw new Error(`Claimed message ${claims[0].messageId} not found.`);
-                built = buildCommentPrompt({ ...ctx, message, instanceId, learning });
+                built = buildCommentPrompt({ ...ctx, message, instanceId, autoSaveLearnedRules });
             } else {
                 const ids = new Set(claims.map((c) => c.messageId));
                 const groups = contexts.map((ctx) => ({
@@ -128,9 +137,10 @@ export class Delivery extends EventEmitter {
                     excerpt: ctx.excerpt,
                     selected: ctx.selected,
                 }));
-                built = buildBatchPrompt({ review: contexts[contexts.length - 1].review, groups, instanceId, learning });
+                built = buildBatchPrompt({ review: contexts[contexts.length - 1].review, groups, instanceId, autoSaveLearnedRules });
             }
-            sessionMessageId = await this.send({ prompt: built.prompt, displayPrompt: built.displayPrompt, mode: "enqueue" });
+            sessionMessageId = await this.send({ prompt: built.prompt, displayPrompt: built.displayPrompt, mode: "enqueue",
+                ...(attachments.length ? { attachments } : {}) });
         } catch (err) {
             const error = errorMessage(err);
             this.log(`self-review: failed to deliver ${claims.map((c) => c.messageId).join(", ")}: ${error}`, "warning");

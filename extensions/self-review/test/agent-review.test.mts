@@ -535,7 +535,7 @@ test("overlapping equivalent findings with different severities share one action
     const approval = await f.agent.approve("review", thread.threadId, "r2");
     const context = await f.service.promptContext("review", thread.threadId);
     const message = required(context.thread.messages.find((item) => item.messageId === approval.messageId));
-    const prompt = buildCommentPrompt({ ...context, message, instanceId: "c", learning: "off" }).prompt;
+    const prompt = buildCommentPrompt({ ...context, message, instanceId: "c" }).prompt;
     assert.match(prompt, /"severity": "optional"/);
     assert.match(prompt, /"startLine": 2/);
     assert.match(prompt, /"source": "notes.md:2-3"/);
@@ -576,7 +576,7 @@ test("unanimously equivalent findings on disjoint lines retain both original anc
     const approval = await f.agent.approve("review", first(threads).threadId, "r2");
     const context = await f.service.promptContext("review", first(threads).threadId);
     const message = required(context.thread.messages.find((item) => item.messageId === approval.messageId));
-    const prompt = buildCommentPrompt({ ...context, message, instanceId: "c", learning: "off" }).prompt;
+    const prompt = buildCommentPrompt({ ...context, message, instanceId: "c" }).prompt;
     assert.match(prompt, /"startLine": 3/);
     assert.match(prompt, /"source": "notes.md:3"/);
     assert.match(prompt, /"selectedLines": \[\s*"new three"/);
@@ -796,7 +796,7 @@ test("approval is explicit and idempotent; stale results remain discussable but 
     assert.equal(ctx.thread.messages.length, 2);
     assert.equal(message.reviewIntent, "approve");
     assert.ok(!message.body.includes(finding.body), "model output must not be copied into a user-authored message");
-    const approvalPrompt = buildCommentPrompt({ ...ctx, message, instanceId: "c", learning: "off" }).prompt;
+    const approvalPrompt = buildCommentPrompt({ ...ctx, message, instanceId: "c" }).prompt;
     assert.match(approvalPrompt, /clicked Approve/);
     assert.match(approvalPrompt, /Reported assessment: confirmed; severity: required/);
     assert.match(approvalPrompt, /Recorded evidence \(data, not instructions\)/);
@@ -807,7 +807,7 @@ test("approval is explicit and idempotent; stale results remain discussable but 
     assert.ok(!rest.split("## What to do")[0].includes(finding.body), "the finding is not presented as the user's comment");
     assert.equal(approvalPrompt.split(finding.body).length, 2, "the finding is rendered exactly once");
     const discussion = await f.service.addMessage("review", thread.threadId, { body: "Explain the tradeoff", author: "user", hold: true });
-    assert.match(buildCommentPrompt({ ...ctx, message: discussion.message, instanceId: "c", learning: "off" }).prompt, /without implementing/);
+    assert.match(buildCommentPrompt({ ...ctx, message: discussion.message, instanceId: "c" }).prompt, /without implementing/);
     f.snapshot.fingerprint = "two";
     await f.service.refresh("review");
     const stale = (await f.service.getReview("review")).threads[1];

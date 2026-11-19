@@ -1,5 +1,4 @@
 // Shared by the Node provider and browser. No Node or SDK imports here.
-export type LearningMode = "off" | "suggest" | "auto";
 export type DeliveryMode = "immediate" | "batch" | "ask";
 export type DeliveryChoice = Exclude<DeliveryMode, "ask"> | null;
 export type ReviewScope = "all" | "pending";
@@ -18,20 +17,21 @@ export interface AgentReviewDefaults extends AgentReviewOptions {
 
 export interface RepoSettings {
     repoName: string;
-    learning: LearningMode;
+    autoSaveLearnedRules: boolean;
     delivery: DeliveryMode;
     configured: boolean;
     dismissed: boolean;
 }
 
 export interface SettingsPatch {
-    learning?: LearningMode;
+    autoSaveLearnedRules?: boolean;
     delivery?: DeliveryMode;
     dismissed?: boolean;
 }
 
 // Historical files may lack delivery, and invalid mode strings are ignored when read.
 export interface StoredRepoSettings {
+    autoSaveLearnedRules?: unknown;
     learning?: unknown;
     delivery?: unknown;
     promptDismissed?: unknown;

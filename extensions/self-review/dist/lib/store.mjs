@@ -178,11 +178,14 @@ export class Store {
     async updateReview(reviewId, mutate) {
         return this.lock(`review:${reviewId}`, async () => {
             const current = await this.readReview(reviewId);
-            const { review, value, write = true } = (await mutate(current)) ?? {};
+            const { review, value, write = true, journalLessons = [] } = (await mutate(current)) ?? {};
             if (write && review) {
                 review.updatedAt = new Date().toISOString();
                 await writeJsonAtomic(this.reviewFile(reviewId), review);
             }
+            // Keep journal entries in the same order as committed versions of this review.
+            for (const lesson of journalLessons)
+                await this.appendLesson(lesson);
             return value;
         });
     }

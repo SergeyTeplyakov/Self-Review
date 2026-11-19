@@ -3,14 +3,17 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as gitDefault from "./git-process.mjs";
-import { agentReviewDefaults, settingsPatch, isLearningMode, isDeliveryMode, ReviewError } from "../web/contracts.mjs";
-export { LEARNING_MODES, DELIVERY_MODES } from "../web/contracts.mjs";
-// How the agent treats review feedback as reusable guidelines:
-//   off     - address the comment only; never touch instruction files
-//   suggest - propose guidelines in the thread and save one only after the reviewer approves it
-//   auto    - save settled repository guidelines directly and report where they went
-/** @type {import("../../types/contracts.js").LearningMode} */
-export const DEFAULT_LEARNING = "off";
+import { agentReviewDefaults, settingsPatch, isDeliveryMode, ReviewError } from "../web/contracts.mjs";
+export { DELIVERY_MODES } from "../web/contracts.mjs";
+function storedAutoSave(entry) {
+    if (typeof entry?.autoSaveLearnedRules === "boolean")
+        return entry.autoSaveLearnedRules;
+    if (entry?.learning === "auto")
+        return true;
+    if (entry?.learning === "off" || entry?.learning === "suggest")
+        return false;
+    return undefined;
+}
 // When the agent receives the reviewer's comments:
 //   immediate - each comment is sent as soon as it is posted
 //   batch     - comments wait as drafts until the reviewer submits them together
@@ -147,8 +150,7 @@ export class SettingsService {
         });
         return value;
     }
-    // Effective settings for a repository. Learning stays off until the reviewer chooses a mode,
-    // and an unreadable settings file never blocks the review.
+    // An unreadable settings file never enables automatic writes.
     /** @param {string} repoRoot @returns {Promise<import("../../types/contracts.js").RepoSettings>} */
     async get(repoRoot) {
         const identity = await repoIdentity(repoRoot, this.git);
@@ -159,12 +161,12 @@ export class SettingsService {
         catch (err) {
             this.log(`settings unreadable: ${err instanceof Error ? err.message : String(err)}`);
         }
-        const configured = isLearningMode(entry?.learning);
+        const autoSave = storedAutoSave(entry);
         return {
             repoName: identity.name,
-            learning: isLearningMode(entry?.learning) ? entry.learning : DEFAULT_LEARNING,
+            autoSaveLearnedRules: autoSave ?? false,
             delivery: isDeliveryMode(entry?.delivery) ? entry.delivery : DEFAULT_DELIVERY,
-            configured,
+            configured: autoSave !== undefined,
             dismissed: entry?.promptDismissed === true,
         };
     }
@@ -174,8 +176,11 @@ export class SettingsService {
         const identity = await repoIdentity(repoRoot, this.git);
         await this.store.updateSettings((settings) => {
             const entry = { ...settings.repos[identity.key] };
-            if (patch.learning !== undefined)
-                entry.learning = patch.learning;
+            const autoSave = patch.autoSaveLearnedRules ?? storedAutoSave(entry);
+            if (autoSave !== undefined) {
+                entry.autoSaveLearnedRules = autoSave;
+                delete entry.learning;
+            }
             if (patch.delivery !== undefined)
                 entry.delivery = patch.delivery;
             if (patch.dismissed !== undefined)

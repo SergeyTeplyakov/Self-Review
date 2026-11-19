@@ -1,7 +1,7 @@
 // Extension: self-review
 // PR-style inline review of local git changes. Comments are delivered to the agent as
 // conversation messages; the agent answers in-thread with the `reply` action and, depending on the
-// repository's learning mode, proposes or saves guidelines drawn from the feedback.
+// repository's auto-save setting, proposes or saves guidelines drawn from the feedback.
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { joinSession, createCanvas, CanvasError } from "@github/copilot-sdk/extension";
@@ -42,8 +42,9 @@ const log = (message: string, level: "info" | "warning" | "error" = "info"): voi
 };
 
 const store = new Store();
-const service = new ReviewService({ store, log });
 const settings = new SettingsService({ store, log });
+const autoSaveLearnedRules = async (repoRoot: string) => (await settings.get(repoRoot)).autoSaveLearnedRules;
+const service = new ReviewService({ store, log, autoSaveLearnedRules });
 // instanceId -> { reviewId, server, ready }
 const instances = new Map<string, InstanceEntry>();
 const openReviewIds = (): Set<string> => new Set([...instances.values()].map((entry) => entry.reviewId));
@@ -56,7 +57,7 @@ const delivery = new Delivery({
     log,
     send,
     reviewIds: openReviewIds,
-    learning: async (repoRoot: string) => (await settings.get(repoRoot)).learning,
+    autoSaveLearnedRules,
     sessionId: () => session?.sessionId,
 });
 const reviewSkills = new ReviewSkills({ store });
@@ -400,7 +401,7 @@ const actions: CanvasAction[] = [
     },
     {
         name: "get_review",
-        description: "Read the review: scope, git state, threads with messages and delivery state, lessons, and the repository's guideline-learning mode (off, suggest, auto). Use to catch up on comments or check what is still unanswered. Comments the reviewer is still holding as drafts are left out; counts.drafts says how many there are.",
+        description: "Read the review: scope, git state, threads, lessons, and whether Auto-save learned rules is enabled. Held drafts are excluded; counts.drafts says how many there are.",
         inputSchema: {
             type: "object",
             properties: {
@@ -417,7 +418,7 @@ const actions: CanvasAction[] = [
                 threadId: typeof input.threadId === "string" ? input.threadId : undefined,
                 includeResolved: input.includeResolved === true,
             });
-            return { ...summary, learning: (await settings.get(review.repoRoot)).learning };
+            return { ...summary, autoSaveLearnedRules: await autoSaveLearnedRules(review.repoRoot) };
         }),
     },
     {
@@ -429,20 +430,21 @@ const actions: CanvasAction[] = [
                 reviewId: reviewIdProp,
                 threadId: { type: "string" },
                 inReplyTo: { type: "string", description: "messageId of the user comment being answered." },
+                batchId: { type: "string", description: "Submission ID from the batch prompt. Omit for an individually delivered comment." },
                 body: { type: "string", description: "Markdown. What changed (files/lines) or the answer." },
                 outcome: { type: "string", enum: OUTCOMES },
                 verification: { type: "string", description: "How the change was verified (build/test command and result)." },
                 lessons: {
                     type: "array",
-                    description: "Reusable guidelines drawn from this comment, and what happened to them. Follow the learning mode in the delivered prompt.",
+                    description: "Reusable guideline proposals. Self-Review handles saving and verification.",
                     items: {
                         type: "object",
                         properties: {
                             lessonId: { type: "string", description: "A guideline already listed for this thread; use it to record the reviewer's decision on it." },
+                            sourceMessageId: { type: "string", description: "For a new guideline, the messageId of the originating comment answered by this reply. Required for /learn in a mixed batch. Omit when refining an existing lesson by lessonId." },
                             scope: { type: "string", enum: ["repo", "personal"] },
                             rule: { type: "string", description: "The guideline text. Required unless lessonId is given." },
-                            status: { type: "string", enum: LESSON_STATUSES, description: "proposed: suggested to the reviewer; saved (default): written to savedTo; declined: the reviewer rejected it." },
-                            savedTo: { type: "string", description: "Instruction file the rule was written to." },
+                            status: { type: "string", enum: LESSON_STATUSES, description: "proposed (default), or declined if the reviewer rejects a proposal." },
                         },
                         additionalProperties: false,
                     },
@@ -462,6 +464,7 @@ const actions: CanvasAction[] = [
                 outcome: input.outcome,
                 verification: input.verification,
                 inReplyTo: input.inReplyTo,
+                batchId: input.batchId,
                 lessons: input.lessons,
             });
             let revision = null;

@@ -1,6 +1,6 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile, readFile, cp, appendFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile, readFile, cp, appendFile } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -252,7 +252,7 @@ test("agent reply marks the comment replied and records lessons", async () => {
         outcome: "changed",
         inReplyTo: lineMessage.messageId,
         verification: "unit tests",
-        lessons: [{ scope: "personal", rule: "Explain renames", savedTo: "~/.copilot/copilot-instructions.md" }],
+        lessons: [{ scope: "personal", rule: "Explain renames" }],
     });
     assert.equal(message.outcome, "changed");
     assert.equal(await deliveryState(lineMessage.messageId), "replied");
@@ -381,7 +381,7 @@ test("HTTP server enforces token/host/origin and delivers posted comments", asyn
         assert.equal(page.status, 200);
         assert.match(page.text, /app\.js/);
         assert.equal((await request(port, { pathName: "/app.js" })).status, 200);
-        for (const asset of ["/contracts.mjs", "/settings-api.mjs"]) {
+        for (const asset of ["/contracts.mjs", "/settings-api.mjs", "/review-commands.mjs"]) {
             const response = await request(port, { pathName: asset });
             assert.equal(response.status, 200);
             assert.match(response.text, /export /);
@@ -488,6 +488,300 @@ test("review data never leaves the data root and the repo is untouched", async (
     assert.doesNotMatch(status.stdout, /\.copilot|review\.json/);
     const review = JSON.parse(await readFile(store.reviewFile(reviewId), "utf8"));
     assert.equal(review.reviewId, reviewId);
+});
+
+test("pasted image bytes survive drafts and reopen, and reach SDK attachment options for immediate and batch delivery", async () => {
+    const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGNgAAIAAAUAAen63NgAAAAASUVORK5CYII=", "base64");
+    const received: SendOptions[] = [];
+    const reviewService = new ReviewService({ store });
+    const reviewDelivery = new Delivery({ service: reviewService, send: async (options) => {
+        received.push(options);
+        return `image-message-${received.length}`;
+    } });
+    const server = await startReviewServer({ instanceId: "images", getReviewId: () => reviewId, service: reviewService, delivery: reviewDelivery, webRoot: WEB_ROOT });
+    try {
+        const url = new URL(server.url);
+        const token = required(url.searchParams.get("t"));
+        const endpoint = (suffix: string) => new URL(`/api/${suffix}`, url);
+        const headers = { "X-MR-Token": token, "X-MR-Review": reviewId };
+        assert.equal((await fetch(endpoint("comment-images"), { method: "POST", body: new Uint8Array(png) })).status, 403);
+        assert.equal((await fetch(endpoint("comment-images"), { method: "POST", headers, body: "<svg/>" })).status, 400);
+        const upload = await fetch(endpoint("comment-images"), { method: "POST", headers, body: new Uint8Array(png) });
+        assert.equal(upload.status, 200);
+        const { imageId } = await upload.json() as { imageId: string };
+        const imageUrl = endpoint(`comment-images/${imageId}`);
+        imageUrl.searchParams.set("review", reviewId);
+        assert.equal((await fetch(imageUrl)).status, 403);
+        const preview = await fetch(imageUrl, { headers });
+        assert.equal(preview.headers.get("content-type"), "image/png");
+        assert.deepEqual(Buffer.from(await preview.arrayBuffer()), png);
+        const post = (suffix: string, value: unknown) => fetch(endpoint(suffix), {
+            method: "POST", headers: { ...headers, "Content-Type": "application/json" }, body: JSON.stringify(value),
+        });
+        assert.equal((await post("threads", { kind: "overview", body: "", imageIds: [] })).status, 400);
+        const immediate = await post("threads", { kind: "overview", body: "", imageIds: [imageId], draft: false });
+        assert.equal(immediate.status, 200);
+        const thread = await immediate.json() as { threadId: string; messageId: string };
+        await waitFor(() => received[0], "immediate image delivery");
+        assert.deepEqual(received[0].attachments, [{ type: "blob", data: png.toString("base64"), mimeType: "image/png", displayName: `${thread.messageId}-image-1` }]);
+        assert.ok(received[0].prompt.includes(`${thread.messageId}-image-1`));
+        const reply = await post(`threads/${thread.threadId}/messages`, { body: "Compare this", imageIds: [imageId], draft: true });
+        assert.equal(reply.status, 200);
+        const draft = await reply.json() as { messageId: string };
+        const second = await post("threads", { kind: "overview", body: "And this", imageIds: [imageId], draft: true });
+        assert.equal(second.status, 200);
+        const otherDraft = await second.json() as { messageId: string };
+        assert.equal(received.length, 1);
+        const reopened = new ReviewService({ store: new Store(store.root) });
+        assert.deepEqual((await reopened.findMessage(reviewId, draft.messageId)).message.imageIds, [imageId]);
+        assert.ok(!(await readFile(store.reviewFile(reviewId), "utf8")).includes(png.toString("base64")));
+        assert.equal((await post("submit", {})).status, 200);
+        assert.deepEqual(received[1].attachments, [draft.messageId, otherDraft.messageId].map((id) => ({
+            type: "blob", data: png.toString("base64"), mimeType: "image/png", displayName: `${id}-image-1`,
+        })));
+        assert.ok(received[1].prompt.includes(`${draft.messageId}-image-1`));
+        assert.ok(received[1].prompt.includes(`${otherDraft.messageId}-image-1`));
+        const large = Buffer.alloc(2 * 1024 * 1024);
+        png.copy(large);
+        const largeUpload = await fetch(endpoint("comment-images"), { method: "POST", headers, body: new Uint8Array(large) });
+        assert.equal(largeUpload.status, 200);
+        const largeId = (await largeUpload.json() as { imageId: string }).imageId;
+        const drafts: string[] = [];
+        for (let i = 0; i < 9; i++) {
+            const draftResponse = await post("threads", { kind: "overview", body: `Draft ${i}`, imageIds: [largeId], draft: true });
+            assert.equal(draftResponse.status, 200);
+            drafts.push((await draftResponse.json() as { messageId: string }).messageId);
+        }
+        const oversized = await post("submit", {});
+        assert.equal(oversized.status, 400);
+        assert.match(await oversized.text(), /Send some comments individually/);
+        assert.equal(received.length, 2);
+        for (const id of drafts) assert.equal((await reopened.findMessage(reviewId, id)).message.delivery?.state, "draft");
+        const draftToSend = await reopened.findMessage(reviewId, drafts[0]);
+        await reviewDelivery.deliver(reviewId, draftToSend.thread.threadId, drafts[0], "images");
+        assert.equal((await post("submit", {})).status, 200);
+    } finally {
+        await server.close();
+    }
+});
+
+test("saving a refined batched /learn proposal requires the displayed wording and scope", async () => {
+    const savedTo = ".github/copilot-instructions.md";
+    const rule = "Place private methods after public methods in classes that follow this layout.";
+    const { thread, message: learn } = await service.createThread(reviewId, { kind: "overview", body: "/learn Use this class layout consistently.", hold: true });
+    const { message: explain } = await service.addMessage(reviewId, thread.threadId, { body: "/explain", hold: true });
+    await service.claimDrafts(reviewId);
+    await assert.rejects(service.addMessage(reviewId, thread.threadId, {
+        author: "agent", inReplyTo: explain.messageId, body: "Wrong source.",
+        lessons: [{ sourceMessageId: explain.messageId, rule, status: "proposed" }],
+    }), /delivered learning comment/);
+    const { message: proposal } = await service.addMessage(reviewId, thread.threadId, {
+        author: "agent", inReplyTo: explain.messageId, body: "Proposed for approval.",
+        lessons: [{ sourceMessageId: learn.messageId, rule, status: "proposed" }],
+    });
+    assert.equal(await deliveryState(learn.messageId), "replied");
+    const lessonId = required(proposal.lessonIds?.[0]);
+    const getLesson = async () => required((await getReview()).lessons.find((l) => l.lessonId === lessonId));
+    assert.equal((await getLesson()).status, "proposed");
+    const refined = "In classes with conventional access ordering, place private methods after public methods.";
+    const { message: discussion } = await service.addMessage(reviewId, thread.threadId, { body: "Limit it to classes with conventional access ordering." });
+    await service.addMessage(reviewId, thread.threadId, {
+        author: "agent", inReplyTo: discussion.messageId, body: refined,
+        lessons: [{ lessonId, rule: refined, scope: "repo" }],
+    });
+    const file = path.join(repo, savedTo);
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, "# Existing instructions\n");
+    const server = await startReviewServer({ instanceId: "save-rule", getReviewId: () => reviewId, service, delivery, webRoot: WEB_ROOT });
+    try {
+        const url = new URL(server.url);
+        const headers = { "X-MR-Token": required(url.searchParams.get("t")), "X-MR-Review": reviewId, "Content-Type": "application/json" };
+        const save = (rule: string, scope: string) => fetch(new URL(`/api/lessons/${lessonId}/save`, url), {
+            method: "POST", headers, body: JSON.stringify({ rule, scope }),
+        });
+        assert.equal((await save(rule, "repo")).status, 409);
+        assert.equal((await save(refined, "personal")).status, 409);
+        assert.equal((await getLesson()).status, "proposed");
+        assert.equal(await readFile(file, "utf8"), "# Existing instructions\n");
+        assert.equal((await save(refined, "repo")).status, 200);
+        assert.equal((await save(refined, "repo")).status, 200);
+        assert.equal(await readFile(file, "utf8"), `# Existing instructions\n\n- ${refined}\n`);
+        const lesson = await getLesson();
+        assert.equal(lesson.sourceMessageId, learn.messageId);
+        assert.equal(lesson.status, "saved");
+        assert.equal(lesson.savedTo, savedTo);
+    } finally {
+        await server.close();
+        await rm(file);
+    }
+});
+
+test("the agent cannot bypass verification by reporting a rule as saved", async () => {
+    const { thread, message } = await service.createThread(reviewId, { kind: "overview", body: "/learn Use this layout." });
+    await assert.rejects(service.addMessage(reviewId, thread.threadId, {
+        author: "agent", inReplyTo: message.messageId, body: "Saved.",
+        lessons: [{ rule: "Use this layout for comparable classes.", status: "saved" }],
+    }), /lesson.status must be one of proposed, declined/);
+    assert.equal(await deliveryState(message.messageId), "saving");
+});
+
+for (const other of ["/learn Use this layout.", "/explain Why this layout?", "Use this layout."]) {
+    test(`a batch with /learn and "${other}" requires attribution for a new lesson`, async () => {
+        const { thread, message: first } = await service.createThread(reviewId, { kind: "overview", body: other, hold: true });
+        const { message: second } = await service.addMessage(reviewId, thread.threadId, { body: "/learn Name layout helpers consistently.", hold: true });
+        await service.claimDrafts(reviewId);
+        const lesson = { rule: "Name layout helpers consistently." };
+        const reply = { author: "agent", inReplyTo: first.messageId, body: lesson.rule };
+        await assert.rejects(service.addMessage(reviewId, thread.threadId, {
+            ...reply, lessons: [lesson],
+        }), /sourceMessageId is required/);
+        const accepted = await service.addMessage(reviewId, thread.threadId, {
+            ...reply, lessons: [{ ...lesson, sourceMessageId: second.messageId }],
+        });
+        assert.equal((await getReview()).lessons.find((item) => item.lessonId === accepted.message.lessonIds?.[0])?.sourceMessageId, second.messageId);
+    });
+}
+
+test("a late batch reply can cite an individually retried /learn comment", async () => {
+    const { thread, message: learn } = await service.createThread(reviewId, { kind: "overview", body: "/learn Use a predictable layout.", hold: true });
+    const { message: explain } = await service.addMessage(reviewId, thread.threadId, { body: "/explain Why?", hold: true });
+    await service.claimDrafts(reviewId);
+    const batchId = required((await service.findMessage(reviewId, explain.messageId)).message.delivery?.batchId);
+    await service.setDelivery(reviewId, learn.messageId, { state: "no-reply" });
+    assert.ok(await service.claimDelivery(reviewId, thread.threadId, learn.messageId, { retry: true }));
+    await assert.rejects(service.addMessage(reviewId, thread.threadId, {
+        author: "agent", inReplyTo: learn.messageId, batchId: "wrong-batch", body: "Wrong submission.",
+    }), /batchId must identify/);
+    const rule = "Use predictable member layouts.";
+    const response = await service.addMessage(reviewId, thread.threadId, {
+        author: "agent", inReplyTo: explain.messageId, batchId, body: rule,
+        lessons: [{ rule, sourceMessageId: learn.messageId }],
+    });
+    const lesson = required((await getReview()).lessons.find((item) => item.lessonId === response.message.lessonIds?.[0]));
+    assert.equal(lesson.sourceMessageId, learn.messageId);
+    assert.equal((await service.findMessage(reviewId, learn.messageId)).message.delivery?.state, "replied");
+});
+
+test("a concurrent save cannot journal before the refinement it saves", async (t) => {
+    const { thread, message } = await service.createThread(reviewId, { kind: "overview", body: "/learn Use explicit options." });
+    const reply = await service.addMessage(reviewId, thread.threadId, {
+        author: "agent", inReplyTo: message.messageId, body: "Use explicit options.", lessons: [{ rule: "Use explicit options." }],
+    });
+    const id = required(reply.message.lessonIds?.[0]);
+    const rule = "Use explicit options in public APIs.";
+    const file = path.join(repo, ".github", "copilot-instructions.md");
+    t.after(() => rm(file, { force: true }));
+    const append = store.appendLesson.bind(store);
+    let signalEntered!: () => void;
+    let release!: () => void;
+    const entered = new Promise<void>((resolve) => { signalEntered = resolve; });
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    t.mock.method(store, "appendLesson", async (lesson: Parameters<StoreType["appendLesson"]>[0]) => {
+        if (lesson.lessonId === id && lesson.status === "proposed") {
+            signalEntered();
+            await released;
+        }
+        await append(lesson);
+    });
+    const refinement = service.addMessage(reviewId, thread.threadId, {
+        author: "agent", body: rule, lessons: [{ lessonId: id, rule }],
+    });
+    await Promise.race([entered, refinement]);
+    const saving = service.saveLesson(reviewId, id, { rule, scope: "repo" });
+    try {
+        assert.equal(await Promise.race([saving.then(() => "saved"), new Promise<string>((resolve) => setTimeout(resolve, 300, "waiting"))]), "waiting");
+    } finally {
+        release();
+        await Promise.all([refinement, saving]);
+    }
+    assert.equal((await store.readLessons()).find((item) => item.lessonId === id)?.status, "saved");
+});
+
+test("retrying a saved guideline repairs its journal after an append failure", async (t) => {
+    const { thread, message } = await service.createThread(reviewId, { kind: "overview", body: "/learn Prefer explicit limits." });
+    const rule = "Prefer explicit limits.";
+    const reply = await service.addMessage(reviewId, thread.threadId, {
+        author: "agent", inReplyTo: message.messageId, body: rule, lessons: [{ rule }],
+    });
+    const id = required(reply.message.lessonIds?.[0]);
+    const file = path.join(repo, ".github", "copilot-instructions.md");
+    t.after(() => rm(file, { force: true }));
+    t.mock.method(store, "appendLesson", async () => { throw new Error("Journal unavailable"); }, { times: 1 });
+    await assert.rejects(service.saveLesson(reviewId, id, { rule, scope: "repo" }), /Journal unavailable/);
+    assert.equal((await getReview()).lessons.find((item) => item.lessonId === id)?.status, "saved");
+    assert.equal((await store.readLessons()).find((item) => item.lessonId === id)?.status, "proposed");
+    assert.equal((await service.saveLesson(reviewId, id, { rule, scope: "repo" })).status, "saved");
+    assert.equal((await store.readLessons()).find((item) => item.lessonId === id)?.status, "saved");
+    assert.equal(await readFile(file, "utf8"), `- ${rule}\n`);
+});
+
+test("auto-save verifies a personal guideline in the isolated home, not the repository", async (t) => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "self-review-personal-"));
+    t.after(() => rm(home, { force: true, recursive: true }));
+    t.mock.method(os, "homedir", () => home);
+    const auto = new ReviewService({ store, autoSaveLearnedRules: async () => true });
+    const rule = "Name reusable test fixtures by their purpose.";
+    const { thread, message } = await auto.createThread(reviewId, { kind: "overview", body: `/learn ${rule}` });
+    const reply = await auto.addMessage(reviewId, thread.threadId, {
+        author: "agent", inReplyTo: message.messageId, body: rule, lessons: [{ rule, scope: "personal" }],
+    });
+    const lesson = required((await getReview()).lessons.find((item) => item.lessonId === reply.message.lessonIds?.[0]));
+    assert.equal(lesson.status, "saved");
+    const file = path.join(home, ".copilot", "copilot-instructions.md");
+    assert.equal(lesson.savedTo, file);
+    assert.equal(await readFile(file, "utf8"), `- ${rule}\n`);
+    await assert.rejects(readFile(path.join(repo, ".github", "copilot-instructions.md")), { code: "ENOENT" });
+});
+
+test("a failed auto-save settings lookup preserves the reply and its proposal", async () => {
+    const warnings: string[] = [];
+    const auto = new ReviewService({
+        store,
+        autoSaveLearnedRules: async () => { throw new Error("Repository identity unavailable"); },
+        log: (message, level) => { if (level === "warning") warnings.push(message); },
+    });
+    const rule = "Use clear option names.";
+    const { thread, message } = await auto.createThread(reviewId, { kind: "overview", body: `/learn ${rule}` });
+    const reply = await auto.addMessage(reviewId, thread.threadId, {
+        author: "agent", inReplyTo: message.messageId, body: rule, lessons: [{ rule }],
+    });
+    const persisted = await getReview();
+    assert.ok(persisted.threads.find((item) => item.threadId === thread.threadId)?.messages.some((item) => item.messageId === reply.message.messageId));
+    const lesson = required(persisted.lessons.find((item) => item.lessonId === reply.message.lessonIds?.[0]));
+    assert.equal(lesson.status, "proposed");
+    assert.equal(lesson.savedTo, null);
+    assert.equal((await auto.findMessage(reviewId, message.messageId)).message.delivery?.state, "replied");
+    assert.match(warnings.join("\n"), /Repository identity unavailable/);
+});
+
+test("auto-save writes and verifies both explicit and unsolicited guidelines and leaves failed saves proposed", async () => {
+    const auto = new ReviewService({ store, autoSaveLearnedRules: async () => true });
+    const file = path.join(repo, ".github", "copilot-instructions.md");
+    await mkdir(path.dirname(file), { recursive: true });
+    try {
+        for (const body of ["/learn Inline trivial helpers.", "Use clear names for review settings."]) {
+            const { thread, message } = await auto.createThread(reviewId, { kind: "overview", body });
+            const rule = body.replace(/^\/learn /, "");
+            const reply = await auto.addMessage(reviewId, thread.threadId, {
+                author: "agent", inReplyTo: message.messageId, body: rule, lessons: [{ rule }],
+            });
+            const lesson = required((await getReview()).lessons.find((item) => item.lessonId === reply.message.lessonIds?.[0]));
+            assert.equal(lesson.status, "saved");
+            assert.ok((await readFile(file, "utf8")).split("\n").includes(`- ${rule}`));
+        }
+        await rm(file);
+        await mkdir(file);
+        const { thread, message } = await auto.createThread(reviewId, { kind: "overview", body: "/learn Prefer explicit scopes." });
+        const reply = await auto.addMessage(reviewId, thread.threadId, {
+            author: "agent", inReplyTo: message.messageId, body: "Prefer explicit scopes.", lessons: [{ rule: "Prefer explicit scopes." }],
+        });
+        const lesson = required((await getReview()).lessons.find((item) => item.lessonId === reply.message.lessonIds?.[0]));
+        assert.equal(lesson.status, "proposed");
+        assert.equal(lesson.savedTo, null);
+        assert.match(lesson.saveError ?? "", /still a proposal/);
+    } finally {
+        await rm(file, { force: true, recursive: true });
+    }
 });
 
 test("descriptions persist across reopen, reject stale updates, and are captured with overview comments", async () => {

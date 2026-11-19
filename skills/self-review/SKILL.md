@@ -210,15 +210,14 @@ the rest.
 3. Distinguish questions from change requests. Explain when asked to discuss;
    make the smallest complete change when asked to fix. Clarify contradictory
    comments or behavior choices before editing.
-4. Handle any coding guideline according to the repository's learning mode, as in
+4. Handle any coding guideline as described in
    [Learn from review feedback](#learn-from-review-feedback). Apply confirmed
    guidance to this change and subsequent relevant work.
 5. Read nearby implementation and tests, follow applicable instructions, and
    preserve user-owned edits. Run the narrowest verification relevant to a fix.
 6. Reply through the extension's discovered thread action with what changed,
-   the verification outcome, or the reason work is blocked or disputed. When
-   learning is on, include the guideline proposed, added, refined, or already
-   covered and its instruction-file path. If thread reply delivery fails, say so
+   the verification outcome, or the reason work is blocked or disputed. Include
+   the wording and scope of any proposed or refined guideline. If thread reply delivery fails, say so
    in chat; do not imply the reply was saved.
 7. Refresh the review to a new revision after edits. Retain the comment history
    and original anchors; do not silently attach an old comment to different code.
@@ -230,48 +229,31 @@ the rest.
 
 ## Learn from review feedback
 
-Whether comments become standing guidelines is a per-repository setting, the
-learning mode. The reviewer picks it with the Configure button in the canvas and
-it is kept in their own settings, never in the repository. Each delivered comment
-states the active mode, and the discovered read action reports it. Follow the
-stated mode and treat a missing one as off.
+**Auto-save learned rules** is a per-repository setting, off by default. In
+either setting, report reusable rules as structured proposals in `lessons`.
+Follow the delivered command guidance for `/learn`. Self-Review saves rules
+automatically when enabled, or when the reviewer clicks **Save guideline**.
 
-- off (default): address the comment itself. Do not edit instruction files or
-  report lessons unless the reviewer explicitly asks you to record a guideline.
-- suggest: propose a reusable rule in the thread reply and report it as a lesson
-  with status `proposed`. Write nothing to instruction files until the reviewer
-  approves it in the thread; then save it and report it as `saved`, or as
-  `declined` if they reject it.
-- auto: treat every review comment as coding-guideline input and save the
-  confirmed rule. Do not silently skip a comment because the fix is local.
-
-When proposing or saving a rule:
+When proposing a rule:
 
 - Extract the underlying intent into a concise, actionable rule with appropriate
   scope, not just a local fix.
-- Read existing instructions first. Refine or confirm an equivalent rule rather
-  than appending duplicates. Keep one canonical home for each rule.
-- Save repository-specific guidance in the applicable path-scoped file under
-  `.github/instructions/`, or `.github/copilot-instructions.md` when appropriate.
-  For general personal preferences, propose the rule in the thread reply; write it
-  to the user's personal Copilot instructions file (outside the repository) only
-  after the user explicitly confirms.
+- Read existing instructions first. Update an existing proposal by `lessonId`
+  when the reviewer refines it. Choose repository scope unless the reviewer clearly
+  intends a personal rule across repositories.
 - Clarify ambiguous or conflicting intent before making it a standing rule.
   Questions and tentative suggestions are not settled decisions; capture the
   confirmed guidance after discussion, not an invented universal rule.
 - Apply confirmed guidance to similar code touched by the current change and
   future relevant changes, without expanding into unrelated refactoring.
-- Verify the instruction file contains the rule before reporting it as saved.
-  Include the rule and actual file path in the thread reply and its `lessons`
-  metadata when the discovered action supports it. If already covered, say so;
-  if clarification or saving is blocked, report that instead.
+- Do not write instruction files or claim a save yourself. Self-Review writes
+  the displayed rule and verifies it before marking it saved.
 
 ## Boundaries
 
 - Do not commit, push, publish PR comments, or update a PR solely because a local
   review comment was posted. These require the user's explicit authorization.
-- Do not edit instruction files to record a guideline unless the learning mode,
-  or the reviewer's explicit request, allows it.
+- Do not bypass Self-Review's guideline saving flow when handling a comment.
 - Do not infer completion of a long-running fix from message queue acceptance.
 - Do not run multiple overlapping fixes against the same checkout concurrently.
 - Do not discard unresolved comments or hide failed delivery during refresh.
@@ -284,7 +266,7 @@ Exercise the rendered UI with a clearly labeled test comment and confirm that it
 arrives exactly once in the owning conversation with the correct file, side,
 range, revision, and hunk. Confirm that an agent reply appears in that same thread.
 Check persistence across a panel and extension reload, stale-anchor handling,
-visible messaging failures, scope switching, and that the learning mode chosen in
+visible messaging failures, scope switching, and that the auto-save setting chosen in
 Configure reaches the next delivered comment. Test without editing production code, then remove
 only the test data created for this check.
 

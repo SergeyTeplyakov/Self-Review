@@ -38,6 +38,7 @@ for (const asset of ["index.html", "styles.css"]) {
     copyFileSync(path.join(extensionRoot, "web", asset), path.join(webOutput, asset));
 }
 cpSync(path.join(extensionRoot, "bundled-skills"), path.join(distributionRoot, "bundled-skills"), { recursive: true });
+cpSync(path.join(extensionRoot, "review-commands"), path.join(distributionRoot, "review-commands"), { recursive: true });
 
 mkdirSync(toolsDistributionRoot, { recursive: true });
 rmSync(path.join(toolsDistributionRoot, "dist"), { recursive: true, force: true });
