@@ -172,9 +172,10 @@ The built-in review approach draws on [Addy's evidence-based review and simplifi
 |------|------------|
 | [`extensions/self-review/`](extensions/self-review/) | The canvas: diff view, threads, comment delivery, and the actions the agent uses to reply. |
 | [`skills/self-review/`](skills/self-review/) | The skill that tells the agent how to run the review loop: open the right comparison, process comments, reply, and propose reusable guidelines. |
-| [`.github/skills/create-pr/`](.github/skills/create-pr/) | A repository-local workflow for creating or finishing a PR, addressing review feedback, verifying CI, and merging only when its safety gates pass. |
+| [`.github/skills/create-pr/`](.github/skills/create-pr/) | A repository-local workflow for creating or finishing a PR, addressing review feedback, verifying CI, and guarded automatic merging. |
 
 Canvases are a GitHub Copilot app feature. The skill loads in Copilot CLI too, but without the canvas there is nothing to comment on.
+Ask Copilot **"create PR"** to run the workflow; it merges only when its review and CI gates pass and no unusual signals remain. Say **"manual mode"** or **"no merge"** to leave the PR open.
 
 ## Updating
 
