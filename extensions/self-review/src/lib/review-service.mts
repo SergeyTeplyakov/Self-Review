@@ -1001,9 +1001,8 @@ export class ReviewService extends EventEmitter {
                 }
             }
             thread.messages.push(message);
-            return { review, value: { thread, message, duplicate: false } };
+            return { review, value: { thread, message, duplicate: false }, journalLessons: touchedLessons.values() };
         });
-        for (const lesson of touchedLessons.values()) await this.store.appendLesson(lesson);
         this.changed(reviewId, "message");
         return result;
     }
@@ -1018,12 +1017,13 @@ export class ReviewService extends EventEmitter {
             if (proposal.rule !== rule || proposal.scope !== scope || (proposal.status !== "proposed" && proposal.status !== "saved")) {
                 throw new ReviewError("conflict", "This guideline changed. Review the current proposal before saving.");
             }
-            if (proposal.status === "saved") return { write: false, value: { lesson: proposal, saved: false } };
+            if (proposal.status === "saved") {
+                return { write: false, value: { lesson: proposal, saved: false }, journalLessons: [proposal] };
+            }
             await saveRule(this.store, review.repoRoot, proposal);
-            return { review, value: { lesson: proposal, saved: true } };
+            return { review, value: { lesson: proposal, saved: true }, journalLessons: [proposal] };
         });
         if (saved) this.changed(reviewId, "message");
-        await this.store.appendLesson(lesson);
         return lesson;
     }
 

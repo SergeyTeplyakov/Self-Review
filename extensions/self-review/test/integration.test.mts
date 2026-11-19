@@ -662,6 +662,41 @@ test("a late batch reply can cite an individually retried /learn comment", async
     assert.equal((await service.findMessage(reviewId, learn.messageId)).message.delivery?.state, "replied");
 });
 
+test("a concurrent save cannot journal before the refinement it saves", async (t) => {
+    const { thread, message } = await service.createThread(reviewId, { kind: "overview", body: "/learn Use explicit options." });
+    const reply = await service.addMessage(reviewId, thread.threadId, {
+        author: "agent", inReplyTo: message.messageId, body: "Use explicit options.", lessons: [{ rule: "Use explicit options." }],
+    });
+    const id = required(reply.message.lessonIds?.[0]);
+    const rule = "Use explicit options in public APIs.";
+    const file = path.join(repo, ".github", "copilot-instructions.md");
+    t.after(() => rm(file, { force: true }));
+    const append = store.appendLesson.bind(store);
+    let signalEntered!: () => void;
+    let release!: () => void;
+    const entered = new Promise<void>((resolve) => { signalEntered = resolve; });
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    t.mock.method(store, "appendLesson", async (lesson: Parameters<StoreType["appendLesson"]>[0]) => {
+        if (lesson.lessonId === id && lesson.status === "proposed") {
+            signalEntered();
+            await released;
+        }
+        await append(lesson);
+    });
+    const refinement = service.addMessage(reviewId, thread.threadId, {
+        author: "agent", body: rule, lessons: [{ lessonId: id, rule }],
+    });
+    await Promise.race([entered, refinement]);
+    const saving = service.saveLesson(reviewId, id, { rule, scope: "repo" });
+    try {
+        assert.equal(await Promise.race([saving.then(() => "saved"), new Promise<string>((resolve) => setTimeout(resolve, 300, "waiting"))]), "waiting");
+    } finally {
+        release();
+        await Promise.all([refinement, saving]);
+    }
+    assert.equal((await store.readLessons()).find((item) => item.lessonId === id)?.status, "saved");
+});
+
 test("retrying a saved guideline repairs its journal after an append failure", async (t) => {
     const { thread, message } = await service.createThread(reviewId, { kind: "overview", body: "/learn Prefer explicit limits." });
     const rule = "Prefer explicit limits.";
