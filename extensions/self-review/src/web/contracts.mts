@@ -4,7 +4,6 @@ import type {
     AgentReviewOptions,
     DeliveryChoice,
     DeliveryMode,
-    LearningMode,
     RepoSettings,
     SettingsDocument,
     SettingsPatch,
@@ -22,7 +21,6 @@ export class ReviewError extends Error {
     }
 }
 
-export const LEARNING_MODES: LearningMode[] = ["off", "suggest", "auto"];
 export const DELIVERY_MODES: DeliveryMode[] = ["immediate", "batch", "ask"];
 export const REVIEW_FOCUSES: import("../../types/contracts.js").ReviewFocus[] = ["review", "simplify", "both"];
 export const FUSION_REVIEWER = "copilot-fusion";
@@ -30,10 +28,6 @@ export const SUGGESTED_REVIEWERS = ["gpt-6-astra", "gpt-6.1-sol", FUSION_REVIEWE
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
     return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-export function isLearningMode(value: unknown): value is LearningMode {
-    return value === "off" || value === "suggest" || value === "auto";
 }
 
 export function isDeliveryMode(value: unknown): value is DeliveryMode {
@@ -73,11 +67,11 @@ export function agentReviewDefaults(defaults: unknown): AgentReviewDefaults {
 }
 
 export function settingsPatch(value: unknown): SettingsPatch {
-    if (!isRecord(value) || (value.learning === undefined && value.delivery === undefined && value.dismissed === undefined)) {
-        throw new ReviewError("invalid_input", "Provide learning, delivery, or dismissed.");
+    if (!isRecord(value) || (value.autoSaveLearnedRules === undefined && value.delivery === undefined && value.dismissed === undefined)) {
+        throw new ReviewError("invalid_input", "Provide autoSaveLearnedRules, delivery, or dismissed.");
     }
-    if (value.learning !== undefined && !isLearningMode(value.learning)) {
-        throw new ReviewError("invalid_input", `learning must be one of ${LEARNING_MODES.join(", ")}.`);
+    if (value.autoSaveLearnedRules !== undefined && typeof value.autoSaveLearnedRules !== "boolean") {
+        throw new ReviewError("invalid_input", "autoSaveLearnedRules must be a boolean.");
     }
     if (value.delivery !== undefined && !isDeliveryMode(value.delivery)) {
         throw new ReviewError("invalid_input", `delivery must be one of ${DELIVERY_MODES.join(", ")}.`);
@@ -85,7 +79,7 @@ export function settingsPatch(value: unknown): SettingsPatch {
     if (value.dismissed !== undefined && typeof value.dismissed !== "boolean") {
         throw new ReviewError("invalid_input", "dismissed must be a boolean.");
     }
-    return { learning: value.learning, delivery: value.delivery, dismissed: value.dismissed };
+    return { autoSaveLearnedRules: value.autoSaveLearnedRules, delivery: value.delivery, dismissed: value.dismissed };
 }
 
 export function settingsDocument(value: unknown): SettingsDocument {
@@ -108,12 +102,12 @@ export function settingsDocument(value: unknown): SettingsDocument {
 
 export function repoSettings(value: unknown): RepoSettings {
     if (!isRecord(value) || typeof value.repoName !== "string"
-        || !isLearningMode(value.learning) || !isDeliveryMode(value.delivery)
+        || typeof value.autoSaveLearnedRules !== "boolean" || !isDeliveryMode(value.delivery)
         || typeof value.configured !== "boolean" || typeof value.dismissed !== "boolean") {
         throw new Error("Invalid repository settings response.");
     }
     return {
-        repoName: value.repoName, learning: value.learning, delivery: value.delivery,
+        repoName: value.repoName, autoSaveLearnedRules: value.autoSaveLearnedRules, delivery: value.delivery,
         configured: value.configured, dismissed: value.dismissed,
     };
 }

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { cp, mkdtemp, mkdir, readFile, readdir, rm, stat } from "node:fs/promises";
+import { cp, mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -34,6 +34,8 @@ test("the installation-shaped distribution contains executable modules and all b
         "dist/extension.mjs",
         "dist/lib/server.mjs",
         "dist/lib/settings.mjs",
+        "dist/review-commands/explain/SKILL.md",
+        "dist/review-commands/learn/SKILL.md",
         "dist/web/app.js",
         "dist/web/contracts.mjs",
         "dist/web/index.html",
@@ -64,4 +66,12 @@ test("the installation-shaped distribution contains executable modules and all b
         models: ["model-a"], focus: "both", intent: "",
     });
     assert.throws(() => reviewOptions({ models: ["model-a"], focus: "unsupported" }), /focus must be/);
+
+    const { reviewCommandGuidance }: typeof import("../src/lib/review-command-skills.mjs") =
+        await import(pathToFileURL(path.join(installedDist, "lib", "review-command-skills.mjs")).href);
+    const learnDoc = path.join(installedDist, "review-commands", "learn", "SKILL.md");
+    const markdown = await readFile(learnDoc, "utf8");
+    await writeFile(learnDoc, markdown.replace("## Auto-save on", "## Auto-save on\n\nFixture-only guidance."));
+    assert.match(reviewCommandGuidance("/learn", "m-test", true, "repo.md", "personal.md").join("\n"), /Fixture-only guidance\./);
+    assert.doesNotMatch(reviewCommandGuidance("/learn", "m-test", false, "repo.md", "personal.md").join("\n"), /Fixture-only guidance\./);
 });

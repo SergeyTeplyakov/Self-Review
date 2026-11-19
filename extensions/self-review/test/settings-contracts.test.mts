@@ -11,7 +11,7 @@ import {
 } from "./modules.mjs";
 
 const defaults = { models: ["model-a", "copilot-fusion"], focus: "both", intent: "Check contracts.", skipDialog: false } satisfies AgentReviewDefaults;
-const effective = { repoName: "repo", learning: "suggest", delivery: "ask", configured: true, dismissed: false };
+const effective = { repoName: "repo", autoSaveLearnedRules: true, delivery: "ask", configured: true, dismissed: false };
 
 async function fixture(t: import("node:test").TestContext) {
     const root = await mkdtemp(path.join(os.tmpdir(), "sr-contracts-"));
@@ -37,11 +37,11 @@ function hasCode(error: unknown, code: string): boolean {
 test("shared options and patch codecs reject untrusted input without type assertions", () => {
     assert.deepEqual(reviewOptions(defaults), { models: defaults.models, focus: "both", intent: defaults.intent });
     assert.deepEqual(agentReviewDefaults(defaults), defaults);
-    assert.deepEqual(settingsPatch({ learning: "off", dismissed: false }), { learning: "off", delivery: undefined, dismissed: false });
+    assert.deepEqual(settingsPatch({ autoSaveLearnedRules: false, dismissed: false }), { autoSaveLearnedRules: false, delivery: undefined, dismissed: false });
     for (const value of [null, [], {}, { models: ["model-a"], focus: "invalid" }, { ...defaults, models: ["a", "a"] }, { ...defaults, intent: 3 }]) {
         assert.throws(() => reviewOptions(value), (error) => hasCode(error, "invalid_input"));
     }
-    for (const value of [undefined, null, [], {}, { learning: "batch" }, { delivery: "auto" }, { dismissed: "false" }]) {
+    for (const value of [undefined, null, [], {}, { autoSaveLearnedRules: "false" }, { learning: "auto" }, { delivery: "auto" }, { dismissed: "false" }]) {
         assert.throws(() => settingsPatch(value), (error) => hasCode(error, "invalid_input"));
     }
     assert.throws(() => agentReviewDefaults({ ...defaults, skipDialog: "false" }), (error) => hasCode(error, "invalid_input"));
@@ -54,7 +54,7 @@ test("the saved-settings codec preserves metadata and legacy modes but rejects b
     const legacy = { repos: { "remote:github.com/owner/repo": { learning: "unknown", custom: "kept" } }, customRoot: { kept: true } };
     await writeFile(store.settingsFile(), JSON.stringify(legacy));
     const previous = await settings.get("repo");
-    assert.equal(previous.learning, "off");
+    assert.equal(previous.autoSaveLearnedRules, false);
     assert.equal(previous.delivery, "immediate");
     assert.equal(previous.configured, false);
     await settings.update("repo", { delivery: "batch" });
@@ -66,11 +66,43 @@ test("the saved-settings codec preserves metadata and legacy modes but rejects b
     }
     await writeFile(store.settingsFile(), JSON.stringify({ repos: [] }));
     await assert.rejects(() => settings.update("repo", { delivery: "batch" }), /Invalid settings repositories/);
-    assert.equal((await settings.get("repo")).learning, "off");
+    assert.equal((await settings.get("repo")).autoSaveLearnedRules, false);
     assert.match(required(log.at(-1)), /settings unreadable/);
-    const special = settingsDocument(JSON.parse('{"repos":{"__proto__":{"learning":"off"}}}'));
+    const special = settingsDocument(JSON.parse('{"repos":{"__proto__":{"autoSaveLearnedRules":false}}}'));
     assert.equal(Object.hasOwn(special.repos, "__proto__"), true);
     assert.equal(Object.getPrototypeOf(special.repos), Object.prototype);
+});
+
+test("legacy learning modes migrate to auto-save booleans without losing delivery or dismissal", async (t) => {
+    const { store, settings } = await fixture(t);
+    const key = "remote:github.com/owner/repo";
+
+    for (const [learning, autoSaveLearnedRules] of [["off", false], ["suggest", false], ["auto", true]] as const) {
+        await writeFile(store.settingsFile(), JSON.stringify({
+            version: 1,
+            repos: { [key]: { learning, delivery: "batch", promptDismissed: true } },
+        }));
+        assert.deepEqual(await settings.get("repo"), {
+            repoName: "repo", autoSaveLearnedRules, delivery: "batch", configured: true, dismissed: true,
+        }, `${learning} migrates to ${autoSaveLearnedRules}`);
+
+        const updated = await settings.update("repo", { delivery: "ask" });
+        assert.deepEqual(updated, {
+            repoName: "repo", autoSaveLearnedRules, delivery: "ask", configured: true, dismissed: true,
+        });
+        const saved = JSON.parse(await readFile(store.settingsFile(), "utf8"));
+        assert.equal(saved.repos[key].autoSaveLearnedRules, autoSaveLearnedRules);
+        assert.equal("learning" in saved.repos[key], false);
+        assert.equal(saved.repos[key].delivery, "ask");
+        assert.equal(saved.repos[key].promptDismissed, true);
+    }
+
+    await writeFile(store.settingsFile(), JSON.stringify({ version: 1, repos: { [key]: { learning: "unknown" } } }));
+    assert.deepEqual(await settings.get("repo"), {
+        repoName: "repo", autoSaveLearnedRules: false, delivery: "immediate", configured: false, dismissed: false,
+    }, "unknown legacy values default off");
+    await writeFile(store.settingsFile(), JSON.stringify({ version: 1, repos: {} }));
+    assert.equal((await settings.get("repo")).autoSaveLearnedRules, false, "missing settings default off");
 });
 
 test("checked HTTP and browser settings boundaries round-trip persisted choices", async (t) => {
@@ -81,7 +113,7 @@ test("checked HTTP and browser settings boundaries round-trip persisted choices"
         posts.push({ method, endpoint, body });
         return endpoint === "settings" ? http.update("repo", body) : http.updateAgentReview(body);
     });
-    await api.update({ learning: "suggest", delivery: "ask" });
+    await api.update({ autoSaveLearnedRules: true, delivery: "ask" });
     await api.updateAgentReview(defaults);
     const state = api.readState(await http.read("repo"));
     assert.deepEqual(state.settings, effective);
@@ -102,11 +134,11 @@ test("checked HTTP and browser settings boundaries round-trip persisted choices"
 
 test("corrupt saved reviewer defaults remain visible without hiding valid repo preferences", async (t) => {
     const { store, settings, log } = await fixture(t);
-    await settings.update("repo", { learning: "suggest" });
+    await settings.update("repo", { autoSaveLearnedRules: false });
     await store.updateSettings((document) => { document.agentReview = { ...defaults, skipDialog: "false" }; });
     const http = new SettingsHttp(settings, (message) => log.push(message));
     const state = createSettingsApi(async () => null).readState(await http.read("repo"));
-    assert.equal(required(state.settings).learning, "suggest");
+    assert.equal(required(state.settings).autoSaveLearnedRules, false);
     assert.equal(state.agentReviewSettings, null);
     assert.equal(state.agentReviewSettingsAvailable, true);
     assert.match(state.agentReviewSettingsError ?? "", /boolean skipDialog/);
@@ -115,7 +147,7 @@ test("corrupt saved reviewer defaults remain visible without hiding valid repo p
 
 test("browser decoders reject malformed success payloads instead of accepting typed-looking JSON", async () => {
     const api = createSettingsApi(async () => ({ ...effective, dismissed: "false" }));
-    await assert.rejects(() => api.update({ learning: "suggest" }), /Invalid repository settings response/);
+    await assert.rejects(() => api.update({ autoSaveLearnedRules: true }), /Invalid repository settings response/);
     const badDefaults = createSettingsApi(async () => ({ ...defaults, models: [null] }));
     await assert.rejects(() => badDefaults.updateAgentReview(defaults), (error) => hasCode(error, "invalid_input"));
     for (const value of [null, [], { settings: { ...effective, delivery: "later" } }, { agentReviewSettingsAvailable: "true" }]) {

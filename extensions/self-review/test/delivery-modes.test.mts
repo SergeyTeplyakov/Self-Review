@@ -179,14 +179,14 @@ test("resolveDelivery uses the repository mode and lets an ask-mode review decid
     assert.equal(resolveDelivery("ask", { deliveryMode: "immediate" }), "immediate");
 });
 
-test("SettingsService stores the delivery mode per repository without choosing a learning mode", async () => {
+test("SettingsService stores the delivery mode per repository without enabling rule auto-save", async () => {
     const { store } = fresh();
     const settings = new SettingsService({ store });
-    const initial = { repoName: "proj", learning: "off", delivery: "immediate", configured: false, dismissed: false };
-    assert.deepEqual(await settings.update(repo, { delivery: "batch" }), { ...initial, delivery: "batch" }, "delivery alone leaves learning unconfigured");
-    assert.deepEqual(await settings.update(repo, { learning: "suggest", delivery: "ask" }), { ...initial, learning: "suggest", delivery: "ask", configured: true });
-    assert.deepEqual(await new SettingsService({ store }).get(repo), { ...initial, learning: "suggest", delivery: "ask", configured: true }, "the choice is stored, not cached");
-    assert.equal((await settings.update(repo, { learning: "auto" })).delivery, "ask", "changing learning keeps the delivery mode");
+    const initial = { repoName: "proj", autoSaveLearnedRules: false, delivery: "immediate", configured: false, dismissed: false };
+    assert.deepEqual(await settings.update(repo, { delivery: "batch" }), { ...initial, delivery: "batch" }, "delivery alone leaves auto-save unconfigured");
+    assert.deepEqual(await settings.update(repo, { autoSaveLearnedRules: false, delivery: "ask" }), { ...initial, delivery: "ask", configured: true });
+    assert.deepEqual(await new SettingsService({ store }).get(repo), { ...initial, delivery: "ask", configured: true }, "the choice is stored, not cached");
+    assert.equal((await settings.update(repo, { autoSaveLearnedRules: true })).delivery, "ask", "changing auto-save keeps the delivery mode");
 });
 
 test("held comments stay drafts until the review is submitted, then are claimed once as one batch", async () => {

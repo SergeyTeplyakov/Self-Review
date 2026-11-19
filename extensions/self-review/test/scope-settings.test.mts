@@ -13,7 +13,7 @@ import {
 import type { Review, ReviewService as ReviewServiceType, ReviewThread } from "../src/lib/review-service.mjs";
 import type { Delivery as DeliveryType, SendOptions } from "../src/lib/delivery.mjs";
 import type { Store as StoreType } from "../src/lib/store.mjs";
-import type { LearningMode, Log, ReviewScope } from "../types/contracts.js";
+import type { Log, ReviewScope } from "../types/contracts.js";
 
 const WEB_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "dist", "web");
 const lines = (n: number, f: (i: number) => string = (i) => `line ${i}`) => Array.from({ length: n }, (_, i) => f(i + 1)).join("\n") + "\n";
@@ -66,7 +66,7 @@ async function waitFor<T>(predicate: () => T | Promise<T>, label: string, timeou
 interface HttpJson extends Record<string, unknown> {
     review?: { reviewId: string; currentRevisionId: string; scope?: string };
     error?: { code: string; message: string };
-    settings?: { repoName: string; learning: string; delivery: string; configured: boolean; dismissed: boolean } | null;
+    settings?: { repoName: string; autoSaveLearnedRules: boolean; delivery: string; configured: boolean; dismissed: boolean } | null;
     scope?: string;
     reviewId?: string;
     [key: string]: unknown;
@@ -340,25 +340,28 @@ test("committing pending work empties the pending review while the all review ke
     assert.equal(required(pending.git).baseCommit, required(pending.git).headCommit);
 });
 
-test("a proposed guideline is settled in place when it is saved or declined", async () => {
+test("a proposed guideline is saved by Self-Review or declined by the agent", async (t) => {
     const { store, service } = fresh();
     const { reviewId, thread, message } = await commentThread(service);
     const rule = "Prefer early returns over nested conditionals.";
+    t.after(() => rm(path.join(repo, ".github"), { recursive: true, force: true }));
 
-    const proposal = await agentReply(service, reviewId, thread, { inReplyTo: message.messageId, lessons: [{ rule, status: "proposed", savedTo: "ignored.md" }] });
+    const proposal = await agentReply(service, reviewId, thread, { inReplyTo: message.messageId, lessons: [{ rule, status: "proposed" }] });
     const [lesson] = (await service.getReview(reviewId)).lessons;
     assert.match(lesson.lessonId, /^l-[0-9a-f]{8}$/);
     assert.deepEqual([lesson.status, lesson.scope, lesson.savedTo, lesson.rule], ["proposed", "repo", null, rule], "a proposal is not saved anywhere yet");
     assert.deepEqual(proposal.message.lessonIds, [lesson.lessonId]);
 
-    await agentReply(service, reviewId, thread, { lessons: [{ lessonId: lesson.lessonId, status: "saved", savedTo: ".github/copilot-instructions.md" }] });
+    const saved = await service.saveLesson(reviewId, lesson.lessonId, { rule, scope: "repo" });
     const settled = (await service.getReview(reviewId)).lessons;
     assert.equal(settled.length, 1, "the proposal is updated, not duplicated");
-    assert.deepEqual([settled[0].status, settled[0].savedTo, settled[0].rule], ["saved", ".github/copilot-instructions.md", rule]);
+    assert.deepEqual([saved.status, saved.savedTo, settled[0].status, settled[0].savedTo, settled[0].rule],
+        ["saved", ".github/copilot-instructions.md", "saved", ".github/copilot-instructions.md", rule]);
+    assert.match(await readFile(path.join(repo, ".github", "copilot-instructions.md"), "utf8"), /- Prefer early returns over nested conditionals\./);
     assert.ok(settled[0].updatedAt);
 
     await agentReply(service, reviewId, thread, { lessons: [{ rule: "Log the correlation id.", status: "proposed" }] });
-    await agentReply(service, reviewId, thread, { lessons: [{ rule: "  log the CORRELATION   id ", status: "declined", savedTo: "ignored.md" }] });
+    await agentReply(service, reviewId, thread, { lessons: [{ rule: "  log the CORRELATION   id ", status: "declined" }] });
     const lessons = (await service.getReview(reviewId)).lessons;
     assert.equal(lessons.length, 2, "repeating a proposed rule settles it instead of adding another");
     assert.deepEqual([lessons[1].status, lessons[1].savedTo], ["declined", null]);
@@ -373,23 +376,22 @@ test("a proposed guideline is settled in place when it is saved or declined", as
     );
 });
 
-test("lessons recorded before statuses existed read as saved", async () => {
+test("legacy lessons without a status still read as saved", async () => {
     const { store, service } = fresh();
     const { reviewId, thread, message } = await commentThread(service);
     await agentReply(service, reviewId, thread, {
         inReplyTo: message.messageId,
-        lessons: [{ rule: "Explain renames", scope: "personal", savedTo: "~/.copilot/copilot-instructions.md" }],
+        lessons: [{ rule: "Explain renames", scope: "repo", status: "proposed" }],
     });
-    const created = required((await service.getReview(reviewId)).lessons[0]);
-    assert.deepEqual([created.status, created.scope, created.savedTo], ["saved", "personal", "~/.copilot/copilot-instructions.md"], "a lesson without a status is saved");
-
     await store.updateReview(reviewId, (current) => {
         const r = required(current);
         delete r.lessons[0].status;
+        r.lessons[0].savedTo = ".github/copilot-instructions.md";
         return { review: r };
     });
     const legacy = await service.getReview(reviewId);
     assert.equal("status" in legacy.lessons[0], false);
+    assert.equal(legacy.lessons[0].savedTo, ".github/copilot-instructions.md");
     assert.equal(service.summarize(legacy).lessons[0].status, "saved");
 });
 
@@ -412,8 +414,10 @@ test("lesson updates are validated before anything is written", async () => {
     await rejects(thread, [{ rule: "   " }], "invalid_input");
     await rejects(thread, [{}], "invalid_input");
     await rejects(thread, [null], "invalid_input");
-    await rejects(thread, [{ lessonId: "l-00000000", status: "saved" }], "not_found");
-    await rejects(other.thread, [{ lessonId: lesson.lessonId, status: "saved" }], "not_found");
+    await rejects(thread, [{ lessonId: "l-00000000", status: "proposed" }], "not_found");
+    await rejects(other.thread, [{ lessonId: lesson.lessonId, status: "proposed" }], "not_found");
+    await rejects(thread, [{ rule: "Valid rule", status: "saved" }], "invalid_input");
+    await rejects(thread, [{ rule: "Valid rule", savedTo: ".github/copilot-instructions.md" }], "invalid_input");
     assert.equal(JSON.stringify(await service.getReview(reviewId)), snapshot, "a rejected reply leaves the review untouched");
     assert.equal((await store.readLessons()).length, 1);
 });
@@ -561,22 +565,22 @@ test("local-only bare repository worktrees use the repository name without chang
     assert.deepEqual(await repoIdentity(worktree), { key, name: "local-bare.git" });
 });
 
-test("SettingsService keeps learning off until a mode is chosen and stores each choice per repository", async () => {
+test("SettingsService defaults learned-rule auto-save off and stores the boolean per repository", async () => {
     const { store } = fresh();
     const settings = new SettingsService({ store });
     const other = path.join(tmp, "other-repo");
     await runGit(tmp, ["init", "-q", "-b", "main", other]);
 
-    const initial = { repoName: "proj", learning: "off", delivery: "immediate", configured: false, dismissed: false };
+    const initial = { repoName: "proj", autoSaveLearnedRules: false, delivery: "immediate", configured: false, dismissed: false };
     assert.deepEqual(await settings.get(repo), initial);
-    assert.deepEqual(await settings.update(repo, { dismissed: true }), { ...initial, dismissed: true }, "dismissing the prompt does not choose a mode");
-    assert.deepEqual(await settings.update(repo, { learning: "suggest" }), { ...initial, learning: "suggest", delivery: "immediate", configured: true, dismissed: true });
-    assert.deepEqual(await new SettingsService({ store }).get(repo), { ...initial, learning: "suggest", delivery: "immediate", configured: true, dismissed: true }, "the choice is stored, not cached");
-    assert.deepEqual(await settings.update(repo, { dismissed: false }), { ...initial, learning: "suggest", delivery: "immediate", configured: true }, "the prompt flag does not touch the mode");
-    assert.deepEqual(await settings.update(repo, { learning: "off" }), { ...initial, configured: true }, "off is a deliberate choice, not the unset state");
-    assert.deepEqual(await settings.get(other), { repoName: "other-repo", learning: "off", delivery: "immediate", configured: false, dismissed: false }, "other repositories are unaffected");
-    assert.deepEqual(await settings.update(other, { learning: "auto" }), { repoName: "other-repo", learning: "auto", delivery: "immediate", configured: true, dismissed: false });
-    assert.equal((await settings.get(repo)).learning, "off");
+    assert.deepEqual(await settings.update(repo, { dismissed: true }), { ...initial, dismissed: true }, "dismissing the prompt does not enable auto-save");
+    assert.deepEqual(await settings.update(repo, { autoSaveLearnedRules: true }), { ...initial, autoSaveLearnedRules: true, configured: true, dismissed: true });
+    assert.deepEqual(await new SettingsService({ store }).get(repo), { ...initial, autoSaveLearnedRules: true, configured: true, dismissed: true }, "the choice is stored, not cached");
+    assert.deepEqual(await settings.update(repo, { dismissed: false }), { ...initial, autoSaveLearnedRules: true, configured: true }, "the prompt flag does not touch auto-save");
+    assert.deepEqual(await settings.update(repo, { autoSaveLearnedRules: false }), { ...initial, configured: true }, "false is an explicit choice, not the unset state");
+    assert.deepEqual(await settings.get(other), { repoName: "other-repo", autoSaveLearnedRules: false, delivery: "immediate", configured: false, dismissed: false }, "other repositories are unaffected");
+    assert.deepEqual(await settings.update(other, { autoSaveLearnedRules: true }), { repoName: "other-repo", autoSaveLearnedRules: true, delivery: "immediate", configured: true, dismissed: false });
+    assert.equal((await settings.get(repo)).autoSaveLearnedRules, false);
 
     const saved = JSON.parse(await readFile(store.settingsFile(), "utf8"));
     assert.equal(saved.version, 1);
@@ -592,17 +596,17 @@ test("SettingsService shares a choice between clones of the same remote", async 
         await runGit(tmp, ["init", "-q", "-b", "main", dir]);
         await git(dir, "remote", "add", "origin", url);
     }
-    await settings.update(first, { learning: "auto" });
-    assert.deepEqual(await settings.get(second), { repoName: "repo", learning: "auto", delivery: "immediate", configured: true, dismissed: false });
+    await settings.update(first, { autoSaveLearnedRules: true });
+    assert.deepEqual(await settings.get(second), { repoName: "repo", autoSaveLearnedRules: true, delivery: "immediate", configured: true, dismissed: false });
 });
 
 test("SettingsService rejects invalid updates without writing anything", async () => {
     const { store } = fresh();
     const settings = new SettingsService({ store });
-    for (const patch of [undefined, {}, { learning: "sometimes" }, { learning: null }, { learning: 1 }, { dismissed: "yes" }, { dismissed: 1 }, { dismissed: null }, { learning: "auto", dismissed: "no" }, { delivery: "later" }, { delivery: null }, { delivery: 1 }, { learning: "auto", delivery: "later" }]) {
+    for (const patch of [undefined, {}, { learning: "auto" }, { autoSaveLearnedRules: "yes" }, { autoSaveLearnedRules: null }, { dismissed: "yes" }, { dismissed: 1 }, { dismissed: null }, { autoSaveLearnedRules: true, dismissed: "no" }, { delivery: "later" }, { delivery: null }, { delivery: 1 }, { autoSaveLearnedRules: true, delivery: "later" }]) {
         await assert.rejects(() => settings.update(repo, patch), (error) => errorHasCode(error, "invalid_input"), JSON.stringify(patch));
     }
-    assert.deepEqual(await settings.get(repo), { repoName: "proj", learning: "off", delivery: "immediate", configured: false, dismissed: false });
+    assert.deepEqual(await settings.get(repo), { repoName: "proj", autoSaveLearnedRules: false, delivery: "immediate", configured: false, dismissed: false });
     await assert.rejects(() => access(store.settingsFile()), { code: "ENOENT" });
 });
 
@@ -612,21 +616,21 @@ test("an unreadable or hand-edited settings file never blocks reading the effect
     await writeFile(store.settingsFile(), "{ not json");
     const logs: string[] = [];
     const settings = new SettingsService({ store, log: (m) => logs.push(m) });
-    assert.deepEqual(await settings.get(repo), { repoName: "proj", learning: "off", delivery: "immediate", configured: false, dismissed: false });
+    assert.deepEqual(await settings.get(repo), { repoName: "proj", autoSaveLearnedRules: false, delivery: "immediate", configured: false, dismissed: false });
     assert.equal(logs.length, 1);
     assert.match(logs[0], /^settings unreadable: /);
 
     const { key } = await repoIdentity(repo);
     await writeFile(store.settingsFile(), JSON.stringify({ version: 1, repos: { [key]: { learning: "loud", promptDismissed: "yes" } } }));
-    assert.deepEqual(await settings.get(repo), { repoName: "proj", learning: "off", delivery: "immediate", configured: false, dismissed: false }, "unknown values are ignored");
+    assert.deepEqual(await settings.get(repo), { repoName: "proj", autoSaveLearnedRules: false, delivery: "immediate", configured: false, dismissed: false }, "unknown legacy values are ignored");
 });
 
-test("Delivery hands the repository's learning mode to the prompt and falls back to off when it cannot be read", async () => {
+test("Delivery hands the repository's auto-save boolean to the prompt and falls back to off when it cannot be read", async () => {
     const { service } = fresh();
     const { reviewId, thread } = await commentThread(service);
     const { repoRoot } = await service.getReview(reviewId);
 
-    const deliver = async (learning?: (root: string) => Promise<string>) => {
+    const deliver = async (autoSaveLearnedRules?: (root: string) => Promise<boolean>) => {
         const { message } = await service.addMessage(reviewId, thread.threadId, { body: "Check this preference", author: "user" });
         const sent: SendOptions[] = [];
         const logs: Array<{ text: string; level?: string }> = [];
@@ -637,19 +641,18 @@ test("Delivery hands the repository's learning mode to the prompt and falls back
                 return `sm-${sent.length}`;
             },
             log: (text, level) => logs.push({ text, level }),
-            ...(learning ? { learning } : {}),
+            ...(autoSaveLearnedRules ? { autoSaveLearnedRules } : {}),
         });
         await delivery.deliver(reviewId, thread.threadId, message.messageId, "inst");
         return { prompt: required(sent[0]).prompt, logs };
     };
-    const off = /Guideline learning is off for this repository/;
+    const off = /Auto-save learned rules is off/;
 
     assert.match((await deliver()).prompt, off, "no provider means off");
     const asked: string[] = [];
-    assert.match((await deliver(async (root: string) => (asked.push(root), "suggest"))).prompt, /Guideline learning is in suggest mode/);
+    assert.match((await deliver(async (root: string) => (asked.push(root), false))).prompt, off);
     assert.deepEqual(asked, [repoRoot]);
-    assert.match((await deliver(async () => "auto")).prompt, /Treat every review comment as coding-guideline input/);
-    assert.match((await deliver(async () => "bogus")).prompt, off, "an unknown mode is treated as off");
+    assert.match((await deliver(async () => true)).prompt, /Auto-save learned rules is on/);
 
     const failed = await deliver(async () => {
         throw new Error("settings offline");
@@ -659,7 +662,7 @@ test("Delivery hands the repository's learning mode to the prompt and falls back
     assert.match(failed.logs[0].text, /could not read the learning setting, using off: settings offline/);
 });
 
-test("the settings API stores the learning mode per repository and the next comment is delivered with it", async () => {
+test("the settings API stores the auto-save boolean per repository and the next comment is delivered with it", async () => {
     const { store, service } = fresh();
     const settings = new SettingsService({ store });
     const sent: SendOptions[] = [];
@@ -669,35 +672,35 @@ test("the settings API stores the learning mode per repository and the next comm
             sent.push(opts);
             return `sm-${sent.length}`;
         },
-        learning: async (repoRoot) => (await settings.get(repoRoot)).learning,
+        autoSaveLearnedRules: async (repoRoot) => (await settings.get(repoRoot)).autoSaveLearnedRules,
     });
     const reviewId = await service.ensureReview({ repoPath: repo, base: "main" });
 
     await withServer({ instanceId: "inst-settings", getReviewId: () => reviewId, service, delivery, settings }, async ({ headers, state, post }) => {
         const initial = await state();
-        assert.deepEqual(initial.settings, { repoName: "proj", learning: "off", delivery: "immediate", configured: false, dismissed: false });
+        assert.deepEqual(initial.settings, { repoName: "proj", autoSaveLearnedRules: false, delivery: "immediate", configured: false, dismissed: false });
         assert.equal(required(initial.review).scope, "all");
 
-        const chosen = await post("/api/settings", { learning: "suggest" });
+        const chosen = await post("/api/settings", { autoSaveLearnedRules: false });
         assert.equal(chosen.status, 200);
-        assert.deepEqual(chosen.json, { repoName: "proj", learning: "suggest", delivery: "immediate", configured: true, dismissed: false });
+        assert.deepEqual(chosen.json, { repoName: "proj", autoSaveLearnedRules: false, delivery: "immediate", configured: true, dismissed: false });
         assert.deepEqual((await state()).settings, chosen.json);
         assert.deepEqual((await post("/api/settings", { dismissed: true })).json, { ...chosen.json, dismissed: true });
 
-        for (const body of [{}, { learning: "loud" }, { learning: null }, { dismissed: "yes" }, { delivery: "later" }]) {
+        for (const body of [{}, { learning: "auto" }, { autoSaveLearnedRules: "yes" }, { autoSaveLearnedRules: null }, { dismissed: "yes" }, { delivery: "later" }]) {
             const rejected = await post("/api/settings", body);
             assert.equal(rejected.status, 400, JSON.stringify(body));
             assert.equal(required(required(rejected.json).error).code, "invalid_input");
         }
-        assert.equal((await post("/api/settings", { learning: "auto" }, { "Content-Type": "application/json" })).status, 403, "the token header is required");
-        assert.equal((await post("/api/settings", { learning: "auto" }, { ...headers, "Content-Type": "text/plain" })).status, 415);
-        assert.equal((await post("/api/settings", { learning: "auto" }, { ...headers, Origin: "http://evil.example" })).status, 403);
-        assert.equal(required((await state()).settings).learning, "suggest", "rejected requests change nothing");
+        assert.equal((await post("/api/settings", { autoSaveLearnedRules: true }, { "Content-Type": "application/json" })).status, 403, "the token header is required");
+        assert.equal((await post("/api/settings", { autoSaveLearnedRules: true }, { ...headers, "Content-Type": "text/plain" })).status, 415);
+        assert.equal((await post("/api/settings", { autoSaveLearnedRules: true }, { ...headers, Origin: "http://evil.example" })).status, 403);
+        assert.equal(required((await state()).settings).autoSaveLearnedRules, false, "rejected requests change nothing");
 
-        assert.equal((await post("/api/settings", { learning: "auto" })).status, 200);
+        assert.equal((await post("/api/settings", { autoSaveLearnedRules: true })).status, 200);
         assert.equal((await post("/api/threads", { kind: "file", path: "a.cs", body: "Prefer early returns" })).status, 200);
         await waitFor(() => sent.length === 1, "the comment to be delivered");
-        assert.match(required(sent[0]).prompt, /Treat every review comment as coding-guideline input/);
+        assert.match(required(sent[0]).prompt, /Auto-save learned rules is on/);
     });
 });
 
@@ -713,7 +716,7 @@ test("the scope API switches the served review and keeps the repository setting"
     await withServer(
         { instanceId: "inst-scope", getReviewId: () => currentId, service, delivery, settings, onReviewChange: (id) => { currentId = id; } },
         async ({ state, post }) => {
-            await post("/api/settings", { learning: "suggest" });
+            await post("/api/settings", { autoSaveLearnedRules: true });
             for (const body of [{}, { scope: "bogus" }, { scope: null }, { scope: ["all"] }]) {
                 const rejected = await post("/api/scope", body);
                 assert.equal(rejected.status, 400, JSON.stringify(body));
@@ -735,7 +738,7 @@ test("the scope API switches the served review and keeps the repository setting"
 
             const view = await state();
             assert.deepEqual([required(view.review).reviewId, required(view.review).scope], [switchedId, "pending"]);
-            assert.equal(required(view.settings).learning, "suggest", "the learning mode belongs to the repository, not the scope");
+            assert.equal(required(view.settings).autoSaveLearnedRules, true, "the setting belongs to the repository, not the scope");
 
             assert.deepEqual((await post("/api/scope", { scope: "all" })).json, { reviewId: allId, scope: "all" });
             assert.equal(required((await state()).review).reviewId, allId);
@@ -778,7 +781,7 @@ test("the settings and scope endpoints say so when the host does not provide the
 
     await withServer({ instanceId: "inst-bare", getReviewId: () => reviewId, service, delivery }, async ({ state, post }) => {
         assert.equal((await state()).settings, null);
-        const settings = await post("/api/settings", { learning: "auto" });
+        const settings = await post("/api/settings", { autoSaveLearnedRules: true });
         assert.equal(settings.status, 501);
         assert.equal(required(required(settings.json).error).code, "unsupported");
         assert.equal((await post("/api/scope", { scope: "bogus" })).status, 400, "validation comes first");

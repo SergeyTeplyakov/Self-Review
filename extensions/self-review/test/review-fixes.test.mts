@@ -128,7 +128,7 @@ test("separate provider processes preserve review, settings, lesson and instance
                 for (let i = 0; i < 8; i++) {
                     const id = worker + "-" + i;
                     await store.updateReview("shared", async r => { await delay(); r.values.push(id); return { review: r }; });
-                    await store.updateSettings(async s => { await delay(); s.repos[id] = { learning: "suggest" }; });
+                    await store.updateSettings(async s => { await delay(); s.repos[id] = { autoSaveLearnedRules: false }; });
                     await store.setInstanceReview(id, "shared");
                     await store.appendLesson({ lessonId: id });
                 }
@@ -653,7 +653,7 @@ test("raw content fingerprints change within binary and oversized classification
     assert.equal((await service.getReview(required(id))).revisions.length, 6);
 });
 
-test("generic SSH home paths keep their user and never share automatic learning with absolute paths", async (t) => {
+test("generic SSH home paths keep their user and never share auto-save settings with absolute paths", async (t) => {
     const home = "git@host.example:team/repo.git";
     const absolute = "ssh://git@host.example/team/repo.git";
     assert.notEqual(normalizeRemoteUrl(home), normalizeRemoteUrl(absolute));
@@ -663,7 +663,7 @@ test("generic SSH home paths keep their user and never share automatic learning 
     const { repo, store } = await fixture(t);
     let url = home;
     const settings = new SettingsService({ store, git: { runGit: async () => ({ ok: true, stdout: url, stderr: "" }) } });
-    await settings.update(repo, { learning: "auto", delivery: "batch" });
+    await settings.update(repo, { autoSaveLearnedRules: true, delivery: "batch" });
     url = absolute;
-    assert.deepEqual([(await settings.get(repo)).learning, (await settings.get(repo)).delivery], ["off", "immediate"]);
+    assert.deepEqual([(await settings.get(repo)).autoSaveLearnedRules, (await settings.get(repo)).delivery], [false, "immediate"]);
 });

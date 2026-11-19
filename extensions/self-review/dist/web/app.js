@@ -1,6 +1,7 @@
 // Self review canvas client: renders the diff, inline threads, and composers; talks to the
 // per-instance loopback server with the token from the URL.
 import { createSettingsApi } from "./settings-api.mjs";
+import { REVIEW_COMMANDS, reviewCommandSuggestions } from "./review-commands.mjs";
 function isRecord(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -80,6 +81,7 @@ function isMessage(value) {
     if (!isRecord(value) || typeof value.messageId !== "string"
         || (value.author !== "user" && value.author !== "agent")
         || typeof value.body !== "string" || typeof value.createdAt !== "string"
+        || (value.imageIds !== undefined && !isStringArray(value.imageIds))
         || !isOptionalString(value.outcome) || !isOptionalString(value.verification)
         || (value.lessonIds !== undefined && (!Array.isArray(value.lessonIds) || !value.lessonIds.every((id) => typeof id === "string")))) {
         return false;
@@ -125,6 +127,7 @@ function isThread(value) {
 function isLesson(value) {
     return isRecord(value)
         && typeof value.lessonId === "string" && typeof value.scope === "string"
+        && (value.sourceMessageId === undefined || typeof value.sourceMessageId === "string")
         && (value.status === undefined || typeof value.status === "string")
         && typeof value.rule === "string" && isOptionalString(value.savedTo)
         && typeof value.threadId === "string" && typeof value.createdAt === "string";
@@ -203,9 +206,6 @@ function isReviewFocus(value) {
 }
 function isThreadStatus(value) {
     return value === "active" || value === "resolved" || value === "wontfix" || value === "closed";
-}
-function isLearningMode(value) {
-    return value === "off" || value === "suggest" || value === "auto";
 }
 function isSnapshot(value) {
     return isRecord(value) && typeof value.revisionId === "string"
@@ -316,12 +316,6 @@ const state = {
 };
 const FOLDER_VIEW_ROW_BUDGET = 3000;
 const settingsApi = createSettingsApi((method, path, body) => api(method, path, body));
-const LEARNING_MODES = ["off", "suggest", "auto"];
-const LEARNING = {
-    off: { label: "Off", pill: "Off", hint: "Copilot only addresses each comment. It does not edit instruction files or record guidelines unless you ask." },
-    suggest: { label: "Suggest", pill: "Suggest", hint: "Copilot proposes a guideline in the thread when your feedback reveals a reusable rule, and saves it only after you approve." },
-    auto: { label: "Save automatically", pill: "Auto-save", hint: "Copilot saves settled guidelines to the repository's instruction files and tells you where. Personal rules still wait for your confirmation." },
-};
 const DELIVERY_MODES = ["immediate", "batch", "ask"];
 const DELIVERY = {
     immediate: { label: "Send each comment now", pill: "Immediate", hint: "Each comment goes to Copilot as soon as you post it." },
@@ -329,16 +323,14 @@ const DELIVERY = {
     ask: { label: "Ask for each review", pill: "Ask", hint: "The first time you comment on a review, choose whether to send each comment now or batch them." },
 };
 const LESSON_STATUSES = {
-    proposed: "Proposed by Copilot and not saved yet. Approve it in the thread to save it.",
+    proposed: "Proposed by Copilot and not saved yet.",
     saved: "Saved as a guideline for future work.",
     declined: "Declined; not saved.",
 };
 const scopeOf = (review) => (review?.scope === "pending" ? "pending" : "all");
 const scopeLabel = (scope) => (scope === "pending" ? "pending changes" : "all changes");
-const learningMode = () => {
-    const mode = state.settings?.learning;
-    return mode === "suggest" || mode === "auto" ? mode : "off";
-};
+const autoSaveLearnedRules = () => state.settings?.autoSaveLearnedRules === true;
+const autoSaveLabel = () => `Auto-save learned rules: ${autoSaveLearnedRules() ? "On" : "Off"}`;
 const deliveryRepoMode = () => {
     const mode = state.settings?.delivery;
     return mode === "batch" || mode === "ask" ? mode : "immediate";
@@ -726,6 +718,7 @@ async function api(method, path, body) {
 // A scope switch points this page at a different review; nothing derived from the previous one may carry over.
 function resetForReview() {
     persistPinnedComposers();
+    imageUploads.clear();
     pinnedComposers.clear();
     composerContexts.clear();
     state.snapshot = null;
@@ -881,6 +874,35 @@ function setDraft(key, value) {
         localStorage.setItem(draftKey(key), value);
     else
         localStorage.removeItem(draftKey(key));
+}
+const draftImageKey = (key) => `${draftKey(key)}:images`;
+const imageUploads = new Map();
+function getDraftImages(key) {
+    try {
+        const ids = JSON.parse(localStorage.getItem(draftImageKey(key)) ?? "[]");
+        return isStringArray(ids) ? ids : [];
+    }
+    catch (error) {
+        if (error instanceof SyntaxError)
+            return [];
+        throw error;
+    }
+}
+function setDraftImages(key, ids) {
+    if (ids.length)
+        localStorage.setItem(draftImageKey(key), JSON.stringify(ids));
+    else
+        localStorage.removeItem(draftImageKey(key));
+}
+function imagesHtml(ids, key, disabled = false) {
+    if (!ids.length)
+        return "";
+    return `<div class="comment-images">${ids.map((id, i) => {
+        const label = `Attached image ${i + 1}`;
+        const url = `/api/comment-images/${encodeURIComponent(id)}?review=${encodeURIComponent(state.review?.reviewId ?? "")}&t=${encodeURIComponent(TOKEN)}`;
+        return `<div><a href="${esc(url)}" target="_blank" rel="noopener noreferrer"><img src="${esc(url)}" alt="${label}"></a>`
+            + (key === undefined ? "" : `<button type="button" aria-label="Remove ${label.toLowerCase()}" data-action="remove-image" data-key="${esc(key)}" data-image="${esc(id)}"${disabled ? " disabled" : ""}>×</button>`) + `</div>`;
+    }).join("")}</div>`;
 }
 function saveView() {
     if (state.review)
@@ -1194,8 +1216,7 @@ function renderTop() {
         workflows.push(chosen
             ? `<span class="pill" title="${esc(DELIVERY[chosen].hint)} Chosen for this review.">Delivery: ${esc(DELIVERY[chosen].pill)}</span><button class="link" data-action="delivery-reask" title="Choose again how this review sends comments">Change</button>`
             : `<span class="pill" title="${esc(DELIVERY[repoMode].hint)}">Delivery: ${esc(DELIVERY[repoMode].pill)}</span>`);
-        const mode = LEARNING[learningMode()];
-        workflows.push(`<span class="pill" title="${esc(mode.hint)}">Learning: ${esc(mode.pill)}</span><button data-action="configure" title="Change how manual review comments are delivered and used for learning in this repository">Manual review settings</button>`);
+        workflows.push(`<span class="pill">${autoSaveLabel()}</span><button data-action="configure" title="Change how manual review comments are delivered and used for learning in this repository">Manual review settings</button>`);
     }
     workflows.push(`</div></section>`);
     if (workflows.length)
@@ -1207,10 +1228,9 @@ function learningBannerHtml() {
     const s = state.settings;
     if (!s || s.configured || s.dismissed)
         return "";
-    const choice = (mode, primary) => `<button data-action="learning-set" data-mode="${mode}"${primary ? ` class="primary"` : ""} title="${esc(LEARNING[mode].hint)}">${esc(LEARNING[mode].label)}</button>`;
-    return `<div class="banner-row"><span class="banner-text"><strong>Learn from your review feedback in ${esc(s.repoName)}?</strong> Copilot can turn your comments into reusable coding guidelines. The choice is stored on this machine only, and Configure changes it any time.</span>`
-        + `<span class="banner-actions">${choice("suggest", true)}${choice("auto", false)}`
-        + `<button class="link" data-action="learning-dismiss" title="Hide this notice. Learning stays off until you choose a mode with Configure.">Not now</button></span></div>`;
+    return `<div class="banner-row"><span class="banner-text"><strong>Auto-save learned rules in ${esc(s.repoName)}?</strong> Copilot proposes reusable guidelines from your feedback. By default, you choose which guidelines to save.</span>`
+        + `<span class="banner-actions"><button data-action="learning-set" data-enabled="false" class="primary">Keep manual saving</button><button data-action="learning-set" data-enabled="true">Enable auto-save</button>`
+        + `<button class="link" data-action="learning-dismiss" title="Hide this notice without enabling auto-save.">Not now</button></span></div>`;
 }
 // Shown while an ask-mode review is undecided; until then the server holds new comments as drafts.
 function deliveryBannerHtml() {
@@ -1246,7 +1266,7 @@ function dialogHtml() {
     return `<div class="modal-backdrop" data-action="dialog-backdrop"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby="dialog-desc">`
         + `<h2 id="dialog-title">Review settings</h2>`
         + `<p id="dialog-desc" class="muted">Settings for ${esc(state.settings?.repoName ?? "this repository")}. They are stored on this machine only and never committed.</p>`
-        + `<fieldset class="choices"><legend>Learn from review feedback</legend>${choicesHtml("learning", LEARNING_MODES, LEARNING, d.learning)}</fieldset>`
+        + `<fieldset class="choices"><legend>Guidelines</legend><label><input type="checkbox" name="autoSaveLearnedRules"${d.autoSaveLearnedRules ? " checked" : ""}> Auto-save learned rules</label><p>When off, review and save proposed guidelines yourself.</p></fieldset>`
         + `<fieldset class="choices"><legend>Send comments to Copilot</legend>${choicesHtml("delivery", DELIVERY_MODES, DELIVERY, d.delivery)}</fieldset>`
         + (d.error ? `<div class="modal-error" role="alert">${esc(d.error)}</div>` : "")
         + `<div class="modal-actions"><button data-action="dialog-cancel"${d.saving ? " disabled" : ""}>Cancel</button>`
@@ -1286,9 +1306,9 @@ function renderDialog() {
 function openConfigure() {
     if (!state.settings || state.dialog)
         return;
-    state.dialog = { type: "configure", learning: learningMode(), delivery: deliveryRepoMode(), saving: false, error: "" };
+    state.dialog = { type: "configure", autoSaveLearnedRules: autoSaveLearnedRules(), delivery: deliveryRepoMode(), saving: false, error: "" };
     renderDialog();
-    focusIn('#dialog input[name="learning"]:checked');
+    focusIn('#dialog input[name="autoSaveLearnedRules"]');
 }
 function closeConfigure() {
     if (!state.dialog || state.dialog.saving)
@@ -1596,11 +1616,11 @@ async function saveConfigure() {
     d.error = "";
     renderDialog();
     try {
-        await updateSettings({ learning: d.learning, delivery: d.delivery });
+        await updateSettings({ autoSaveLearnedRules: d.autoSaveLearnedRules, delivery: d.delivery });
         state.dialog = null;
         renderDialog();
         focusIn('[data-action="configure"]');
-        toast(`Saved. Learning: ${LEARNING[learningMode()].pill} · Delivery: ${DELIVERY[deliveryRepoMode()].pill}`);
+        toast(`Saved. ${autoSaveLabel()} · Delivery: ${DELIVERY[deliveryRepoMode()].pill}`);
     }
     catch (err) {
         d.saving = false;
@@ -1617,7 +1637,7 @@ function trapTab(e) {
     };
     const stops = state.dialog?.type === "agent-review"
         ? Array.from(document.querySelectorAll("#dialog input:not([disabled]), #dialog select:not([disabled]), #dialog textarea:not([disabled]), #dialog a[href], #dialog button:not([disabled])"))
-        : [groupStop("learning"), groupStop("delivery"), ...Array.from(document.querySelectorAll("#dialog button:not([disabled])"))]
+        : [document.querySelector('#dialog input[name="autoSaveLearnedRules"]'), groupStop("delivery"), ...Array.from(document.querySelectorAll("#dialog button:not([disabled])"))]
             .filter((el) => el instanceof HTMLInputElement || el instanceof HTMLButtonElement);
     if (!stops.length)
         return;
@@ -1801,15 +1821,24 @@ function pinComposers() {
         if (pinnedComposers.has(key))
             return null;
         const draft = getDraft(key);
+        const images = getDraftImages(key);
+        const upload = imageUploads.get(key);
         const pending = state.pending.get(key);
         state.open.delete(key);
         composerContexts.delete(key);
-        if (!draft && !pending)
+        if (!draft && !images.length && !upload && !pending)
             return null;
         const pinnedKey = `pinned:${options.revisionId}:${key}`;
         pinnedComposers.set(pinnedKey, { ...options, alwaysOpen: true });
         setDraft(pinnedKey, draft);
         setDraft(key, "");
+        setDraftImages(pinnedKey, images);
+        setDraftImages(key, []);
+        if (upload) {
+            upload.key = pinnedKey;
+            imageUploads.set(pinnedKey, upload);
+            imageUploads.delete(key);
+        }
         if (pending) {
             state.pending.set(pinnedKey, pending);
             state.pending.delete(key);
@@ -1842,10 +1871,12 @@ function pinComposers() {
 }
 function composerHtml(key, { label, placeholder, kind, path, side, startLine, endLine, alwaysOpen, revisionId, }) {
     const draft = getDraft(key);
+    const images = getDraftImages(key);
+    const uploading = imageUploads.has(key);
     // The HTML parser strips the first newline immediately after a textarea's opening tag.
     const draftHtml = (draft.startsWith("\n") ? "\n" : "") + esc(draft);
     const p = state.pending.get(key);
-    const open = alwaysOpen || state.open.has(key) || Boolean(draft) || Boolean(p);
+    const open = alwaysOpen || state.open.has(key) || Boolean(draft) || Boolean(images.length) || Boolean(p) || uploading;
     if (open && (kind === "line" || kind === "change" || kind === "file") && !pinnedComposers.has(key)) {
         composerContexts.set(key, { label, placeholder, kind, path, side, startLine, endLine, alwaysOpen: true, revisionId: revisionId ?? state.review?.currentRevisionId ?? undefined });
     }
@@ -1860,15 +1891,19 @@ function composerHtml(key, { label, placeholder, kind, path, side, startLine, en
     ].join(" ");
     const k = esc(key);
     const batching = deliveryMode() !== "immediate";
+    const disabled = p?.sending || uploading;
     const buttons = batching
-        ? `<button data-action="submit" data-key="${k}" data-draft="0" title="Send this comment to Copilot right away"${p?.sending ? " disabled" : ""}>Send now</button>`
-            + `<button class="primary" data-action="submit" data-key="${k}" data-draft="1" title="Hold this comment as a draft until you submit the review"${p?.sending ? " disabled>Saving…" : ">Add to review"}</button>`
-        : `<button class="primary" data-action="submit" data-key="${k}" ${p?.sending ? "disabled" : ""}>${p?.sending ? "Sending…" : "Comment"}</button>`;
+        ? `<button data-action="submit" data-key="${k}" data-draft="0" title="Send this comment to Copilot right away"${disabled ? " disabled" : ""}>Send now</button>`
+            + `<button class="primary" data-action="submit" data-key="${k}" data-draft="1" title="Hold this comment as a draft until you submit the review"${disabled ? " disabled" : ""}>${p?.sending ? "Saving…" : "Add to review"}</button>`
+        : `<button class="primary" data-action="submit" data-key="${k}"${disabled ? " disabled" : ""}>${p?.sending ? "Sending…" : "Comment"}</button>`;
     return `<div class="composer${open ? " open" : ""}" ${data}>`
         + (label ? `<div class="label">${esc(label)}</div>` : "")
         + `<textarea data-composer="${k}" placeholder="${esc(placeholder ?? "Write a comment…")}" ${p?.sending ? "disabled" : ""}>${draftHtml}</textarea>`
+        + `<div class="review-commands" role="group" aria-label="Review commands" hidden></div>`
+        + imagesHtml(images, key, Boolean(p?.sending))
+        + (uploading ? `<div class="muted" role="status">Attaching image…</div>` : "")
         + (p?.error ? `<div class="err">${esc(p.error)}</div>` : "")
-        + `<div class="bar"><span class="hint">Markdown · Ctrl+Enter to ${batching ? "add to review" : "send"} · Esc to close</span>`
+        + `<div class="bar"><span class="hint">/ for commands · Ctrl+Enter to ${batching ? "add to review" : "send"} · Esc to cancel${/^win/i.test(globalThis.navigator?.platform ?? "") ? " · Win+H for dictation" : ""}</span>`
         + `<button data-action="cancel" data-key="${k}">Cancel</button>`
         + `${buttons}</div>`
         + `</div>`;
@@ -1900,17 +1935,25 @@ function deliveryHtml(m) {
             return "";
     }
 }
+function saveLessonButton(l) {
+    if (l.status !== "proposed" || (l.scope !== "repo" && l.scope !== "personal"))
+        return "";
+    return ` <button data-action="save-lesson" data-lesson="${esc(l.lessonId)}" data-proposal="${esc(JSON.stringify({ rule: l.rule, scope: l.scope }))}">Save guideline</button>`
+        + (l.saveError ? ` <span role="status">${esc(l.saveError)}</span>` : "");
+}
 function messageHtml(m) {
     const agent = m.author === "agent";
     const lessons = (m.lessonIds ?? []).map((id) => state.review?.lessons.find((l) => l.lessonId === id)).filter((lesson) => Boolean(lesson));
+    const savedLesson = !agent && state.review?.lessons.some((l) => l.sourceMessageId === m.messageId && l.status === "saved" && l.savedTo);
     return `<div class="msg" data-message-id="${esc(m.messageId)}">`
         + `<div class="msg-head"><span class="avatar${agent ? " agent" : ""}">${agent ? "AI" : "Me"}</span>`
         + `<span class="who">${agent ? "Copilot" : "You"}</span><span class="when" title="${esc(m.createdAt)}">${esc(ago(m.createdAt))}</span>`
         + (agent && m.outcome ? `<span class="outcome ${esc(m.outcome)}">${esc(m.outcome)}</span>` : "")
         + deliveryHtml(m)
-        + `</div>${md(m.body)}`
+        + (savedLesson ? `<span class="badge lesson-saved">Lesson learned</span>` : "")
+        + `</div>${md(m.body)}${imagesHtml(m.imageIds ?? [])}`
         + (m.verification ? `<div class="verification">Verification: ${inline(m.verification)}</div>` : "")
-        + (lessons.length ? `<div class="lessons">Guidelines:<ul>${lessons.map((l) => `<li><span class="badge">${esc(l.scope)}</span> ${lessonBadge(l)} ${inline(l.rule)}${l.savedTo ? ` <span class="muted mono">→ ${esc(l.savedTo)}</span>` : ""}</li>`).join("")}</ul></div>` : "")
+        + (lessons.length ? `<div class="lessons">Guidelines:<ul>${lessons.map((l) => `<li><span class="badge">${esc(l.scope)}</span> ${lessonBadge(l)} ${inline(l.rule)}${l.savedTo ? ` <span class="muted mono">→ ${esc(l.savedTo)}</span>` : ""}${saveLessonButton(l)}</li>`).join("")}</ul></div>` : "")
         + `</div>`;
 }
 function findingApprovalIssue(finding) {
@@ -1950,7 +1993,7 @@ function findingEvidenceHtml(finding) {
         + `</details>`;
 }
 const replyKey = (threadId) => `reply:${threadId}`;
-const hasDraftReply = (threadId) => Boolean(getDraft(replyKey(threadId)));
+const hasDraftReply = (threadId) => Boolean(getDraft(replyKey(threadId)) || getDraftImages(replyKey(threadId)).length);
 const threadDefaultsCollapsed = (t) => (t.status !== "active" || t.location?.state === "outdated") && !hasDraftReply(t.threadId);
 const threadCollapsed = (t) => state.collapsedThreads.has(t.threadId) || (threadDefaultsCollapsed(t) && !state.expanded.has(t.threadId));
 function outsideDraftRepliesHtml() {
@@ -2036,16 +2079,9 @@ function overviewView() {
         + (done.length ? `<h2>Closed threads (${done.length})</h2>${done.map((t) => threadHtml(t, { showLocation: true })).join("")}` : "");
 }
 function lessonsEmptyHint() {
-    if (!state.settings)
-        return "Copilot records reusable rules here when your comments reveal a preference.";
-    switch (learningMode()) {
-        case "suggest":
-            return "Copilot proposes reusable guidelines here when your comments reveal a preference, and saves one after you approve it.";
-        case "auto":
-            return "Copilot saves reusable guidelines here when your comments reveal a preference.";
-        default:
-            return "Learning is off for this repository, so Copilot does not record guidelines from your comments. Use Configure to turn it on.";
-    }
+    return autoSaveLearnedRules()
+        ? "Copilot saves reusable guidelines here when your feedback reveals a settled preference."
+        : "Copilot proposes reusable guidelines when your feedback reveals a settled preference. Use Save guideline in the thread to save one.";
 }
 function lessonsView() {
     const lessons = state.review?.lessons ?? [];
@@ -2258,8 +2294,11 @@ function revealPendingJump() {
 function closeComposer(key, discard) {
     pinnedComposers.delete(key);
     composerContexts.delete(key);
-    if (discard)
+    if (discard) {
         setDraft(key, "");
+        setDraftImages(key, []);
+        imageUploads.delete(key);
+    }
     state.open.delete(key);
     state.pending.delete(key);
     persistPinnedComposers();
@@ -2282,7 +2321,10 @@ async function submit(key, draft = defaultDraft()) {
     if (!box || !textarea)
         return;
     const body = textarea.value.trim();
-    if (!body) {
+    const imageIds = getDraftImages(key);
+    if (imageUploads.has(key) || state.pending.get(key)?.sending)
+        return;
+    if (!body && !imageIds.length) {
         textarea.focus();
         return;
     }
@@ -2297,7 +2339,7 @@ async function submit(key, draft = defaultDraft()) {
         let res;
         const hold = draft === undefined ? {} : { draft };
         if (key.startsWith("reply:")) {
-            res = await api("POST", `threads/${encodeURIComponent(key.slice(6))}/messages`, { body, clientRequestId: pending.clientRequestId, descriptionVersion: review.description?.version ?? 0, ...hold });
+            res = await api("POST", `threads/${encodeURIComponent(key.slice(6))}/messages`, { body, imageIds, clientRequestId: pending.clientRequestId, descriptionVersion: review.description?.version ?? 0, ...hold });
         }
         else {
             const d = box.dataset;
@@ -2310,12 +2352,14 @@ async function submit(key, draft = defaultDraft()) {
                 revisionId: d.revision || review.currentRevisionId,
                 descriptionVersion: review.description?.version ?? 0,
                 body,
+                imageIds,
                 clientRequestId: pending.clientRequestId,
                 ...hold,
             });
         }
         const sentKey = submittedKey();
         setDraft(sentKey, "");
+        setDraftImages(sentKey, []);
         pinnedComposers.delete(sentKey);
         composerContexts.delete(sentKey);
         state.pending.delete(sentKey);
@@ -2351,6 +2395,23 @@ async function onClick(e) {
     const action = value("action");
     try {
         switch (action) {
+            case "remove-image": {
+                const key = value("key");
+                setDraftImages(key, getDraftImages(key).filter((id) => id !== value("image")));
+                render();
+                focusComposer(key);
+                break;
+            }
+            case "review-command": {
+                const textarea = target.closest(".composer")?.querySelector("textarea[data-composer]");
+                if (textarea && REVIEW_COMMANDS.some(({ name }) => name === target.dataset.command)) {
+                    textarea.value = `/${target.dataset.command} `;
+                    textarea.focus();
+                    textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+                    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+                }
+                break;
+            }
             case "agent-review":
                 await runAgentReview();
                 break;
@@ -2564,12 +2625,15 @@ async function onClick(e) {
                 await saveConfigure();
                 break;
             case "learning-set":
-                {
-                    const mode = value("mode");
-                    if (isLearningMode(mode))
-                        await updateSettings({ learning: mode });
+                if (value("enabled") === "true" || value("enabled") === "false") {
+                    await updateSettings({ autoSaveLearnedRules: value("enabled") === "true" });
+                    toast(autoSaveLabel());
                 }
-                toast(`Learning mode: ${LEARNING[learningMode()].label}`);
+                break;
+            case "save-lesson":
+                await api("POST", `lessons/${encodeURIComponent(value("lesson"))}/save`, JSON.parse(value("proposal")));
+                await loadState();
+                toast("Guideline saved.");
                 break;
             case "learning-dismiss":
                 await updateSettings({ dismissed: true });
@@ -2614,9 +2678,9 @@ async function onChange(e) {
             state.dialog.focus = el.value;
         return;
     }
-    if ((el.name === "learning" || el.name === "delivery") && state.dialog?.type === "configure") {
-        if (el.name === "learning" && (el.value === "off" || el.value === "suggest" || el.value === "auto"))
-            state.dialog.learning = el.value;
+    if ((el.name === "autoSaveLearnedRules" || el.name === "delivery") && state.dialog?.type === "configure") {
+        if (el instanceof HTMLInputElement && el.name === "autoSaveLearnedRules")
+            state.dialog.autoSaveLearnedRules = el.checked;
         if (el.name === "delivery" && (el.value === "immediate" || el.value === "batch" || el.value === "ask"))
             state.dialog.delivery = el.value;
         return;
@@ -2637,6 +2701,14 @@ async function onChange(e) {
         await loadState().catch(() => undefined);
     }
 }
+function updateReviewCommands(textarea) {
+    const menu = textarea.closest(".composer")?.querySelector(".review-commands");
+    if (!menu)
+        return;
+    const commands = reviewCommandSuggestions(textarea.value);
+    menu.hidden = !commands.length;
+    menu.innerHTML = commands.map(({ name, description }, index) => `<button type="button" tabindex="-1" data-action="review-command" data-command="${name}"${index ? "" : ' class="selected"'}><strong>/${name}</strong> <span>${esc(description)}</span></button>`).join("");
+}
 function onInput(e) {
     const el = e.target;
     if (!(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement))
@@ -2648,6 +2720,57 @@ function onInput(e) {
     if (el.dataset?.composer) {
         setDraft(el.dataset.composer, el.value);
         el.closest(".composer")?.classList.add("open");
+        if (el instanceof HTMLTextAreaElement)
+            updateReviewCommands(el);
+    }
+}
+async function onPaste(event) {
+    const field = event.target;
+    if (!(field instanceof HTMLTextAreaElement) || !field.dataset.composer || field.disabled || !state.review)
+        return;
+    const files = Array.from(event.clipboardData?.files ?? []).filter((file) => file.type.startsWith("image/"));
+    if (!files.length)
+        return;
+    event.preventDefault();
+    const key = field.dataset.composer;
+    const reviewId = state.review.reviewId;
+    if (imageUploads.has(key))
+        return;
+    if (getDraftImages(key).length + files.length > 4) {
+        toast("A comment can attach up to four images.", true);
+        return;
+    }
+    const upload = { key };
+    imageUploads.set(key, upload);
+    render();
+    const active = () => state.review?.reviewId === reviewId && imageUploads.get(upload.key) === upload;
+    try {
+        for (const file of files) {
+            if (!active())
+                return;
+            if (file.size > 2 * 1024 * 1024)
+                throw new Error("Paste an image up to 2 MB.");
+            const response = await fetch("/api/comment-images", { method: "POST",
+                headers: { "X-MR-Token": TOKEN, "X-MR-Review": reviewId }, body: file });
+            const result = await response.json();
+            if (!active())
+                return;
+            if (!response.ok || !isRecord(result) || typeof result.imageId !== "string") {
+                throw new Error(isRecord(result) && isRecord(result.error) && typeof result.error.message === "string"
+                    ? result.error.message : "Could not attach the image.");
+            }
+            setDraftImages(upload.key, [...new Set([...getDraftImages(upload.key), result.imageId])]);
+        }
+    }
+    catch (error) {
+        if (active())
+            toast(errorMessage(error), true);
+    }
+    finally {
+        if (active()) {
+            imageUploads.delete(upload.key);
+            render();
+        }
     }
 }
 function onKeyDown(e) {
@@ -2666,17 +2789,38 @@ function onKeyDown(e) {
     const key = el.dataset.composer;
     if (!key)
         return;
+    const menu = el.closest(".composer")?.querySelector(".review-commands:not([hidden])");
+    if (menu && !e.isComposing && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
+        const options = Array.from(menu.querySelectorAll("button"));
+        const selected = options.findIndex((option) => option.classList.contains("selected"));
+        if (e.key === "Escape") {
+            e.preventDefault();
+            menu.hidden = true;
+            return;
+        }
+        if (options.length && (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Enter")) {
+            e.preventDefault();
+            if (e.key === "Enter")
+                options[Math.max(0, selected)].click();
+            else {
+                const next = (selected + (e.key === "ArrowDown" ? 1 : -1) + options.length) % options.length;
+                options.forEach((option, index) => option.classList.toggle("selected", index === next));
+            }
+            return;
+        }
+    }
     if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
         e.preventDefault();
         submit(key);
     }
     else if (e.key === "Escape") {
         e.preventDefault();
-        if (key.startsWith("reply:") && !el.value.trim()) {
+        const empty = !el.value.trim() && !getDraftImages(key).length && !imageUploads.has(key);
+        if (key.startsWith("reply:") && empty) {
             el.closest(".composer")?.classList.remove("open");
             el.blur();
         }
-        else if (!el.value.trim())
+        else if (empty)
             closeComposer(key, true);
         else
             el.blur();
@@ -2684,19 +2828,24 @@ function onKeyDown(e) {
 }
 function onFocusIn(e) {
     const el = e.target;
-    if (el instanceof HTMLTextAreaElement && el.dataset.composer)
+    if (el instanceof HTMLTextAreaElement && el.dataset.composer) {
         el.closest(".composer")?.classList.add("open");
+        updateReviewCommands(el);
+    }
 }
 function onFocusOut(e) {
     const el = e.target;
     if (!(el instanceof HTMLTextAreaElement))
         return;
     const key = el.dataset?.composer;
+    const menu = el.closest(".composer")?.querySelector(".review-commands");
+    if (menu)
+        menu.hidden = true;
     if (!key || !key.startsWith("reply:"))
         return;
     setTimeout(() => {
         const box = el.closest(".composer");
-        if (box && !el.value.trim() && !box.contains(document.activeElement))
+        if (box && !el.value.trim() && !getDraftImages(key).length && !imageUploads.has(key) && !box.contains(document.activeElement))
             box.classList.remove("open");
     }, 150);
 }
@@ -2783,6 +2932,10 @@ function paintSelection() {
     }
 }
 function onMouseDown(e) {
+    if (e.target instanceof Element && e.target.closest(".review-commands button")) {
+        e.preventDefault(); // Keep the composer focused until the click chooses a command.
+        return;
+    }
     if (e.button !== 0 || !(e.target instanceof Element) || !e.target.closest("td.ln, td.gut"))
         return;
     const pos = rowFromEvent(e);
@@ -2830,6 +2983,7 @@ function onMouseUp() {
 document.addEventListener("click", onClick);
 document.addEventListener("change", onChange);
 document.addEventListener("input", onInput);
+document.addEventListener("paste", onPaste);
 document.addEventListener("keydown", onKeyDown);
 document.addEventListener("focusin", onFocusIn);
 document.addEventListener("focusout", onFocusOut);

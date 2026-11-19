@@ -3,6 +3,7 @@
 import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { buildBatchPrompt, buildCommentPrompt } from "./prompt.mjs";
+import { readCommentImage } from "./comment-images.mjs";
 const errorMessage = (error) => String(error && typeof error === "object" && "message" in error ? error.message ?? error : error);
 // Also accepts markers written before the rename to Self Review Canvas, so in-flight replies still match.
 const MARKER_RE = /^\[(?:self-review sr|manual-review mr):([a-z0-9][a-z0-9._-]{0,100}):(m-[0-9a-f-]{36})\]$/;
@@ -12,7 +13,7 @@ export class Delivery extends EventEmitter {
     send;
     log;
     reviewIds;
-    learning;
+    autoSaveLearnedRules;
     sessionId;
     fallbackOwner;
     busy;
@@ -27,16 +28,16 @@ export class Delivery extends EventEmitter {
      * @param {(options: object) => Promise<string>} p.send session.send
      * @param {(msg: string, level?: string) => void} p.log
      * @param {() => Iterable<string>} p.reviewIds reviews to settle when the agent goes idle
-     * @param {(repoRoot: string) => Promise<string>} [p.learning] guideline-learning mode for a repository; failures fall back to off
+     * @param {(repoRoot: string) => Promise<boolean>} [p.autoSaveLearnedRules]
      * @param {() => string | undefined} [p.sessionId] conversation that processes the comments this instance sends
      */
-    constructor({ service, send, log = () => { }, reviewIds = () => [], learning = async () => "off", sessionId = () => undefined }) {
+    constructor({ service, send, log = () => { }, reviewIds = () => [], autoSaveLearnedRules = async () => false, sessionId = () => undefined }) {
         super();
         this.service = service;
         this.send = send;
         this.log = log;
         this.reviewIds = reviewIds;
-        this.learning = learning;
+        this.autoSaveLearnedRules = autoSaveLearnedRules;
         this.sessionId = sessionId;
         this.fallbackOwner = `delivery-${randomUUID()}`;
         this.busy = null;
@@ -75,11 +76,11 @@ export class Delivery extends EventEmitter {
     }
     async repoLearning(repoRoot) {
         try {
-            return await this.learning(repoRoot);
+            return await this.autoSaveLearnedRules(repoRoot);
         }
         catch (err) {
             this.log(`self-review: could not read the learning setting, using off: ${errorMessage(err)}`, "warning");
-            return "off";
+            return false;
         }
     }
     // Builds and sends the prompt for claimed messages: one comment uses the single-comment prompt, more use the batch prompt.
@@ -90,14 +91,22 @@ export class Delivery extends EventEmitter {
             const contexts = [];
             for (const threadId of threadIds)
                 contexts.push(await this.service.promptContext(reviewId, threadId));
-            const learning = await this.repoLearning(contexts[0].review.repoRoot);
+            const autoSaveLearnedRules = await this.repoLearning(contexts[0].review.repoRoot);
+            const attachments = [];
+            for (const claim of claims) {
+                const message = contexts.find((ctx) => ctx.thread.threadId === claim.threadId)?.thread.messages.find((m) => m.messageId === claim.messageId);
+                for (const [index, id] of (message?.imageIds ?? []).entries()) {
+                    const { bytes, mimeType } = await readCommentImage(this.service.store, reviewId, id);
+                    attachments.push({ type: "blob", data: bytes.toString("base64"), mimeType, displayName: `${claim.messageId}-image-${index + 1}` });
+                }
+            }
             let built;
             if (claims.length === 1) {
                 const ctx = contexts[0];
                 const message = ctx.thread.messages.find((m) => m.messageId === claims[0].messageId);
                 if (!message)
                     throw new Error(`Claimed message ${claims[0].messageId} not found.`);
-                built = buildCommentPrompt({ ...ctx, message, instanceId, learning });
+                built = buildCommentPrompt({ ...ctx, message, instanceId, autoSaveLearnedRules });
             }
             else {
                 const ids = new Set(claims.map((c) => c.messageId));
@@ -107,9 +116,10 @@ export class Delivery extends EventEmitter {
                     excerpt: ctx.excerpt,
                     selected: ctx.selected,
                 }));
-                built = buildBatchPrompt({ review: contexts[contexts.length - 1].review, groups, instanceId, learning });
+                built = buildBatchPrompt({ review: contexts[contexts.length - 1].review, groups, instanceId, autoSaveLearnedRules });
             }
-            sessionMessageId = await this.send({ prompt: built.prompt, displayPrompt: built.displayPrompt, mode: "enqueue" });
+            sessionMessageId = await this.send({ prompt: built.prompt, displayPrompt: built.displayPrompt, mode: "enqueue",
+                ...(attachments.length ? { attachments } : {}) });
         }
         catch (err) {
             const error = errorMessage(err);

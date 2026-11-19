@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
-import { createSettingsApi } from "./modules.mjs";
+import { createSettingsApi, REVIEW_COMMANDS, reviewCommandSuggestions } from "./modules.mjs";
 
 export class MockElement {
     readonly tagName: string;
@@ -59,10 +59,15 @@ class MockButtonElement extends MockElement {
 // Keep the renderer's existing classic-script VM harness, using its real imported API.
 export async function loadApp(context: vm.Context) {
     const source = await readFile(new URL("../dist/web/app.js", import.meta.url), "utf8");
-    const declaration = 'import { createSettingsApi } from "./settings-api.mjs";';
-    if (!source.includes(declaration)) throw new Error("Update the renderer test harness for its module imports.");
+    const declarations = [
+        'import { createSettingsApi } from "./settings-api.mjs";',
+        'import { REVIEW_COMMANDS, reviewCommandSuggestions } from "./review-commands.mjs";',
+    ];
+    if (!declarations.every((declaration) => source.includes(declaration))) throw new Error("Update the renderer test harness for its module imports.");
     Object.assign(context, {
         createSettingsApi,
+        REVIEW_COMMANDS,
+        reviewCommandSuggestions,
         Element: MockElement,
         HTMLElement: MockElement,
         HTMLInputElement: MockInputElement,
@@ -70,5 +75,5 @@ export async function loadApp(context: vm.Context) {
         HTMLSelectElement: MockSelectElement,
         HTMLButtonElement: MockButtonElement,
     });
-    vm.runInContext(source.replace(declaration, ""), context);
+    vm.runInContext(declarations.reduce((script, declaration) => script.replace(declaration, ""), source), context);
 }

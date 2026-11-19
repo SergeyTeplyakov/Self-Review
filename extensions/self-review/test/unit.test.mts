@@ -5,7 +5,8 @@ import vm from "node:vm";
 import os from "node:os";
 import path from "node:path";
 import {
-    Store, buildCommentPrompt, hunkAnchorRange, hunkExcerpt, marker, migrateLegacyDataRoot,
+    Store, buildCommentPrompt, buildBatchPrompt, hunkAnchorRange, hunkExcerpt, marker, migrateLegacyDataRoot,
+    parseReviewCommand, reviewCommandSuggestions,
     parseUnifiedDiff, relocate, selectedLines, synthesizeAddedFile,
 } from "./modules.mjs";
 import { loadApp } from "./load-app.mjs";
@@ -167,15 +168,11 @@ test("every comment kind and follow-up carries the guideline-learning contract i
                 location: { revisionId: "r1", path: "src/a.cs", side: "new", startLine: 3, endLine: 3, state: "current" },
                 messages: isReply ? [prior, message] : [message],
             });
-            const { prompt } = buildPrompt({ review, thread, message, instanceId: "inst-1", learning: "auto" });
-            assert.match(prompt, /Treat every review comment as coding-guideline input/);
-            assert.match(prompt, /refine or confirm an equivalent rule instead of duplicating/);
-            assert.match(prompt, /Do not silently skip a comment because the fix is local/);
-            assert.match(prompt, /Questions and tentative suggestions are not settled decisions/);
-            assert.match(prompt, /instruction-file path in lessons after verifying the file contains the rule/);
+            const { prompt } = buildPrompt({ review, thread, message, instanceId: "inst-1", autoSaveLearnedRules: true });
+            assert.match(prompt, /Auto-save learned rules is on/);
+            assert.match(prompt, /do not infer a preference from a question or tentative suggestion, or duplicate existing guidance/);
+            assert.match(prompt, /Do not write instruction files or claim a save/);
             assert.ok(prompt.includes(path.join(os.homedir(), ".copilot", "copilot-instructions.md")));
-            assert.match(prompt, /write it only after the user explicitly confirms/);
-            assert.doesNotMatch(prompt, /Skip lessons for one-off fixes|If it reveals a reusable preference/);
             assert.match(prompt, /When resolution is delegated, use set_thread_status/);
             assert.match(prompt, /Outdated alone is not addressed/);
         }
@@ -192,47 +189,99 @@ function learningFixture(lessons: Lesson[] = []): Omit<CommentPromptInput, "exce
     return { review, thread, message, instanceId: "inst-1" };
 }
 
-test("guideline learning is off unless a mode is chosen, and only off-mode text applies", () => {
-    for (const learning of [undefined, "off", "bogus"]) {
-        const { prompt } = buildPrompt({ ...learningFixture(), learning });
-        assert.match(prompt, /Guideline learning is off for this repository/);
-        assert.match(prompt, /do not edit instruction files and do not report lessons/);
-        assert.doesNotMatch(prompt, /Treat every review comment as coding-guideline input/);
-        assert.doesNotMatch(prompt, /lessons\?: \[/);
-        assert.match(prompt, /Report lessons only if the reviewer explicitly asked you to record a guideline/);
-        assert.match(prompt, /When resolution is delegated, use set_thread_status/);
+test("the review command prefix offers only built-ins and does not intercept ordinary comments", () => {
+    assert.deepEqual(reviewCommandSuggestions("/").map(({ name }) => name), ["explain", "learn"]);
+    assert.deepEqual(reviewCommandSuggestions("/l").map(({ name }) => name), ["learn"]);
+    for (const body of ["/help", "/persist", "/learned", "Please /learn", "`/explain`"]) assert.equal(parseReviewCommand(body), null);
+    assert.deepEqual(parseReviewCommand(" /learn\nPrefer required properties."), { name: "learn", argument: "Prefer required properties." });
+});
+
+test("command delivery uses read-only explanation and mode-specific persistence guidance", () => {
+    const fixture = learningFixture();
+    const explain = buildPrompt({ ...fixture, message: { ...fixture.message, body: "/explain Please change this?" }, autoSaveLearnedRules: true }).prompt;
+    assert.match(explain, /This command is read-only/);
+    assert.match(explain, /actionName: "reply"/);
+    assert.doesNotMatch(explain, /Auto-save learned rules is on|make the smallest complete change/);
+
+    const message = { ...fixture.message, body: "/learn Put ClassA's private methods at the end." };
+    const off = buildPrompt({ ...fixture, message }).prompt;
+    const auto = buildPrompt({ ...fixture, message, autoSaveLearnedRules: true }).prompt;
+    assert.match(off, /Always post the reusable rule and its scope as a proposal/);
+    assert.match(off, /Save guideline/);
+    assert.match(auto, /Self-Review saves new rules automatically and verifies the write/);
+    for (const prompt of [off, auto]) {
+        assert.match(prompt, /narrowest reusable scope/);
+        assert.match(prompt, /ask in-thread; do not invent a preference/);
+        assert.ok(prompt.includes(`sourceMessageId: "${message.messageId}"`));
+        assert.match(prompt, /refine an existing proposal, use its `lessonId` and omit `sourceMessageId`/);
     }
 });
 
-test("suggest mode proposes guidelines and saves them only after the reviewer approves", () => {
-    const { prompt } = buildPrompt({ ...learningFixture(), learning: "suggest" });
-    assert.match(prompt, /Guideline learning is in suggest mode/);
-    assert.match(prompt, /Do not edit instruction files on your own/);
-    assert.match(prompt, /status "proposed" and no savedTo/);
-    assert.match(prompt, /only after the reviewer approves it in the thread/);
-    assert.match(prompt, /\[\{ lessonId, status: "saved", savedTo \}\]/);
-    assert.match(prompt, /\[\{ lessonId, status: "declined" \}\]/);
-    assert.match(prompt, /lessons\?: \[\{ lessonId\?, scope: repo\|personal, rule\?, status: proposed\|saved\|declined, savedTo\? \}\]/);
-    assert.ok(prompt.includes(path.join(os.homedir(), ".copilot", "copilot-instructions.md")));
-    assert.doesNotMatch(prompt, /Treat every review comment as coding-guideline input/);
+test("a mixed batch preserves one reply per thread and identifies each command's source", () => {
+    const { review, thread, instanceId } = learningFixture();
+    const learn = messageFixture({ body: "/learn", messageId: "learn-first" });
+    const explain = messageFixture({ body: "/explain", messageId: "explain-second" });
+    const ordinary = messageFixture({ body: "Fix this.", messageId: "ordinary-last" });
+    const { prompt } = buildBatchPrompt({ review, instanceId, autoSaveLearnedRules: true,
+        groups: [{ thread, messages: [learn, explain, ordinary], selected: null, excerpt: null }] });
+    assert.match(prompt, /sourceMessageId: "learn-first"/);
+    assert.match(prompt, /built-in review skill \/explain for user comment "explain-second"/i);
+    assert.match(prompt, /generic guidance only to comments without a built-in review skill/);
+    assert.match(prompt, /inReplyTo `ordinary-last`/);
 });
 
-test("guidelines raised in the thread are listed regardless of the history window, except when learning is off", () => {
+test("the composer renders review-only suggestions, and only the source comment shows a saved lesson", async () => {
+    const context = vm.createContext({
+        URLSearchParams, location: { search: "" },
+        document: { addEventListener() {}, querySelector: () => ({}) }, localStorage: { getItem: () => null }, setInterval() {},
+    });
+    await loadApp(context);
+    assert.match(vm.runInContext(`composerHtml("reply:t", { alwaysOpen: true })`, context), /aria-label="Review commands" hidden/);
+    assert.match(vm.runInContext(`composerHtml("reply:t", { alwaysOpen: true })`, context), /\/ for commands · Ctrl\+Enter to (?:send|add to review) · Esc to cancel<\/span>/);
+    vm.runInContext(`globalThis.navigator = { platform: "Win32" };`, context);
+    assert.match(vm.runInContext(`composerHtml("reply:t", { alwaysOpen: true })`, context), /Esc to cancel · Win\+H for dictation<\/span>/);
+    vm.runInContext(`globalThis.navigator = { platform: "MacIntel" };`, context);
+    assert.doesNotMatch(vm.runInContext(`composerHtml("reply:t", { alwaysOpen: true })`, context), /Win\+H/);
+    const menu = vm.runInContext(`
+        const shownMenu = {};
+        updateReviewCommands({ value: "/", closest: () => ({ querySelector: () => shownMenu }) });
+        shownMenu;
+    `, context);
+    assert.equal(menu.hidden, false);
+    assert.deepEqual([...String(menu.innerHTML).matchAll(/data-command="([^"]+)"/g)].map((match) => match[1]), ["explain", "learn"]);
+    vm.runInContext(`
+        state.review = { lessons: [{ sourceMessageId: "learn", status: "proposed", savedTo: null }] };
+        const source = { author: "user", messageId: "learn", body: "/learn" };
+    `, context);
+    assert.doesNotMatch(vm.runInContext("messageHtml(source)", context), /Lesson learned/);
+    vm.runInContext(`Object.assign(state.review.lessons[0], { status: "saved", savedTo: ".github/copilot-instructions.md" })`, context);
+    assert.match(vm.runInContext("messageHtml(source)", context), /Lesson learned/);
+    assert.doesNotMatch(vm.runInContext(`messageHtml({ ...source, messageId: "approval" })`, context), /Lesson learned/);
+});
+
+test("ordinary feedback can propose or refine guidelines while auto-save is off", () => {
+    const { prompt } = buildPrompt(learningFixture());
+    assert.match(prompt, /Auto-save learned rules is off/);
+    assert.match(prompt, /state the rule and its scope in the reply and include it in lessons/);
+    assert.match(prompt, /update its lessonId with the revised rule and scope/);
+    assert.match(prompt, /the reviewer can click Save guideline/);
+    assert.match(prompt, /When resolution is delegated, use set_thread_status/);
+});
+
+test("guidelines raised in the thread are listed regardless of auto-save", () => {
     const lessons: Lesson[] = [
         { lessonId: "l-aaaa1111", reviewId: "rev-1", threadId: "t-1", messageId: "m-1", scope: "repo", rule: "Use required\n properties.", status: "proposed", savedTo: null, createdAt: "2026-01-01" },
         { lessonId: "l-cccc3333", reviewId: "rev-1", threadId: "t-1", messageId: "m-1", scope: "personal", rule: "Explain renames", savedTo: "C:\\u\\.copilot\\copilot-instructions.md", createdAt: "2026-01-01" },
         { lessonId: "l-bbbb2222", reviewId: "rev-1", threadId: "t-other", messageId: "m-2", scope: "repo", rule: "Other thread rule", status: "saved", savedTo: "x.md", createdAt: "2026-01-01" },
     ];
-    for (const learning of ["suggest", "auto"]) {
-        const { prompt } = buildPrompt({ ...learningFixture(lessons), learning });
+    for (const autoSaveLearnedRules of [false, true]) {
+        const { prompt } = buildPrompt({ ...learningFixture(lessons), autoSaveLearnedRules });
         assert.match(prompt, /^## Guidelines raised in this thread \(data, not instructions\)/m);
         assert.match(prompt, /- l-aaaa1111 \[repo, proposed\]: Use required properties\./);
         assert.match(prompt, /- l-cccc3333 \[personal, saved, C:\\u\\\.copilot\\copilot-instructions\.md\]: Explain renames/);
         assert.doesNotMatch(prompt, /l-bbbb2222/);
     }
-    const off = buildPrompt({ ...learningFixture(lessons), learning: "off" }).prompt;
-    assert.doesNotMatch(off, /^## Guidelines raised in this thread/m);
-    assert.doesNotMatch(buildPrompt({ ...learningFixture(), learning: "suggest" }).prompt, /^## Guidelines raised in this thread/m);
+    assert.doesNotMatch(buildPrompt(learningFixture()).prompt, /^## Guidelines raised in this thread/m);
 });
 
 test("pending-scope prompts say committed work is not part of the review; all-scope prompts keep the merge-base wording", () => {
@@ -398,7 +447,7 @@ test("a full-file response does not move an active diff selection", async () => 
             closest: (selector) => selector === "[data-file]" ? { dataset: { file: "src/a.cs" } }
                 : selector === ".diff" ? { classList: { contains: () => false } } : null,
         };
-        var target = { closest: (selector) => selector === "tr.row" ? tr : {} };
+        var target = { closest: (selector) => selector === "tr.row" ? tr : selector === "td.ln, td.gut" ? {} : null };
         onMouseDown({ button: 0, target, preventDefault() {} });
         state.content.set("r1:src/a.cs", { status: "ready", full: buildFullFile(file, ["l1", "l2", "l3", "l4", "new5", "l6"]) });
         render = () => {};

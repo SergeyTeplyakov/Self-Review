@@ -13,6 +13,7 @@ import { resolveDelivery } from "./settings.mjs";
 import { findOpenPullRequest } from "./pull-request.mjs";
 import { SettingsHttp, HttpError } from "./settings-http.mjs";
 import { ReviewWatcher } from "./review-watcher.mjs";
+import { MAX_IMAGE_BYTES, readCommentImage, saveCommentImage } from "./comment-images.mjs";
 const MAX_JSON = 1024 * 1024;
 const PULL_REQUEST_CACHE_MS = 30_000;
 const STATIC = {
@@ -22,6 +23,7 @@ const STATIC = {
     "/styles.css": ["styles.css", "text/css; charset=utf-8"],
     "/contracts.mjs": ["contracts.mjs", "text/javascript; charset=utf-8"],
     "/settings-api.mjs": ["settings-api.mjs", "text/javascript; charset=utf-8"],
+    "/review-commands.mjs": ["review-commands.mjs", "text/javascript; charset=utf-8"],
 };
 const ASSET_FILES = [...new Set(Object.values(STATIC).map(([file]) => file))];
 const ASSET_DEBOUNCE_MS = 250;
@@ -65,6 +67,18 @@ function readJsonBody(req) {
         });
         req.on("error", reject);
     });
+}
+async function readImageBody(req) {
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of req) {
+        size += chunk.length;
+        if (size <= MAX_IMAGE_BYTES)
+            chunks.push(chunk);
+    }
+    if (size > MAX_IMAGE_BYTES)
+        throw new HttpError(413, "invalid_input", "Paste an image up to 2 MB.");
+    return Buffer.concat(chunks);
 }
 function tokenMatches(expected, provided) {
     if (typeof provided !== "string" || provided.length !== expected.length)
@@ -186,6 +200,17 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         const reviewId = getReviewId();
         const parts = url.pathname.split("/").filter(Boolean).slice(1);
         if (req.method === "GET") {
+            if (parts[0] === "comment-images" && parts.length === 2) {
+                if (url.searchParams.get("review") !== reviewId)
+                    throw new HttpError(404, "not_found", "Not found.");
+                const { bytes, mimeType } = await readCommentImage(service.store, reviewId, parts[1]);
+                res.writeHead(200, {
+                    "Content-Type": mimeType, "Content-Length": bytes.length, "Cache-Control": "no-store",
+                    "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer",
+                });
+                res.end(bytes);
+                return;
+            }
             if (parts[0] === "state" && parts.length === 1) {
                 const initial = await service.getReview(reviewId);
                 const [pullRequest, settingsState] = await Promise.all([readPullRequest(initial), settingsHttp.read(initial.repoRoot)]);
@@ -227,6 +252,12 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         const pageReview = req.headers["x-mr-review"];
         if (pageReview !== undefined && pageReview !== reviewId) {
             throw new HttpError(409, "conflict", "This canvas now shows a different review. Your comment was not saved; reload and try again.");
+        }
+        if (parts[0] === "comment-images" && parts.length === 1) {
+            if (pageReview !== reviewId)
+                throw new HttpError(409, "conflict", "Refresh the canvas before pasting an image.");
+            const imageId = await saveCommentImage(service.store, reviewId, await readImageBody(req));
+            return send(res, 200, { imageId });
         }
         const body = recordBody(await readJsonBody(req));
         if (parts[0] === "review-skills" && parts.length === 1) {
@@ -278,7 +309,7 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         }
         if (parts[0] === "threads" && parts.length === 3 && parts[2] === "messages") {
             const hold = await shouldHold(reviewId, body.draft);
-            const { thread, message, duplicate } = await service.addMessage(reviewId, parts[1], { body: body.body, clientRequestId: body.clientRequestId, descriptionVersion: body.descriptionVersion, author: "user", hold });
+            const { thread, message, duplicate } = await service.addMessage(reviewId, parts[1], { body: body.body, imageIds: body.imageIds, clientRequestId: body.clientRequestId, descriptionVersion: body.descriptionVersion, author: "user", hold });
             if (!duplicate && !hold)
                 deliverAsync(reviewId, thread.threadId, message.messageId);
             return send(res, 200, { threadId: thread.threadId, messageId: message.messageId, duplicate, draft: message.delivery?.state === "draft" });
@@ -318,6 +349,11 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         }
         if (parts[0] === "refresh" && parts.length === 1) {
             return send(res, 200, await service.refresh(reviewId));
+        }
+        if (parts[0] === "lessons" && parts.length === 3 && parts[2] === "save") {
+            if (pageReview !== reviewId)
+                throw new HttpError(409, "conflict", "Refresh the canvas before saving a guideline.");
+            return send(res, 200, await service.saveLesson(reviewId, parts[1], body));
         }
         if (parts[0] === "settings" && parts.length === 1) {
             if (!settings)

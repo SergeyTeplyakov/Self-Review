@@ -36,7 +36,7 @@ interface DialogState {
     focus?: string;
     saving?: boolean;
     error?: string;
-    learning?: string;
+    autoSaveLearnedRules?: boolean;
     delivery?: string;
     revisionId?: string;
     model?: string;
@@ -46,7 +46,7 @@ interface RuntimeState {
     [key: string]: unknown;
     review: Record<string, unknown> & { reviewId: string; scope?: string; threads: Array<{ status: string; messages: unknown[] }> };
     dialog: DialogState | null;
-    settings: Record<string, unknown> & { learning: string; delivery: string; configured: boolean; repoName?: string } | null | undefined;
+    settings: Record<string, unknown> & { autoSaveLearnedRules?: boolean; delivery: string; configured: boolean; repoName?: string } | null | undefined;
     skillOverrides: Map<string, Set<string>>;
     open: Set<string>;
     expanded: Set<string>;
@@ -148,7 +148,7 @@ const reviewFixture = (overrides: Record<string, unknown> = {}) => ({
     threads: [], lessons: [],
     ...overrides,
 });
-const settingsFixture = (overrides: Record<string, unknown> = {}) => ({ repoName: "repo", learning: "off", delivery: "immediate", configured: false, dismissed: false, ...overrides });
+const settingsFixture = (overrides: Record<string, unknown> = {}) => ({ repoName: "repo", autoSaveLearnedRules: false, delivery: "immediate", configured: false, dismissed: false, ...overrides });
 
 test("tree root and root folder use the repository identity, retaining the checkout tooltip", async () => {
     const app = await loadApp();
@@ -686,7 +686,7 @@ test("the prominent review action and agent-comment counts include findings, not
     assert.match(html, /class="primary agent-review-launch"[^>]*>Run agentic review/);
     assert.doesNotMatch(html, /Agent comments|agent-comment-count|data-view="agent-comments"/);
     assert.match(html, /Run agentic review.*Review settings/);
-    assert.match(html, /aria-labelledby="manual-review-title".*Delivery: Immediate.*Learning: Off.*Manual review settings/);
+    assert.match(html, /aria-labelledby="manual-review-title".*Delivery: Immediate.*Auto-save learned rules: Off.*Manual review settings/);
     assert.match(app.node("#side").innerHTML, /data-view="overview".*<span class="count"[^>]*>2<\/span><span class="name">Agent reviews<\/span>/);
     assert.doesNotMatch(app.run("overviewView()"), /agent-review-run|Review runs|<h2>Revisions/, "Overview omits agent review runs and the revisions list");
     assert.match(app.run("agentCommentsView()"), /1 active, 1 closed or resolved; 1 from older revisions/);
@@ -1386,18 +1386,18 @@ test("the top bar shows the review scope, and the learning controls only when th
     assert.equal(required(toggle(top()).match(/ disabled/g)).length, 2, "both scope buttons are disabled while a switch is in flight");
     app.state.switching = false;
 
-    for (const [learning, pill] of [["off", "Off"], ["suggest", "Suggest"], ["auto", "Auto-save"], ["unexpected", "Off"]]) {
-        app.state.settings = settingsFixture({ learning, configured: true });
-        assert.match(top(), new RegExp(`Learning: ${pill}</span><button data-action="configure"[^>]*>Manual review settings`), learning);
+    for (const [autoSaveLearnedRules, label] of [[false, "Off"], [true, "On"]]) {
+        app.state.settings = settingsFixture({ autoSaveLearnedRules, configured: true });
+        assert.match(top(), new RegExp(`Auto-save learned rules: ${label}</span><button data-action="configure"[^>]*>Manual review settings`), String(autoSaveLearnedRules));
     }
     app.state.settings = null;
     html = top();
-    assert.doesNotMatch(html, /Learning:|Manual review settings|data-action="configure"/);
+    assert.doesNotMatch(html, /Auto-save learned rules:|Manual review settings|data-action="configure"/);
     assert.match(html, /aria-labelledby="manual-review-title"/);
     assert.match(html, /data-action="refresh"/);
 });
 
-test("the first-use banner offers Suggest or Save automatically, never Off, and only while the repository is undecided", async () => {
+test("the first-use banner offers manual saving or auto-save, with the old dismissal still supported", async () => {
     const app = await loadApp();
     const banner = (settings: RuntimeState["settings"]) => {
         app.state.settings = settings;
@@ -1411,43 +1411,38 @@ test("the first-use banner offers Suggest or Save automatically, never Off, and 
 
     const shown = banner(settingsFixture({ repoName: "<img src=x>" }));
     assert.equal(shown.hidden, false);
-    assert.match(shown.innerHTML, /Learn from your review feedback in &lt;img src=x&gt;\?/);
+    assert.match(shown.innerHTML, /Auto-save learned rules in &lt;img src=x&gt;\?/);
     assert.doesNotMatch(shown.innerHTML, /<img/);
-    assert.match(shown.innerHTML, /data-action="learning-set" data-mode="suggest" class="primary"[^>]*>Suggest</);
-    assert.match(shown.innerHTML, /data-action="learning-set" data-mode="auto"(?! class="primary")[^>]*>Save automatically</);
-    assert.doesNotMatch(shown.innerHTML, /data-mode="off"/);
+    assert.match(shown.innerHTML, /data-action="learning-set" data-enabled="false" class="primary"[^>]*>Keep manual saving</);
+    assert.match(shown.innerHTML, /data-action="learning-set" data-enabled="true"(?! class="primary")[^>]*>Enable auto-save</);
     assert.match(shown.innerHTML, /data-action="learning-dismiss"[^>]*>Not now</);
 });
 
-test("the Configure dialog is an accessible modal that preselects the draft mode and locks while saving", async () => {
+test("the Configure dialog is an accessible modal with auto-save off by default and locks while saving", async () => {
     const app = await loadApp();
     assert.equal(app.run("dialogHtml()"), "", "closed by default");
-    app.state.settings = settingsFixture({ repoName: "Org/Repo <x>", learning: "suggest", configured: true });
-    app.state.dialog = { learning: "suggest", delivery: "batch", saving: false, error: "" };
+    app.state.settings = settingsFixture({ repoName: "Org/Repo <x>", configured: true });
+    app.state.dialog = { autoSaveLearnedRules: false, delivery: "batch", saving: false, error: "" };
     const html = app.run("dialogHtml()");
     assert.match(html, /role="dialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby="dialog-desc"/);
     assert.match(html, /<h2 id="dialog-title">Review settings<\/h2>/);
     assert.match(html, /<p id="dialog-desc" class="muted">Settings for Org\/Repo &lt;x&gt;\. /);
-    assert.match(html, /<legend>Learn from review feedback<\/legend>.*<legend>Send comments to Copilot<\/legend>/);
-    assert.deepEqual(
-        [...html.matchAll(/<input type="radio" name="learning" value="(\w+)"( checked)?>/g)].map((m) => [m[1], Boolean(m[2])]),
-        [["off", false], ["suggest", true], ["auto", false]],
-    );
+    assert.match(html, /<legend>Guidelines<\/legend><label><input type="checkbox" name="autoSaveLearnedRules"> Auto-save learned rules<\/label>/);
+    assert.match(html, /When off, review and save proposed guidelines yourself\./);
     assert.deepEqual(
         [...html.matchAll(/<input type="radio" name="delivery" value="(\w+)"( checked)?>/g)].map((m) => [m[1], Boolean(m[2])]),
         [["immediate", false], ["batch", true], ["ask", false]],
     );
-    assert.match(html, /<span class="choice-title">Save automatically<\/span>/);
     assert.match(html, /<span class="choice-title">Ask for each review<\/span>/);
     assert.doesNotMatch(html, /role="alert"|\sdisabled[\s>]/);
     assert.match(html, /data-action="dialog-save">Save<\/button>/);
 
-    app.state.dialog = { learning: "auto", saving: true, error: "Could not save <b>" };
+    app.state.dialog = { autoSaveLearnedRules: true, saving: true, error: "Could not save <b>" };
     const busy = app.run("dialogHtml()");
     assert.match(busy, /<div class="modal-error" role="alert">Could not save &lt;b&gt;<\/div>/);
     assert.match(busy, /data-action="dialog-cancel" disabled>/);
     assert.match(busy, /data-action="dialog-save" disabled>Saving…<\/button>/);
-    assert.match(busy, /value="auto" checked/);
+    assert.match(busy, /name="autoSaveLearnedRules" checked/);
 
     app.state.settings = settingsFixture({ repoName: undefined });
     assert.match(app.run("dialogHtml()"), /Settings for this repository\./);
@@ -1462,39 +1457,48 @@ test("the Configure dialog opens on the saved mode, keeps the page inert behind 
     app.state.settings = null;
     app.run("openConfigure()");
     assert.equal(app.state.dialog, null, "there is nothing to configure until the server reports the settings");
-    app.state.settings = settingsFixture({ learning: "auto", configured: true });
+    app.state.settings = settingsFixture({ configured: true });
+    app.run("openConfigure()");
+    assert.equal(dialog(app).autoSaveLearnedRules, false, "auto-save defaults to off");
+    assert.doesNotMatch(app.node("#dialog").innerHTML, /name="autoSaveLearnedRules" checked/);
+    await clicker(app)("dialog-cancel");
+
+    app.state.settings = settingsFixture({ autoSaveLearnedRules: true, configured: true });
 
     app.run("openConfigure()");
-    assert.equal(dialog(app).learning, "auto");
-    assert.match(app.node("#dialog").innerHTML, /value="auto" checked/);
+    assert.equal(dialog(app).autoSaveLearnedRules, true);
+    assert.match(app.node("#dialog").innerHTML, /name="autoSaveLearnedRules" checked/);
     for (const id of ["#top", "#banner", "#layout"]) assert.equal(app.node(id).inert, true, id);
-    assert.equal(app.focused.at(-1), '#dialog input[name="learning"]:checked');
+    assert.equal(app.focused.at(-1), '#dialog input[name="autoSaveLearnedRules"]');
     const opened = app.state.dialog;
     app.run("openConfigure()");
     assert.equal(app.state.dialog, opened, "opening twice keeps the first dialog");
 
-    await app.run("onChange")({ target: { name: "learning", value: "off" } });
-    assert.equal(dialog(app).learning, "off");
-    assert.equal(app.state.settings.learning, "auto", "the choice is only a draft until Save");
+    await app.run("onChange")({ target: Object.assign(new MockElement("INPUT"), { name: "autoSaveLearnedRules", checked: false }) });
+    assert.equal(dialog(app).autoSaveLearnedRules, false);
+    assert.equal(app.state.settings.autoSaveLearnedRules, true, "the choice is only a draft until Save");
 
     const focus: string[] = [];
-    const radios: MockFocusable[] = [
-        Object.assign(new MockElement("INPUT"), { checked: false, name: "learning" }),
-        Object.assign(new MockElement("INPUT"), { checked: true, name: "learning", focus: () => focus.push("radio") }),
-        Object.assign(new MockElement("INPUT"), { checked: false, name: "learning" }),
+    const deliveryRadios: MockFocusable[] = [
+        Object.assign(new MockElement("INPUT"), { checked: false, name: "delivery" }),
+        Object.assign(new MockElement("INPUT"), { checked: true, name: "delivery", focus: () => focus.push("radio") }),
+        Object.assign(new MockElement("INPUT"), { checked: false, name: "delivery" }),
     ];
+    const autoSaveCheckbox = Object.assign(new MockElement("INPUT"), { checked: true, name: "autoSaveLearnedRules", focus: () => focus.push("checkbox") });
     const buttons: MockFocusable[] = [
         Object.assign(new MockElement("BUTTON"), { focus: () => focus.push("cancel") }),
         Object.assign(new MockElement("BUTTON"), { focus: () => focus.push("save") }),
     ];
-    app.document.querySelectorAll = (selector: string) => (selector.startsWith("#dialog input") ? radios : buttons);
+    const querySelector = app.document.querySelector;
+    app.document.querySelector = (selector: string) => (selector.includes("autoSaveLearnedRules") ? autoSaveCheckbox : querySelector(selector));
+    app.document.querySelectorAll = (selector: string) => (selector === '#dialog input[name="delivery"]' ? deliveryRadios : buttons);
     app.document.activeElement = buttons[1];
     press({ key: "Tab", shiftKey: false });
-    app.document.activeElement = radios[1];
+    app.document.activeElement = autoSaveCheckbox;
     press({ key: "Tab", shiftKey: true });
     app.document.activeElement = buttons[0];
     press({ key: "Tab", shiftKey: false });
-    assert.deepEqual(focus, ["radio", "save"], "Tab wraps from the last stop to the first, and Shift+Tab from the first to the last");
+    assert.deepEqual(focus, ["checkbox", "save"], "Tab wraps from the last stop to the checkbox, and Shift+Tab from the checkbox to the last");
     assert.equal(prevented, 2, "Tab between the stops is left to the browser");
 
     press({ key: "Escape" });
@@ -1510,7 +1514,7 @@ test("the Configure dialog opens on the saved mode, keeps the page inert behind 
     assert.notEqual(app.state.dialog, null, "a save in flight cannot be dismissed");
 });
 
-test("choosing a mode from the banner or the Configure dialog saves it, updates the controls, and reports a failed save", async () => {
+test("the banner, Configure checkbox, and dismissal persist auto-save settings and report failures", async () => {
     const posts: CapturedPost[] = [];
     let settings: ReturnType<typeof settingsFixture> | undefined = settingsFixture();
     let failure: string | null = null;
@@ -1520,7 +1524,7 @@ test("choosing a mode from the banner or the Configure dialog saves it, updates 
         if (failure) return jsonResponse({ error: { message: failure } }, 500);
         settings = {
             ...(settings ?? settingsFixture()),
-            ...(typeof body.learning === "string" ? { learning: body.learning, configured: true } : {}),
+            ...(typeof body.autoSaveLearnedRules === "boolean" ? { autoSaveLearnedRules: body.autoSaveLearnedRules, configured: true } : {}),
             ...(typeof body.delivery === "string" ? { delivery: body.delivery } : {}),
             ...(body.dismissed === true ? { dismissed: true } : {}),
         };
@@ -1533,53 +1537,54 @@ test("choosing a mode from the banner or the Configure dialog saves it, updates 
     app.run("renderBanner()");
     assert.equal(app.node("#banner").hidden, false);
 
-    await click("learning-set", { mode: "suggest" });
-    assert.deepEqual(posts.at(-1), ["POST", "/api/settings", { learning: "suggest" }]);
-    assert.equal(app.state.settings.learning, "suggest");
-    assert.equal(app.node("#banner").hidden, true, "choosing a mode settles the question");
-    assert.match(app.node("#top").innerHTML, /Learning: Suggest/);
-    assert.equal(app.node("#toast").textContent, "Learning mode: Suggest");
+    await click("learning-set", { enabled: "false" });
+    assert.deepEqual(posts.at(-1), ["POST", "/api/settings", { autoSaveLearnedRules: false }]);
+    assert.equal(app.state.settings.autoSaveLearnedRules, false);
+    assert.equal(app.node("#banner").hidden, true, "choosing manual saving settles the question");
+    assert.match(app.node("#top").innerHTML, /Auto-save learned rules: Off/);
+    assert.equal(app.node("#toast").textContent, "Auto-save learned rules: Off");
 
     settings = settingsFixture();
     app.state.settings = settings;
     await click("learning-dismiss");
     assert.deepEqual(posts.at(-1), ["POST", "/api/settings", { dismissed: true }]);
     assert.equal(app.node("#banner").hidden, true);
-    assert.equal(app.state.settings.configured, false, "Not now leaves the repository unconfigured");
-    assert.match(app.node("#top").innerHTML, /Learning: Off/);
+    assert.equal(app.state.settings.configured, false, "Not now leaves the auto-save setting at its default");
+    assert.equal(app.state.settings.autoSaveLearnedRules, false);
+    assert.match(app.node("#top").innerHTML, /Auto-save learned rules: Off/);
 
     await click("configure");
-    assert.equal(dialog(app).learning, "off");
+    assert.equal(dialog(app).autoSaveLearnedRules, false);
     assert.equal(dialog(app).delivery, "immediate");
-    await app.run("onChange")({ target: { name: "learning", value: "auto" } });
+    await app.run("onChange")({ target: Object.assign(new MockElement("INPUT"), { name: "autoSaveLearnedRules", checked: true }) });
     await app.run("onChange")({ target: { name: "delivery", value: "batch" } });
     await click("dialog-save");
-    assert.deepEqual(posts.at(-1), ["POST", "/api/settings", { learning: "auto", delivery: "batch" }]);
+    assert.deepEqual(posts.at(-1), ["POST", "/api/settings", { autoSaveLearnedRules: true, delivery: "batch" }]);
     assert.equal(app.state.dialog, null);
-    assert.equal(app.state.settings.learning, "auto");
+    assert.equal(app.state.settings.autoSaveLearnedRules, true);
     assert.equal(app.state.settings.delivery, "batch");
     assert.equal(app.node("#dialog").innerHTML, "");
-    assert.match(app.node("#top").innerHTML, /Delivery: Batch<\/span>.*Learning: Auto-save/);
-    assert.equal(app.node("#toast").textContent, "Saved. Learning: Auto-save · Delivery: Batch");
+    assert.match(app.node("#top").innerHTML, /Delivery: Batch<\/span>.*Auto-save learned rules: On/);
+    assert.equal(app.node("#toast").textContent, "Saved. Auto-save learned rules: On · Delivery: Batch");
     assert.equal(app.focused.at(-1), '[data-action="configure"]');
 
     await click("configure");
     failure = "disk full";
-    await app.run("onChange")({ target: { name: "learning", value: "off" } });
+    await app.run("onChange")({ target: Object.assign(new MockElement("INPUT"), { name: "autoSaveLearnedRules", checked: false }) });
     await click("dialog-save");
     assert.equal(dialog(app).saving, false);
     assert.equal(dialog(app).error, "disk full");
-    assert.equal(app.state.settings.learning, "auto", "a failed save changes nothing");
+    assert.equal(app.state.settings.autoSaveLearnedRules, true, "a failed save changes nothing");
     assert.match(app.node("#dialog").innerHTML, /role="alert">disk full</);
     assert.equal(app.focused.at(-1), '#dialog [data-action="dialog-save"]');
     failure = null;
     await click("dialog-save");
     assert.equal(app.state.dialog, null, "retrying after the failure succeeds");
-    assert.equal(app.state.settings.learning, "off");
+    assert.equal(app.state.settings.autoSaveLearnedRules, false);
 
     failure = "offline";
-    await click("learning-set", { mode: "auto" });
-    assert.equal(app.state.settings.learning, "off");
+    await click("learning-set", { enabled: "true" });
+    assert.equal(app.state.settings.autoSaveLearnedRules, false);
     assert.equal(app.node("#toast").textContent, "offline");
     assert.equal(app.node("#toast").className, "error");
 });
@@ -1612,7 +1617,7 @@ test("lessons show their status next to each rule in the thread and in the Lesso
     app.state.review = reviewFixture({
         lessons: [
             { lessonId: "l-1", threadId: "t1", scope: "repo", rule: "Prefer `ILogger`", savedTo: "AGENTS.md", createdAt: "2026-01-01T00:00:00Z" },
-            { lessonId: "l-2", threadId: "t1", scope: "personal", rule: "Keep <b>short</b>", status: "proposed", savedTo: null, createdAt: "2026-01-02T00:00:00Z" },
+            { lessonId: "l-2", threadId: "t1", scope: "personal", rule: "Keep <b>short</b>", status: "proposed", saveError: "Automatic save failed: offline", savedTo: null, createdAt: "2026-01-02T00:00:00Z" },
             { lessonId: "l-3", threadId: "t2", scope: "repo", rule: "Avoid globals", status: "declined", savedTo: null, createdAt: "2026-01-03T00:00:00Z" },
             { lessonId: "l-4", threadId: "t2", scope: "repo", rule: "Unknown status", status: "bogus", savedTo: null, createdAt: "2026-01-04T00:00:00Z" },
         ],
@@ -1621,7 +1626,8 @@ test("lessons show their status next to each rule in the thread and in the Lesso
 
     const html = message(["l-1", "l-2", "missing"]);
     assert.match(html, /<li><span class="badge">repo<\/span> <span class="badge lesson-saved"[^>]*>saved<\/span> Prefer <code>ILogger<\/code> <span class="muted mono">→ AGENTS\.md<\/span><\/li>/, "a lesson recorded before statuses existed was saved");
-    assert.match(html, /<li><span class="badge">personal<\/span> <span class="badge lesson-proposed"[^>]*>proposed<\/span> Keep &lt;b&gt;short&lt;\/b&gt;<\/li>/, "a proposed lesson is not saved anywhere yet");
+    assert.match(html, /<li><span class="badge">personal<\/span> <span class="badge lesson-proposed"[^>]*>proposed<\/span> Keep &lt;b&gt;short&lt;\/b&gt;/, "a proposed lesson is not saved anywhere yet");
+    assert.match(html, /data-action="save-lesson" data-lesson="l-2" data-proposal="[^"]*">Save guideline<\/button> <span role="status">Automatic save failed: offline<\/span>/, "an auto-save failure leaves the proposal and its manual save action visible");
     assert.equal(required(html.match(/<li>/g)).length, 2, "an unknown lesson id is skipped");
     assert.doesNotMatch(message([]), /Guidelines:/);
 
@@ -1633,17 +1639,40 @@ test("lessons show their status next to each rule in the thread and in the Lesso
     assert.match(table, /Keep &lt;b&gt;short&lt;\/b&gt;/);
 });
 
-test("the empty Lessons learned view explains what the current learning mode does", async () => {
+test("Save guideline posts the exact rendered lesson and leaves the proposal visible after failure", async () => {
+    const calls: CapturedPost[] = [];
+    const app = await loadApp({ fetch: async (url, init) => {
+        calls.push([init?.method ?? "GET", url, requestBody(init)]);
+        return jsonResponse({ error: { message: "automatic save unavailable" } }, 500);
+    } });
+    const rule = "Prefer <safe> & focused";
+    app.state.review = reviewFixture({
+        lessons: [{ lessonId: "lesson/one", threadId: "t1", scope: "repo", rule, status: "proposed", createdAt: "2026-01-01T00:00:00Z" }],
+    });
+    const message = () => app.run("messageHtml({ messageId: 'm', author: 'agent', body: 'Done', createdAt: '2026-01-02T00:00:00Z', lessonIds: ['lesson/one'] })");
+    const html = message();
+    assert.match(html, /Prefer &lt;safe&gt; &amp; focused/);
+    const encodedProposal = required(html.match(/data-proposal="([^"]*)"/))[1];
+    const renderedProposal = JSON.parse(encodedProposal
+        .replaceAll("&quot;", '"').replaceAll("&#39;", "'").replaceAll("&gt;", ">").replaceAll("&lt;", "<").replaceAll("&amp;", "&")) as { rule: string; scope: string };
+    assert.deepEqual(renderedProposal, { rule, scope: "repo" });
+
+    await clicker(app)("save-lesson", { lesson: "lesson/one", proposal: JSON.stringify(renderedProposal) });
+    assert.deepEqual(calls, [["POST", "/api/lessons/lesson%2Fone/save", { rule, scope: "repo" }]]);
+    assert.equal(app.node("#toast").textContent, "automatic save unavailable");
+    assert.match(message(), /<span class="badge lesson-proposed"[^>]*>proposed<\/span> Prefer &lt;safe&gt; &amp; focused <button data-action="save-lesson"[^>]*>Save guideline<\/button>/);
+});
+
+test("the empty Lessons learned view explains the current auto-save setting", async () => {
     const app = await loadApp();
     app.state.review = reviewFixture();
     const empty = (settings: RuntimeState["settings"]) => {
         app.state.settings = settings;
         return app.run("lessonsView()");
     };
-    assert.match(empty(null), /^<h2>Lessons learned<\/h2><div class="empty">Copilot records reusable rules here/);
-    assert.match(empty(settingsFixture({ learning: "suggest" })), /Copilot proposes reusable guidelines here.*saves one after you approve it/);
-    assert.match(empty(settingsFixture({ learning: "auto" })), /Copilot saves reusable guidelines here/);
-    for (const learning of ["off", "unexpected"]) assert.match(empty(settingsFixture({ learning })), /Learning is off for this repository.*Use Configure to turn it on/, learning);
+    assert.match(empty(null), /Copilot proposes reusable guidelines when your feedback reveals a settled preference\. Use Save guideline in the thread to save one\./);
+    assert.match(empty(settingsFixture()), /Copilot proposes reusable guidelines when your feedback reveals a settled preference\. Use Save guideline in the thread to save one\./);
+    assert.match(empty(settingsFixture({ autoSaveLearnedRules: true })), /Copilot saves reusable guidelines here/);
 });
 
 test("an empty diff explains itself per scope, and only the pending scope offers the way back", async () => {
@@ -1840,7 +1869,7 @@ test("the composer and the draft badge follow the delivery mode", async () => {
             assert.match(html, /<button class="primary" data-action="submit" data-key="file:a.cs" data-draft="1"[^>]*>Add to review<\/button>/, label);
             assert.match(html, /Ctrl\+Enter to add to review/, label);
         } else {
-            assert.match(html, /<button class="primary" data-action="submit" data-key="file:a.cs" >Comment<\/button>/, label);
+            assert.match(html, /<button class="primary" data-action="submit" data-key="file:a.cs"\s*>Comment<\/button>/, label);
             assert.doesNotMatch(html, /data-draft=|Add to review/, label);
             assert.match(html, /Ctrl\+Enter to send/, label);
         }
