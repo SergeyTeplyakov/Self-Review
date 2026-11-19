@@ -6,6 +6,7 @@ import path from "node:path";
 import { test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseExtensionVersion } from "../src/lib/extension-version.mjs";
+import { distributionBuildId, normalizeDistributionLineEndings } from "../scripts/distribution-fingerprint.mjs";
 
 const extensionRoot = fileURLToPath(new URL("..", import.meta.url));
 
@@ -17,6 +18,30 @@ async function filesUnder(directory: string): Promise<string[]> {
     }
     return files;
 }
+
+test("distribution files and build IDs are stable across line endings and enumeration order", async (t) => {
+    const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "self-review-fingerprint-"));
+    t.after(() => rm(temporaryRoot, { recursive: true, force: true }));
+
+    const linuxRoot = path.join(temporaryRoot, "linux");
+    const windowsRoot = path.join(temporaryRoot, "windows");
+    const relativeFiles = ["a1.txt", path.join("a", "file.txt")] as const;
+    for (const root of [linuxRoot, windowsRoot]) {
+        for (const relativeFile of relativeFiles) await mkdir(path.dirname(path.join(root, relativeFile)), { recursive: true });
+    }
+    await writeFile(path.join(linuxRoot, relativeFiles[0]), "first\nsecond\n");
+    await writeFile(path.join(linuxRoot, relativeFiles[1]), "nested\ncontent\n");
+    await writeFile(path.join(windowsRoot, relativeFiles[0]), "first\r\nsecond\r\n");
+    await writeFile(path.join(windowsRoot, relativeFiles[1]), "nested\r\ncontent\r\n");
+
+    const linuxFiles = relativeFiles.map((file) => path.join(linuxRoot, file));
+    const windowsFiles = relativeFiles.map((file) => path.join(windowsRoot, file)).reverse();
+    assert.equal(distributionBuildId(linuxRoot, linuxFiles), distributionBuildId(windowsRoot, windowsFiles));
+
+    normalizeDistributionLineEndings(windowsFiles);
+    assert.equal(await readFile(path.join(windowsRoot, relativeFiles[0]), "utf8"), "first\nsecond\n");
+    assert.equal(await readFile(path.join(windowsRoot, relativeFiles[1]), "utf8"), "nested\ncontent\n");
+});
 
 test("the installation-shaped distribution contains executable modules and all browser assets", async (t) => {
     const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "self-review-package-"));

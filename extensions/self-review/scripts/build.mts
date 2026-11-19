@@ -1,8 +1,8 @@
-import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { copyFileSync, cpSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { distributionBuildId, normalizeDistributionLineEndings } from "./distribution-fingerprint.mjs";
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../../");
 const extensionRoot = path.join(repositoryRoot, "extensions", "self-review");
@@ -59,14 +59,12 @@ const selfReviewPlugin = isRecord(marketplace) && Array.isArray(marketplace.plug
 if (!isRecord(selfReviewPlugin) || typeof selfReviewPlugin.version !== "string" || !selfReviewPlugin.version.trim()) {
     throw new Error("The Self-Review plugin metadata has no valid version.");
 }
-const buildHash = createHash("sha256");
-for (const file of distributionFiles(distributionRoot).sort()) {
-    buildHash.update(path.relative(distributionRoot, file).split(path.sep).join("/")).update("\0");
-    buildHash.update(readFileSync(file)).update("\0");
-}
+const files = distributionFiles(distributionRoot);
+normalizeDistributionLineEndings(files);
+const buildId = distributionBuildId(distributionRoot, files);
 writeFileSync(path.join(distributionRoot, "version.json"), `${JSON.stringify({
     version: selfReviewPlugin.version,
-    buildId: buildHash.digest("hex").slice(0, 12),
+    buildId,
 }, null, 2)}\n`);
 
 mkdirSync(toolsDistributionRoot, { recursive: true });
