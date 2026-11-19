@@ -614,13 +614,106 @@ function highlightFile(file) {
     highlightedFiles.set(file, rows);
     return rows;
 }
-function inline(text) {
-    return text
-        .split(/(`[^`\n]+`)/)
-        .map((part) => (part.length > 1 && part.startsWith("`") && part.endsWith("`")
-        ? `<code>${esc(part.slice(1, -1))}</code>`
-        : esc(part).replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")))
-        .join("");
+const MD_RENDER_TOKENS = /\\[!-\/:-@[-`{-~]|`+|\*\*|!?\[/g;
+const MD_RENDER_DESTINATION = /\((?:<((?:\\[!-\/:-@[-`{-~]|[^\\<>\r\n])*)>|((?:\\[!-\/:-@[-`{-~]|[^\\<>()\s]|\((?:\\[!-\/:-@[-`{-~]|[^\\<>()\s])*\))*))(?:\s+(?:"[^"]*"|'[^']*'))?\s*\)/y;
+function closingCodeRun(text, from, length) {
+    const runs = /`+|\n/g;
+    runs.lastIndex = from;
+    for (let run = runs.exec(text); run && run[0] !== "\n"; run = runs.exec(text)) {
+        if (run[0].length === length)
+            return run;
+    }
+    return null;
+}
+function closingInlineDelimiter(text, from, kind) {
+    const delimiters = /\\[!-\/:-@[-`{-~]|`+|\*\*|[\[\]\n]/g;
+    delimiters.lastIndex = from;
+    let depth = 1;
+    for (let match = delimiters.exec(text); match && match[0] !== "\n"; match = delimiters.exec(text)) {
+        const [token] = match;
+        if (token.startsWith("`")) {
+            const close = closingCodeRun(text, delimiters.lastIndex, token.length);
+            if (close)
+                delimiters.lastIndex = close.index + close[0].length;
+        }
+        else if (kind === "bold" && token === "**") {
+            return match.index;
+        }
+        else if (kind === "label") {
+            if (token === "[")
+                depth++;
+            if (token === "]" && --depth === 0)
+                return match.index;
+        }
+    }
+    return -1;
+}
+function externalMarkdownUrl(destination) {
+    let decoder;
+    const url = destination.replace(/\\([!-\/:-@[-`{-~])|&(?:#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[a-zA-Z][a-zA-Z0-9]*);/g, (token, punctuation) => {
+        if (typeof punctuation === "string")
+            return punctuation;
+        // Only a single syntactically valid reference, never arbitrary markup, reaches the decoder.
+        decoder ??= document.createElement("textarea");
+        decoder.innerHTML = token;
+        return decoder.value;
+    });
+    if (!/^https?:\/\//i.test(url) || !URL.canParse(url))
+        return undefined;
+    return new URL(url).href;
+}
+function inline(text, allowLinks = true) {
+    // Bound repeated delimiter scans on long lines without dropping any text.
+    if (text.length > 4000)
+        return esc(text);
+    const tokens = new RegExp(MD_RENDER_TOKENS);
+    let html = "";
+    let offset = 0;
+    for (let match = tokens.exec(text); match; match = tokens.exec(text)) {
+        const [token] = match;
+        html += esc(text.slice(offset, match.index));
+        if (token.startsWith("\\"))
+            html += esc(token.slice(1));
+        else if (token.startsWith("`")) {
+            const close = closingCodeRun(text, tokens.lastIndex, token.length);
+            if (close) {
+                html += `<code>${esc(text.slice(tokens.lastIndex, close.index))}</code>`;
+                tokens.lastIndex = close.index + close[0].length;
+            }
+            else
+                html += esc(token);
+        }
+        else if (token === "**") {
+            const close = closingInlineDelimiter(text, tokens.lastIndex, "bold");
+            if (close > tokens.lastIndex) {
+                html += `<strong>${inline(text.slice(tokens.lastIndex, close), allowLinks)}</strong>`;
+                tokens.lastIndex = close + token.length;
+            }
+            else
+                html += esc(token);
+        }
+        else if (allowLinks) {
+            const close = closingInlineDelimiter(text, tokens.lastIndex, "label");
+            MD_RENDER_DESTINATION.lastIndex = close + 1;
+            const link = close < 0 ? null : MD_RENDER_DESTINATION.exec(text);
+            if (link) {
+                const end = MD_RENDER_DESTINATION.lastIndex;
+                const destination = link[1] ?? link[2];
+                const href = token === "[" && destination ? externalMarkdownUrl(destination) : undefined;
+                html += href
+                    ? `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer" data-markdown-link>${inline(text.slice(tokens.lastIndex, close), false)}</a>`
+                    : esc(text.slice(match.index, end));
+                tokens.lastIndex = end;
+            }
+            else
+                html += esc(token);
+        }
+        else {
+            html += esc(token);
+        }
+        offset = tokens.lastIndex;
+    }
+    return html + esc(text.slice(offset));
 }
 function md(text) {
     const out = [];
@@ -629,7 +722,7 @@ function md(text) {
     let list = null;
     const flush = () => {
         if (para.length)
-            out.push(`<p>${para.map(inline).join("<br>")}</p>`);
+            out.push(`<p>${para.map((line) => inline(line)).join("<br>")}</p>`);
         para = [];
         if (list)
             out.push(`</${list}>`);
@@ -2394,6 +2487,19 @@ function dataValue(element, name) {
 async function onClick(e) {
     if (!(e.target instanceof Element))
         return;
+    const commentLink = e.target.closest("a[data-markdown-link][href]");
+    if (commentLink?.tagName === "A") {
+        e.preventDefault();
+        try {
+            await api("POST", "open-comment-link", { url: commentLink.href });
+        }
+        catch (error) {
+            toast(errorMessage(error), true);
+        }
+        return;
+    }
+    if (e.type === "auxclick")
+        return;
     const target = e.target.closest("[data-action]");
     if (!target || target instanceof HTMLSelectElement)
         return;
@@ -2987,6 +3093,10 @@ function onMouseUp() {
 }
 // ---------- Boot ----------
 document.addEventListener("click", onClick);
+document.addEventListener("auxclick", (e) => {
+    if (e.button === 1)
+        void onClick(e);
+});
 document.addEventListener("change", onChange);
 document.addEventListener("input", onInput);
 document.addEventListener("paste", onPaste);

@@ -150,6 +150,86 @@ const reviewFixture = (overrides: Record<string, unknown> = {}) => ({
 });
 const settingsFixture = (overrides: Record<string, unknown> = {}) => ({ repoName: "repo", autoSaveLearnedRules: false, delivery: "immediate", configured: false, dismissed: false, ...overrides });
 
+test("agent reply renders Markdown issue links as external anchors", async () => {
+    const app = await loadApp();
+    const body = "See [#31](https://github.com/SergeyTeplyakov/Self-Review/issues/31) and "
+        + "[**docs & notes**](http://example.test/a(b)?x=1&y=2 \"References\").";
+    const message = { messageId: "reply", author: "agent", body, createdAt: "2026-01-01T00:00:00Z" };
+    const html = app.run(`messageHtml(${JSON.stringify(message)})`);
+    assert.ok(html.includes('<a href="https://github.com/SergeyTeplyakov/Self-Review/issues/31" target="_blank" rel="noopener noreferrer" data-markdown-link>#31</a>'));
+    assert.ok(html.includes('<a href="http://example.test/a(b)?x=1&amp;y=2" target="_blank" rel="noopener noreferrer" data-markdown-link><strong>docs &amp; notes</strong></a>'));
+});
+
+test("reply Markdown respects matching code delimiters and escaped URL punctuation", async () => {
+    const app = await loadApp();
+    const body = "``literal ` [not a link](https://example.test/)`` and [ref](https://example.test/a\\(b\\))";
+    const html = app.run(`md(${JSON.stringify(body)})`);
+    assert.ok(html.includes("<code>literal ` [not a link](https://example.test/)</code>"));
+    assert.equal(html.match(/<a\b/g)?.length, 1);
+    assert.match(html, /href="https:\/\/example\.test\/a\(b\)"/);
+});
+
+test("very long Markdown lines fall back to escaped text", async () => {
+    const app = await loadApp();
+    const line = "[details](https://example.test/) " + "x".repeat(5000) + " <literal>";
+    assert.equal(app.run(`md(${JSON.stringify(line)})`), `<div class="md"><p>${line.replace("<literal>", "&lt;literal&gt;")}</p></div>`);
+});
+
+test("reply Markdown respects code inside bold and balanced link labels", async () => {
+    const app = await loadApp();
+    const body = "**Use `** [#31](https://example.test/)` literally**\n"
+        + "[`T[]`](https://example.test/types) [array[i]](https://example.test/arrays) "
+        + "[`x]` and \\[y\\]](https://example.test/brackets)";
+    const html = app.run(`md(${JSON.stringify(body)})`);
+    assert.ok(html.includes("<strong>Use <code>** [#31](https://example.test/)</code> literally</strong>"));
+    assert.equal(html.match(/<a\b/g)?.length, 3);
+    assert.ok(html.includes("data-markdown-link><code>T[]</code></a>"));
+    assert.ok(html.includes("data-markdown-link>array[i]</a>"));
+    assert.ok(html.includes("data-markdown-link><code>x]</code> and [y]</a>"));
+});
+
+test("reply Markdown accepts angle destinations and decodes references before validating URLs", async () => {
+    const app = await loadApp();
+    const references = new Map([["&amp;", "&"], ["&#x32;", "2"], ["&colon;", ":"]]);
+    Object.assign(app.document, { createElement: (tag: string) => {
+        assert.equal(tag, "textarea");
+        return {
+            value: "",
+            set innerHTML(reference: string) {
+                assert.ok(references.has(reference), "only a single known reference reaches the decoder");
+                this.value = references.get(reference) ?? "";
+            },
+        };
+    } });
+    const body = "[issue](<https://example.test/a b>) [search](https://example.test/?q=one&amp;page=&#x32;) "
+        + "[literal](https://example.test/?q=one\\&amp;page=2) [local](file&colon;///tmp/notes)";
+    const html = app.run(`md(${JSON.stringify(body)})`);
+    assert.equal(html.match(/<a\b/g)?.length, 3);
+    assert.match(html, /href="https:\/\/example\.test\/a%20b"/);
+    assert.match(html, /href="https:\/\/example\.test\/\?q=one&amp;page=2"/);
+    assert.match(html, /href="https:\/\/example\.test\/\?q=one&amp;amp;page=2"/);
+    assert.match(html, /\[local\]\(file&amp;colon;\/\/\/tmp\/notes\)/);
+});
+
+test("agent reply keeps non-web destinations, raw HTML and code inert", async () => {
+    const app = await loadApp();
+    const body = [
+        "[local](//example.test/path) [file](file:///temp/notes) [bad](https://)",
+        '<b>raw markup</b> [<i>label</i>](https://example.test/)',
+        '![image](https://example.test/pixel.png) `[code](https://example.test/)`',
+        "```md\n[fenced](https://example.test/)\n```",
+    ].join("\n");
+    const message = { messageId: "reply", author: "agent", body, createdAt: "2026-01-01T00:00:00Z" };
+    const html = app.run(`messageHtml(${JSON.stringify(message)})`);
+    assert.equal(html.match(/<a\b/g)?.length, 1, "only the valid link becomes an anchor");
+    assert.doesNotMatch(html, /<(?:b|i|img)\b/);
+    assert.ok(html.includes("[local](//example.test/path) [file](file:///temp/notes) [bad](https://)"));
+    assert.ok(html.includes("&lt;b&gt;raw markup&lt;/b&gt;"));
+    assert.ok(html.includes("&lt;i&gt;label&lt;/i&gt;</a>"));
+    assert.ok(html.includes("<code>[code](https://example.test/)</code>"));
+    assert.ok(html.includes("<pre><code>[fenced](https://example.test/)</code></pre>"));
+});
+
 test("tree root and root folder use the repository identity, retaining the checkout tooltip", async () => {
     const app = await loadApp();
     app.state.review = reviewFixture({ repoRoot: "C:\\worktrees\\generated-workspace-id" });
@@ -167,6 +247,32 @@ test("tree root and root folder use the repository identity, retaining the check
 });
 
 const jsonResponse = (data: unknown, status = 200) => ({ ok: status < 400, status, statusText: status < 400 ? "OK" : "Error", json: async () => data });
+
+test("Markdown links in replies and verification prevent canvas navigation and leave Open PR alone", async () => {
+    const requests: Array<{ url: string; method?: string; body?: string }> = [];
+    const app = await loadApp({ fetch: async (url, opts) => {
+        requests.push({ url, method: opts?.method, body: opts?.body });
+        return jsonResponse({ ok: true });
+    } });
+    const href = "https://example.test/a?x=1&y=2";
+    const message = {
+        messageId: "reply", author: "agent", body: "Result", createdAt: "2026-01-01T00:00:00Z",
+        verification: `[Verification run](${href})`,
+    };
+    assert.match(app.run(`messageHtml(${JSON.stringify(message)})`),
+        /<div class="verification">Verification: <a [^>]+ data-markdown-link>Verification run<\/a>/);
+    const link = Object.assign(new MockElement("A"), { href });
+    const target = new MockElement("STRONG");
+    target.closest = (selector) => selector === "a[data-markdown-link][href]" ? link : null;
+    let prevented = 0;
+    const preventDefault = () => { prevented++; };
+    await app.run("onClick")({ target, preventDefault });
+    const openPR = new MockElement("A");
+    openPR.closest = () => null;
+    await app.run("onClick")({ target: openPR, preventDefault });
+    assert.equal(prevented, 1);
+    assert.deepEqual(requests, [{ url: "/api/open-comment-link", method: "POST", body: JSON.stringify({ url: href }) }]);
+});
 
 function deferred<T>() {
     let resolve!: (value: T) => void;
