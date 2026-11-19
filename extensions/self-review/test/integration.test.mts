@@ -733,6 +733,27 @@ test("auto-save verifies a personal guideline in the isolated home, not the repo
     await assert.rejects(readFile(path.join(repo, ".github", "copilot-instructions.md")), { code: "ENOENT" });
 });
 
+test("a failed auto-save settings lookup preserves the reply and its proposal", async () => {
+    const warnings: string[] = [];
+    const auto = new ReviewService({
+        store,
+        autoSaveLearnedRules: async () => { throw new Error("Repository identity unavailable"); },
+        log: (message, level) => { if (level === "warning") warnings.push(message); },
+    });
+    const rule = "Use clear option names.";
+    const { thread, message } = await auto.createThread(reviewId, { kind: "overview", body: `/learn ${rule}` });
+    const reply = await auto.addMessage(reviewId, thread.threadId, {
+        author: "agent", inReplyTo: message.messageId, body: rule, lessons: [{ rule }],
+    });
+    const persisted = await getReview();
+    assert.ok(persisted.threads.find((item) => item.threadId === thread.threadId)?.messages.some((item) => item.messageId === reply.message.messageId));
+    const lesson = required(persisted.lessons.find((item) => item.lessonId === reply.message.lessonIds?.[0]));
+    assert.equal(lesson.status, "proposed");
+    assert.equal(lesson.savedTo, null);
+    assert.equal((await auto.findMessage(reviewId, message.messageId)).message.delivery?.state, "replied");
+    assert.match(warnings.join("\n"), /Repository identity unavailable/);
+});
+
 test("auto-save writes and verifies both explicit and unsolicited guidelines and leaves failed saves proposed", async () => {
     const auto = new ReviewService({ store, autoSaveLearnedRules: async () => true });
     const file = path.join(repo, ".github", "copilot-instructions.md");

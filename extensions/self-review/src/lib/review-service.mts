@@ -988,7 +988,15 @@ export class ReviewService extends EventEmitter {
                     if (!message.lessonIds.includes(lesson.lessonId)) message.lessonIds.push(lesson.lessonId);
                     touchedLessons.set(lesson.lessonId, lesson);
                 }
-                if (touchedLessons.size && await this.autoSaveLearnedRules(review.repoRoot)) {
+                let autoSave = false;
+                if ([...touchedLessons.values()].some((lesson) => lesson.status === "proposed")) {
+                    try {
+                        autoSave = await this.autoSaveLearnedRules(review.repoRoot);
+                    } catch (error) {
+                        this.log(`self-review: could not read the auto-save setting; keeping guidelines proposed: ${errorMessage(error)}`, "warning");
+                    }
+                }
+                if (autoSave) {
                     for (const lesson of touchedLessons.values()) {
                         if (lesson.status !== "proposed") continue;
                         try {
