@@ -12,7 +12,7 @@
 // Uses an installed Edge or Chrome when available (set MR_BROWSER_CHANNEL to pick one).
 // Without either, run `npx playwright-core install chromium` first.
 
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,10 +22,12 @@ import type { ReviewService as ReviewServiceContract } from "../../extensions/se
 import {
     AgentReview, Delivery, ReviewService, ReviewSkills, SettingsService, Store, runGit, startReviewServer,
 } from "../../extensions/self-review/test/modules.mjs";
+import { parseExtensionVersion } from "../../extensions/self-review/src/lib/extension-version.mjs";
 
 const REPOSITORY_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 const HERE = path.join(REPOSITORY_ROOT, "docs", "screenshots");
 const WEB_ROOT = path.join(HERE, "..", "..", "extensions", "self-review", "dist", "web");
+const EXTENSION_VERSION_PATH = path.join(REPOSITORY_ROOT, "extensions", "self-review", "dist", "version.json");
 const OUT = path.join(HERE, "..", "images");
 const KEEP = process.argv.includes("--keep");
 const CHECK_REFRESH = process.argv.includes("--check-refresh-layout");
@@ -582,16 +584,27 @@ async function checkRefreshLayout(browser: Browser, url: string) {
         await page.clock.install();
         await page.goto(url);
         const status = page.locator("#review-status");
+        const statusSlot = page.locator("#review-status-slot");
+        const controls = page.locator("#review-status-controls");
         const refresh = page.locator('#top [data-action="refresh"]');
         const file = page.locator('#side [data-view="file"]').first();
         await file.waitFor();
         await status.waitFor({ state: "hidden" });
-        const geometry = () => Promise.all([file, page.locator("#main"), refresh].map((element) => element.boundingBox()));
+        const geometry = () => Promise.all([file, page.locator("#main"), refresh, controls, statusSlot].map((element) => element.boundingBox()));
+        const assertStatusAlignment = async () => {
+            const [controlBounds, statusBounds, slotBounds] = await Promise.all([controls, status, statusSlot].map((element) => element.boundingBox()));
+            assert.ok(controlBounds && statusBounds && slotBounds, "footer controls and status must have layout boxes");
+            assert.ok(statusBounds.x >= controlBounds.x + controlBounds.width, "refresh status must remain to the right of footer controls");
+            assert.ok(Math.abs(statusBounds.x + statusBounds.width - (slotBounds.x + slotBounds.width - 16)) <= 1, "refresh status must align with the footer's right edge");
+            assert.equal(await status.evaluate((element) => getComputedStyle(element).justifyContent), "flex-end");
+            assert.equal(await status.locator(".review-status-message").evaluate((element) => getComputedStyle(element).textAlign), "right");
+        };
         const original = await geometry();
         let fail = true;
         await page.route("**/api/refresh", async (route) => {
             await status.filter({ hasText: "Showing the last loaded data" }).waitFor();
             assert.deepEqual(await geometry(), original, "refresh progress must not shift the review");
+            await assertStatusAlignment();
             if (fail) {
                 await route.fulfill({ status: 500, json: { error: { message: "Long capture error: bad revision 'origin/main'. ".repeat(20) } } });
             } else {
@@ -603,6 +616,7 @@ async function checkRefreshLayout(browser: Browser, url: string) {
         await retry.waitFor();
         assert.match((await status.textContent()) ?? "", /Long capture error/);
         assert.deepEqual(await geometry(), original, "a long error must not shift the review");
+        await assertStatusAlignment();
         const errorMessage = status.locator(".review-status-message");
         const offset = await errorMessage.evaluate((element) => {
             element.scrollTop = element.scrollHeight;
@@ -715,13 +729,13 @@ async function capture(
     await shot("lessons");
 
     // The pending scope is its own review of what is not committed yet. Switch back so the next theme starts on the full review.
-    await page.locator('#top [data-action="scope"][data-scope="pending"]').click();
-    await page.locator('#top [data-scope="pending"][aria-pressed="true"]:not([disabled])').waitFor();
+    await page.locator('#side [data-action="scope"][data-scope="pending"]').click();
+    await page.locator('#side [data-scope="pending"][aria-pressed="true"]:not([disabled])').waitFor();
     await nav(page, "file", "src/http/retry.ts");
     await fitHeight(page, 600);
     await shot("pending");
-    await page.locator('#top [data-action="scope"][data-scope="all"]').click();
-    await page.locator('#top [data-scope="all"][aria-pressed="true"]:not([disabled])').waitFor();
+    await page.locator('#side [data-action="scope"][data-scope="all"]').click();
+    await page.locator('#side [data-scope="all"][aria-pressed="true"]:not([disabled])').waitFor();
 
     const fitDialog = async () => {
         await page.setViewportSize({ width: WIDTH, height: 1700 });
@@ -729,6 +743,11 @@ async function capture(
         await page.setViewportSize({ width: WIDTH, height: height + 64 });
         await page.waitForTimeout(250);
     };
+    const openSettingsMenu = async () => {
+        const menu = page.locator("#top details.review-settings-menu");
+        if (await menu.getAttribute("open") === null) await menu.locator("summary").click();
+    };
+    await openSettingsMenu();
     await page.locator('#top [data-action="agent-review-configure"]').click();
     await page.locator('#dialog select[name="review-focus"]').selectOption("both");
     await page.locator('#dialog input[name="review-skill"]').first().waitFor({ state: "attached" });
@@ -749,6 +768,7 @@ async function capture(
 
     // The per-repository settings: switch delivery to Batch before saving.
     await page.setViewportSize({ width: WIDTH, height: 1200 });
+    await openSettingsMenu();
     await page.locator('#top [data-action="configure"]').click();
     await page.locator("#dialog .modal").waitFor();
     const modal = await page.locator("#dialog .modal").boundingBox();
@@ -802,6 +822,7 @@ let browser: Browser | undefined;
 try {
     const seeded = await seed(tmp);
     const { service, delivery } = seeded;
+    const extensionVersion = parseExtensionVersion(JSON.parse(await readFile(EXTENSION_VERSION_PATH, "utf8")) as unknown);
     let reviewId = seeded.reviewId;
     const settings = new SettingsService({ store: seeded.store });
     const reviewSkills = new ReviewSkills({ store: seeded.store });
@@ -818,6 +839,7 @@ try {
         },
         service,
         delivery,
+        extensionVersion,
         settings,
         agentReview,
         reviewSkills,

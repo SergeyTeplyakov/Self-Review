@@ -406,7 +406,8 @@ test("comment links use the browser launcher only for authenticated web URLs in 
 });
 
 test("HTTP server enforces token/host/origin and delivers posted comments", async () => {
-    const server = await startReviewServer({ instanceId: "inst-1", getReviewId: () => reviewId, service, delivery, webRoot: WEB_ROOT });
+    const extensionVersion = { version: "0.3.0", buildId: "a1b2c3d4e5f6" };
+    const server = await startReviewServer({ instanceId: "inst-1", getReviewId: () => reviewId, service, delivery, webRoot: WEB_ROOT, extensionVersion });
     try {
         const url = new URL(server.url);
         const port = Number(url.port);
@@ -432,6 +433,7 @@ test("HTTP server enforces token/host/origin and delivers posted comments", asyn
         const stateJson = required(state.json);
         const stateReview = required(stateJson.review);
         assert.equal(stateReview.reviewId, reviewId);
+        assert.deepEqual(stateJson.extensionVersion, extensionVersion, "the running extension build is not inferred from the reviewed checkout");
 
         const snap = await request(port, { pathName: `/api/snapshot/${stateReview.currentRevisionId}?t=${token}` });
         assert.equal(snap.status, 200);

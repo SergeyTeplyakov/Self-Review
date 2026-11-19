@@ -230,9 +230,14 @@ function isRefreshStatus(value) {
     return isRecord(value) && ["idle", "refreshing", "error"].includes(String(value.status))
         && (value.status !== "error" || typeof value.error === "string");
 }
+function isExtensionVersion(value) {
+    return isRecord(value) && typeof value.version === "string" && Boolean(value.version.trim())
+        && typeof value.buildId === "string" && /^[a-f0-9]{12}$/.test(value.buildId);
+}
 function isStateResponse(value) {
     if (!isRecord(value) || !isReview(value.review)
         || (value.refresh !== undefined && !isRefreshStatus(value.refresh))
+        || (value.extensionVersion !== undefined && !isExtensionVersion(value.extensionVersion))
         || (value.session !== undefined && (!isRecord(value.session)
             || (value.session.busy !== null && typeof value.session.busy !== "boolean")))
         || (value.pullRequest !== undefined && value.pullRequest !== null
@@ -254,6 +259,7 @@ function parseState(value) {
         agentReviewAvailable: value.agentReviewAvailable === true,
         reviewSkillsAvailable: value.reviewSkillsAvailable === true,
         agentReviewSuggestedModels: value.agentReviewSuggestedModels ?? [],
+        extensionVersion: value.extensionVersion,
         settingsPayload: value,
     };
 }
@@ -301,6 +307,7 @@ const state = {
     fileFold: new Map(),
     content: new Map(),
     settings: null,
+    extensionVersion: undefined,
     dialog: null,
     switching: false,
     submitting: false,
@@ -835,9 +842,11 @@ let loadError = "";
 let refreshError = "";
 let serverRefresh;
 let renderedStatusHtml = "";
+let renderedFooterControlsHtml = "";
 function renderLoadStatus() {
     const status = $("#review-status");
-    if (!status)
+    const footerControls = $("#review-status-controls");
+    if (!status || !footerControls)
         return;
     const refreshFailure = refreshError || (serverRefresh?.status === "error" ? serverRefresh.error : "");
     const pending = Boolean(loading) || reloadPending || refreshing || (!loadError && !refreshFailure && serverRefresh?.status === "refreshing");
@@ -853,6 +862,24 @@ function renderLoadStatus() {
     if (renderedStatusHtml !== html) {
         status.innerHTML = html;
         renderedStatusHtml = html;
+    }
+    const controls = [];
+    if (state.extensionVersion) {
+        const { version, buildId } = state.extensionVersion;
+        controls.push(`<span class="pill mono review-extension-version" title="Running Self-Review extension build ${esc(buildId)}" aria-label="Self-Review extension version ${esc(version)}, build ${esc(buildId)}">v${esc(version)} · build ${esc(buildId)}</span>`);
+    }
+    if (state.settings) {
+        const repoMode = deliveryRepoMode();
+        const chosen = repoMode === "ask" ? deliveryMode() : null;
+        controls.push(chosen
+            ? `<span class="pill" title="${esc(DELIVERY[chosen].hint)} Chosen for this review.">Delivery: ${esc(DELIVERY[chosen].pill)}</span><button class="link" data-action="delivery-reask" title="Choose again how this review sends comments">Change</button>`
+            : `<span class="pill" title="${esc(DELIVERY[repoMode].hint)}">Delivery: ${esc(DELIVERY[repoMode].pill)}</span>`);
+        controls.push(`<span class="pill">${autoSaveLabel()}</span>`);
+    }
+    const controlsHtml = controls.join("");
+    if (renderedFooterControlsHtml !== controlsHtml) {
+        footerControls.innerHTML = controlsHtml;
+        renderedFooterControlsHtml = controlsHtml;
     }
 }
 async function loadState() {
@@ -881,6 +908,7 @@ async function loadState() {
             else if (state.review && state.review.currentRevisionId !== data.review.currentRevisionId)
                 pinComposers();
             state.review = data.review;
+            state.extensionVersion = data.extensionVersion;
             if (reviewChanged)
                 restorePinnedComposers(data.review.reviewId);
             state.snapshot = snapshot;
@@ -1251,10 +1279,27 @@ function scopeToggleHtml(scope) {
         + button("pending", "Pending changes", "Only uncommitted work: staged, unstaged and untracked files compared with HEAD")
         + `</span>`;
 }
+function reviewSettingsMenuHtml() {
+    const settings = [];
+    if (state.settings)
+        settings.push(`<button data-action="configure">Manual review settings</button>`);
+    if (state.agentReviewAvailable)
+        settings.push(`<button data-action="agent-review-configure">Agent review settings</button>`);
+    return settings.length
+        ? `<details class="review-settings-menu"><summary title="Configure review settings">Settings</summary><div class="review-settings-options" role="group" aria-label="Review settings">${settings.join("")}</div></details>`
+        : "";
+}
 function renderTop() {
     const r = state.review;
     if (!r)
         return;
+    const top = requiredElement("#top");
+    const previousSettingsMenu = top.querySelector(".review-settings-menu");
+    const active = document.activeElement;
+    const activeInSettingsMenu = active instanceof HTMLElement && previousSettingsMenu?.contains(active);
+    const settingsMenuWasOpen = previousSettingsMenu?.open ?? false;
+    const focusedSettingsSummary = activeInSettingsMenu && active === previousSettingsMenu?.querySelector("summary");
+    const focusedSettingsAction = activeInSettingsMenu && active instanceof HTMLElement ? active.dataset.action : undefined;
     const rev = r.revisions.find((x) => x.revisionId === r.currentRevisionId);
     const git = r.git ?? {};
     const scope = scopeOf(r);
@@ -1265,11 +1310,10 @@ function renderTop() {
         `<div class="change-context-heading"><span class="title">${esc(r.title)}</span>${branch}`,
         scope === "all" ? `<span class="muted">vs</span><span class="pill mono" title="merge-base ${esc(git.baseCommit ?? "")}">${esc(r.base)}</span>`
             : `<span class="muted">uncommitted changes only</span>`,
+        rev ? `<span class="pill" title="Revision captured ${esc(rev.createdAt)}">${esc(rev.revisionId)} · ${rev.files} files · <span class="add">+${rev.additions}</span> <span class="del">−${rev.deletions}</span></span>` : "",
         state.pullRequest ? `<a class="pill pr-link" href="${esc(state.pullRequest.url)}" target="_blank" rel="noopener noreferrer" title="Open pull request #${esc(state.pullRequest.number)} in browser">Open PR #${esc(state.pullRequest.number)}</a>` : "",
-        `</div><div class="change-context-details">${scopeToggleHtml(scope)}`,
+        `</div><div class="change-context-details">`,
     ];
-    if (rev)
-        parts.push(`<span class="pill" title="Revision captured ${esc(rev.createdAt)}">${esc(rev.revisionId)} · ${rev.files} files · <span class="add">+${rev.additions}</span> <span class="del">−${rev.deletions}</span></span>`);
     if (scope === "all") {
         if (git.upstream) {
             const { ahead, behind, name } = git.upstream;
@@ -1289,40 +1333,26 @@ function renderTop() {
         parts.push(`<span class="pill busy"><span class="dot"></span>Copilot working${awaiting ? ` · ${awaiting} pending` : ""}</span>`);
     else if (state.busy === false)
         parts.push(`<span class="pill"><span class="dot muted"></span>Copilot idle${awaiting ? ` · ${awaiting} pending` : ""}</span>`);
-    parts.push(`<span class="spacer"></span><button data-action="refresh" title="Re-read the working tree">Refresh</button></div></section>`);
+    parts.push(`<span class="spacer"></span>${agentReviewButtonHtml()}${reviewSettingsMenuHtml()}<button data-action="refresh" title="Re-read the working tree">Refresh</button></div></section>`);
     const drafts = draftMessages().length;
-    const workflows = [];
-    if (state.agentReviewAvailable) {
-        const running = r.agentReviews?.some((run) => ["sending", "queued", "running"].includes(run.state));
-        const defaults = state.agentReviewSettings;
-        const hint = defaults?.skipDialog
-            ? `Run with saved defaults: ${defaults.models.join(", ")} (${defaults.focus}). Review, discussion and voting calls may consume credits.`
-            : "Configure and run a read-only review, discussion and vote. These calls may consume credits.";
-        workflows.push(`<section class="review-lane agent-review-lane" aria-labelledby="agentic-review-title">`
-            + `<div class="review-lane-heading"><h2 id="agentic-review-title">Agentic review</h2><p class="muted">Read-only review, discussion and voting by selected models may consume credits. Only unanimous findings are published.</p></div>`
-            + `<div class="review-lane-actions">`
-            + `<button class="primary agent-review-launch" data-action="agent-review" title="${esc(hint)}"${running || state.startingReview ? " disabled" : ""}>${running ? "Agentic review running" : state.startingReview ? "Queuing review..." : "Run agentic review"}</button>`
-            + `<button data-action="agent-review-configure" title="Configure reviewers, focus, guidance, review skills, and user-wide defaults">Review settings</button>`
-            + `</div></section>`);
-    }
-    workflows.push(`<section class="review-lane feedback-lane" aria-labelledby="manual-review-title">`
-        + `<div class="review-lane-heading"><h2 id="manual-review-title">Manual Review</h2><p class="muted">Your comments guide the coding agent; these settings control how they are sent and learned from.</p></div>`
-        + `<div class="review-lane-actions">`);
-    workflows.push(`<span class="feedback-draft-count">${drafts} draft ${drafts === 1 ? "comment" : "comments"}</span>`);
+    const controls = [];
     if (drafts)
-        workflows.push(`<button class="primary" data-action="submit-review" title="Send every draft comment to Copilot together, as one review"${state.submitting ? " disabled>Submitting…" : `>Submit review (${drafts})`}</button>`);
-    if (state.settings) {
-        const repoMode = deliveryRepoMode();
-        const chosen = repoMode === "ask" ? deliveryMode() : null;
-        workflows.push(chosen
-            ? `<span class="pill" title="${esc(DELIVERY[chosen].hint)} Chosen for this review.">Delivery: ${esc(DELIVERY[chosen].pill)}</span><button class="link" data-action="delivery-reask" title="Choose again how this review sends comments">Change</button>`
-            : `<span class="pill" title="${esc(DELIVERY[repoMode].hint)}">Delivery: ${esc(DELIVERY[repoMode].pill)}</span>`);
-        workflows.push(`<span class="pill">${autoSaveLabel()}</span><button data-action="configure" title="Change how manual review comments are delivered and used for learning in this repository">Manual review settings</button>`);
+        controls.push(`<span class="feedback-draft-count">${drafts} draft ${drafts === 1 ? "comment" : "comments"}</span>`);
+    if (drafts)
+        controls.push(`<button class="primary" data-action="submit-review" title="Send every draft comment to Copilot together, as one review"${state.submitting ? " disabled>Submitting…" : `>Submit review (${drafts})`}</button>`);
+    if (controls.length)
+        parts.push(`<div class="review-controls">${controls.join("")}</div>`);
+    top.innerHTML = parts.join("");
+    const settingsMenu = top.querySelector(".review-settings-menu");
+    if (!settingsMenu)
+        return;
+    settingsMenu.open = settingsMenuWasOpen;
+    if (activeInSettingsMenu) {
+        if (focusedSettingsSummary || !settingsMenuWasOpen)
+            settingsMenu.querySelector("summary")?.focus();
+        else if (focusedSettingsAction)
+            settingsMenu.querySelector(`[data-action="${focusedSettingsAction}"]`)?.focus();
     }
-    workflows.push(`</div></section>`);
-    if (workflows.length)
-        parts.push(`<div class="review-workflows">${workflows.join("")}</div>`);
-    requiredElement("#top").innerHTML = parts.join("");
 }
 // ---------- Repository settings: first-use banner, per-review delivery question, and Configure dialog ----------
 function learningBannerHtml() {
@@ -1375,7 +1405,9 @@ function dialogHtml() {
         + `</div></div>`;
 }
 function focusIn(selector) {
-    $(selector)?.focus?.();
+    const target = $(selector);
+    const closedMenu = target?.closest("details:not([open])");
+    (closedMenu?.querySelector?.("summary") ?? target)?.focus?.();
 }
 // The dialog is rendered on its own so re-renders of the page never disturb its focus or radio state.
 function renderDialog() {
@@ -1474,7 +1506,7 @@ function agentReviewDialogHtml(d) {
     const options = [["review", "Review issues"], ["simplify", "Simplification"], ["both", "Review and simplification"]];
     return `<div class="modal-backdrop" data-action="dialog-backdrop"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby="dialog-desc">`
         + (d.settingsOnly
-            ? `<h2 id="dialog-title">Agent review settings</h2><p id="dialog-desc">Configure reviewers, focus, guidance, and review skills. Saving never starts a review; use Run agentic review in the toolbar.</p>`
+            ? `<h2 id="dialog-title">Agent review settings</h2><p id="dialog-desc">Configure reviewers, focus, guidance, and review skills. Saving never starts a review; use Run agentic review in the Agent reviews view.</p>`
             : `<h2 id="dialog-title">Agentic review</h2><p id="dialog-desc">Review ${esc(d.revisionId)} (${esc(d.scope)}). Selected models review independently, discuss, and vote; these additional calls may consume credits. Only unanimous findings are published. An unavailable reviewer prevents publication. No files are changed until you approve a suggestion or explicitly request a fix.</p>`)
         + reviewTabsHtml(d)
         + `<div role="tabpanel" id="review-panel-general" aria-labelledby="review-tab-general"${d.tab === "general" ? "" : " hidden"}>`
@@ -1612,6 +1644,7 @@ async function runAgentReview() {
     finally {
         state.startingReview = false;
         renderTop();
+        render();
         await loadState();
     }
 }
@@ -1625,11 +1658,22 @@ function agentCommentsView() {
     const threads = agentComments();
     const active = threads.filter((thread) => thread.status === "active").length;
     const older = threads.filter((thread) => thread.agentReview.revisionId !== review.currentRevisionId).length;
-    return `<h2>Agent reviews</h2>`
+    return `<div class="agent-reviews-heading"><h2>Agent reviews</h2>${agentReviewButtonHtml()}</div>`
         + agentReviewsHtml()
         + `<h2>Agent comments (<span aria-live="polite">${threads.length}</span>)</h2>`
         + `<p class="muted">${active} active, ${threads.length - active} closed or resolved; ${older} from older revisions. Counts include all agent findings in this scope, not replies or manual threads.</p>`
         + (threads.length ? threads.map((thread) => threadHtml(thread, { showLocation: true })).join("") : `<div class="empty">No agent comments yet. A review may still be running or may have reported no findings; check its status above.</div>`);
+}
+function agentReviewButtonHtml() {
+    const review = state.review;
+    if (!review || !state.agentReviewAvailable)
+        return "";
+    const running = review.agentReviews?.some((run) => ["sending", "queued", "running"].includes(run.state));
+    const defaults = state.agentReviewSettings;
+    const hint = defaults?.skipDialog
+        ? `Run with saved defaults: ${defaults.models.join(", ")} (${defaults.focus}). Review, discussion and voting calls may consume credits.`
+        : "Configure and run a read-only review, discussion and vote. These calls may consume credits.";
+    return `<button class="primary agent-review-launch" data-action="agent-review" title="${esc(hint)}"${running || state.startingReview ? " disabled" : ""}>${running ? "Agentic review running" : state.startingReview ? "Queuing review..." : "Run agentic review"}</button>`;
 }
 function agentReviewsHtml() {
     const review = state.review;
@@ -1707,6 +1751,7 @@ async function updateSettings(patch) {
     else {
         renderTop();
         renderBanner();
+        renderLoadStatus();
     }
 }
 async function saveConfigure() {
@@ -1758,6 +1803,7 @@ async function switchScope(scope) {
         return;
     state.switching = true;
     renderTop();
+    renderSide();
     try {
         await api("POST", "scope", { scope });
         await loadState();
@@ -1844,6 +1890,7 @@ function renderSide() {
         ...(state.agentReviewAvailable || agentComments().length ? [`<div class="nav-item${v.type === "agent-comments" ? " active" : ""}" data-action="nav" data-view="agent-comments"><span class="count" title="Agent findings in this scope, across all revisions; excludes replies and manual threads">${agentComments().length}</span><span class="name">Agent reviews</span></div>`] : []),
         `<div class="nav-item${v.type === "lessons" ? " active" : ""}" data-action="nav" data-view="lessons"><span class="name">Lessons learned</span><span class="muted">${r.lessons.length}</span></div>`,
         `<div class="section">Files (${files.length})</div>`,
+        `<div class="tree-scope">${scopeToggleHtml(scopeOf(r))}</div>`,
     ];
     if (files.length) {
         html.push(`<div class="tree-controls"><button class="link" data-action="fold-tree" data-fold="1">Collapse all</button><button class="link" data-action="fold-tree" data-fold="0">Expand all</button></div>`, `<div role="tree">`);

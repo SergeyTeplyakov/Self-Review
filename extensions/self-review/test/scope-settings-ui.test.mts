@@ -21,6 +21,7 @@ interface MockNode {
     tagName?: string;
     dataset?: Record<string, string>;
     closest?: (selector: string) => MockNode | null;
+    querySelector?: (selector: string) => unknown;
     contains?: (node: MockNode | null) => boolean;
     classList?: { toggle: (name: string, force?: boolean) => boolean };
 }
@@ -429,6 +430,40 @@ test("refresh progress SSE updates the status without requesting a duplicate ful
     assert.equal(requests, 0);
 });
 
+test("bottom settings controls update without replacing the stable refresh status", async () => {
+    const app = await loadApp();
+    app.state.review = reviewFixture();
+    app.state.extensionVersion = { version: "0.3.0", buildId: "a1b2c3d4e5f6" };
+    app.state.settings = settingsFixture();
+    app.run("refreshing = true; renderLoadStatus()");
+    const status = app.node("#review-status");
+    const loadingHtml = status.innerHTML;
+    assert.match(loadingHtml, /Refreshing review and Overview/);
+    assert.match(app.node("#review-status-controls").innerHTML, /v0\.3\.0 · build a1b2c3d4e5f6.*Delivery: Immediate.*Auto-save learned rules: Off/);
+
+    app.state.settings = settingsFixture({ autoSaveLearnedRules: true, delivery: "batch" });
+    app.run("renderLoadStatus()");
+    assert.equal(status.innerHTML, loadingHtml, "updating footer controls preserves the in-progress status DOM");
+    assert.match(app.node("#review-status-controls").innerHTML, /v0\.3\.0 · build a1b2c3d4e5f6.*Delivery: Batch.*Auto-save learned rules: On/);
+
+    app.run('refreshing = false; refreshError = "capture failed"; renderLoadStatus()');
+    assert.match(status.innerHTML, /capture failed.*Retry/);
+});
+
+test("the bottom bar shows the version reported by the serving extension after loading review state", async () => {
+    const app = await loadApp({ fetch: async (url) => {
+        if (url === "/api/state") return jsonResponse({
+            review: reviewFixture({ repoRoot: "C:\\reviews\\unrelated-checkout" }),
+            extensionVersion: { version: "0.3.0", buildId: "c0ffee123456" },
+        });
+        if (url === "/api/snapshot/r1") return jsonResponse({ revisionId: "r1", files: [] });
+        throw new Error(`Unexpected request ${url}`);
+    } });
+    app.run("renderRuler = () => {}");
+    await app.run("loadState()");
+    assert.match(app.node("#review-status-controls").innerHTML, /v0\.3\.0 · build c0ffee123456/);
+});
+
 test("missing and older descriptions are not presented as pending generation or current content", async () => {
     const app = await loadApp();
     app.state.review = reviewFixture();
@@ -605,7 +640,7 @@ test("Agent review settings has a heading, General and Review skills tabs, no Ru
     app.run("renderTop()");
     const top = app.node("#top").innerHTML;
     assert.doesNotMatch(top, /review-skills|Review skills/);
-    assert.match(top, /data-action="agent-review-configure"[^>]*>Review settings/);
+    assert.match(top, /<details class="review-settings-menu"><summary[^>]*>Settings<\/summary>.*data-action="agent-review-configure"[^>]*>Agent review settings/s);
     await click("agent-review-configure");
     await settle();
     let html = app.node("#dialog").innerHTML;
@@ -629,6 +664,34 @@ test("Agent review settings has a heading, General and Review skills tabs, no Ru
     assert.deepEqual(app.read("state.dialog.skillNames"), NAMES);
     assert.equal(dialog(app).models, "my-reviewer", "switching tabs keeps unsaved General choices");
     assert.equal(posts.length, 0, "opening settings never saves or starts work");
+});
+
+test("header rerenders preserve the open Settings menu and focused menu control", async () => {
+    const app = await loadApp();
+    app.state.review = reviewFixture();
+    app.state.settings = settingsFixture();
+    app.state.agentReviewAvailable = true;
+
+    const focusEvents: string[] = [];
+    const summary = Object.assign(new MockElement("SUMMARY"), { focus: () => focusEvents.push("summary") });
+    const configure = Object.assign(new MockElement("BUTTON"), {
+        dataset: { action: "configure" },
+        focus: () => focusEvents.push("configure"),
+    });
+    const menu = Object.assign(new MockElement("DETAILS"), { open: true });
+    menu.contains = (node) => node === summary || node === configure;
+    menu.querySelector = (selector) => selector === "summary" ? summary : selector === '[data-action="configure"]' ? configure : null;
+    app.node("#top").querySelector = (selector) => selector === ".review-settings-menu" ? menu : null;
+
+    app.document.activeElement = configure;
+    app.run("renderTop()");
+    assert.equal(menu.open, true, "an unrelated header update does not close Settings");
+    assert.equal(focusEvents.at(-1), "configure", "the focused settings action remains usable");
+
+    app.document.activeElement = summary;
+    app.run("renderTop()");
+    assert.equal(menu.open, true);
+    assert.equal(focusEvents.at(-1), "summary", "focus on the Settings summary survives an update");
 });
 
 test("bundled skill loading failures keep unsaved choices and can be retried", async () => {
@@ -705,7 +768,19 @@ test("Run review sends this review's skill opt-outs without saving skill default
 
 test("the page provides every container the scope and learning controls render into", async () => {
     const html = await readFile(new URL("../dist/web/index.html", import.meta.url), "utf8");
-    for (const id of ["top", "banner", "layout", "side", "main", "ruler", "dialog", "toast"]) assert.match(html, new RegExp(`id="${id}"`), id);
+    for (const id of ["top", "banner", "layout", "side", "main", "ruler", "review-status-controls", "dialog", "toast"]) assert.match(html, new RegExp(`id="${id}"`), id);
+    assert.ok(html.indexOf('id="review-status-controls"') < html.indexOf('id="review-status"'), "left footer controls must precede right-aligned refresh status");
+});
+
+test("settings and footer controls stay usable above file headers and within the footer", async () => {
+    const css = await readFile(new URL("../dist/web/styles.css", import.meta.url), "utf8");
+    const settingsMenu = required(css.match(/\.review-settings-options\s*\{([^}]*)\}/s))[1];
+    const fileHeader = required(css.match(/\.file-head\s*\{([^}]*)\}/s))[1];
+    const footerControls = required(css.match(/\.review-status-controls\s*\{([^}]*)\}/s))[1];
+    const zIndex = (rule: string) => Number(required(rule.match(/z-index:\s*(\d+)/))[1]);
+    assert.ok(zIndex(settingsMenu) > zIndex(fileHeader), "the settings menu must paint above sticky file headers");
+    assert.match(footerControls, /max-height:\s*100%/);
+    assert.match(footerControls, /overflow:\s*auto/);
 });
 
 test("agent review is opt-in and its dialog collects models, focus, and guidance with optional Addy skills", async () => {
@@ -714,8 +789,10 @@ test("agent review is opt-in and its dialog collects models, focus, and guidance
     app.run("renderTop()");
     assert.doesNotMatch(app.node("#top").innerHTML, /data-action="agent-review"/);
     app.state.agentReviewAvailable = true;
-    app.run("renderTop()");
-    assert.match(app.node("#top").innerHTML, /data-action="agent-review"/);
+    app.state.view = { type: "agent-comments" };
+    app.run("renderTop(); renderMain()");
+    assert.match(app.node("#top").innerHTML, /data-action="agent-review"[^>]*>Run agentic review/);
+    assert.match(app.node("#main").innerHTML, /data-action="agent-review"/);
     const click = clicker(app);
     await click("agent-review");
     const d = required(app.state.dialog);
@@ -785,24 +862,32 @@ test("the prominent review action and agent-comment counts include findings, not
     app.state.settings = settingsFixture();
     app.run("renderTop(); renderSide()");
     const html = app.node("#top").innerHTML;
-    assert.deepEqual([...html.matchAll(/<section class="review-lane [^"]*" aria-labelledby="([^"]+)"/g)].map((match) => match[1]),
-        ["agentic-review-title", "manual-review-title"]);
-    assert.ok(html.indexOf('aria-label="Change context"') < html.indexOf("Agentic review"));
+    assert.doesNotMatch(html, /review-lane|Agentic review|Manual Review/);
     assert.match(html, /aria-label="Change context".*Copilot idle.*Refresh/);
-    assert.match(html, /class="primary agent-review-launch"[^>]*>Run agentic review/);
+    assert.match(html, /data-action="agent-review"[^>]*>Run agentic review/);
+    assert.match(html, /<summary[^>]*>Settings<\/summary>/);
+    assert.match(html, /data-action="configure"[^>]*>Manual review settings.*data-action="agent-review-configure"[^>]*>Agent review settings/s);
+    assert.match(html, /<span class="spacer"><\/span>.*data-action="agent-review".*review-settings-menu.*data-action="refresh"/s);
+    assert.match(html, /change-context-heading.*Revision captured 2026.*r1 · 2 files.*<\/div><div class="change-context-details">/s);
+    assert.doesNotMatch(html, /data-scope=/, "the scope toggle moved out of the header");
     assert.doesNotMatch(html, /Agent comments|agent-comment-count|data-view="agent-comments"/);
-    assert.match(html, /Run agentic review.*Review settings/);
-    assert.match(html, /aria-labelledby="manual-review-title".*Delivery: Immediate.*Auto-save learned rules: Off.*Manual review settings/);
-    assert.match(app.node("#side").innerHTML, /data-view="overview".*<span class="count"[^>]*>2<\/span><span class="name">Agent reviews<\/span>/);
+    assert.doesNotMatch(html, /Delivery:|Auto-save learned rules:/);
+    app.run("renderLoadStatus()");
+    assert.match(app.node("#review-status-controls").innerHTML, /Delivery: Immediate.*Auto-save learned rules: Off/);
+    const side = app.node("#side").innerHTML;
+    assert.match(side, /data-view="overview".*<span class="count"[^>]*>2<\/span><span class="name">Agent reviews<\/span>/);
+    assert.match(side, /Files \(\d+\)<\/div><div class="tree-scope"><span class="seg" role="group" aria-label="Review scope">.*data-scope="all".*data-scope="pending"/s);
     assert.doesNotMatch(app.run("overviewView()"), /agent-review-run|Review runs|<h2>Revisions/, "Overview omits agent review runs and the revisions list");
     assert.match(app.run("agentCommentsView()"), /1 active, 1 closed or resolved; 1 from older revisions/);
+    assert.match(app.run("agentCommentsView()"), /<div class="agent-reviews-heading"><h2>Agent reviews<\/h2><button class="primary agent-review-launch"[^>]*>Run agentic review/);
     assert.doesNotMatch(app.run("agentCommentsView()"), /Reply to human feedback/);
     await clicker(app)("nav", { view: "agent-comments" });
     assert.equal(required(app.state.view).type, "agent-comments");
     assert.match(app.node("#main").innerHTML, /<h2>Agent reviews<\/h2>.*Agent comments \(<span aria-live="polite">2<\/span>\)/);
-    app.state.review = reviewFixture({ agentReviews: [{ state: "running" }] });
+    app.state.review = reviewFixture({ agentReviews: [{ runId: "ar-running", state: "running", focus: "review", revisionId: "r1", models: ["model-a"], results: [] }] });
     app.run("renderTop()");
     assert.match(app.node("#top").innerHTML, /data-action="agent-review"[^>]*disabled>Agentic review running/);
+    assert.match(app.run("agentCommentsView()"), /data-action="agent-review"[^>]*disabled>Agentic review running/);
     assert.equal(app.run("agentComments().length"), 0, "scope switches never carry another scope's counts");
 });
 
@@ -868,6 +953,7 @@ test("legacy one-model defaults open the dialog instead of starting a review", a
 
 test("one-click run reloads defaults and requires the same scope and revision", async () => {
     const app = await loadApp();
+    app.run("renderRuler = () => {};");
     app.run('loadState = async () => { state.agentReviewSettings = { models: ["updated-model"], focus: "review", skipDialog: false }; }');
     app.state.review = reviewFixture();
     app.state.agentReviewAvailable = true;
@@ -950,17 +1036,30 @@ test("saving user defaults remains available after the review scope or revision 
 test("one-click failures surface errors and release the button even if reloading state fails", async () => {
     for (const reloadFails of [false, true]) {
         const app = await loadApp({ fetch: async () => jsonResponse({ error: { message: "Review could not be queued" } }, 500) });
-        app.run(reloadFails ? 'loadState = async () => { throw new Error("State reload failed"); }' : "loadState = async () => {}");
+        app.run("renderRuler = () => {};");
+        app.run(reloadFails
+            ? 'window.loadCount = 0; loadState = async () => { window.loadCount++; if (window.loadCount > 1) throw new Error("State reload failed"); renderMain(); }'
+            : "loadState = async () => { renderMain(); }");
         app.state.review = reviewFixture();
+        app.state.view = { type: "agent-comments" };
         app.state.agentReviewAvailable = true;
         app.state.agentReviewSettings = { models: ["model-a", "model-b"], focus: "both", skipDialog: true };
+        if (reloadFails) {
+            app.state.snapshot = { revisionId: "r1", files: [] };
+            app.run('pinnedComposers.set("preserved-draft", { kind: "file", path: "src/a.ts", revisionId: "r1" })');
+        }
+        app.run("renderMain()");
+        app.node("#main").scrollTop = 42;
         await clicker(app)("agent-review");
         assert.equal(app.state.startingReview, false);
         assert.equal(app.state.dialog, null);
-        assert.match(app.node("#top").innerHTML, /data-action="agent-review"[^>]*>Run agentic review/);
-        assert.doesNotMatch(app.node("#top").innerHTML, /data-action="agent-review"[^>]*disabled/);
+        const reviews = app.node("#main").innerHTML;
+        assert.match(reviews, /data-action="agent-review"[^>]*>Run agentic review/);
+        assert.doesNotMatch(reviews, /data-action="agent-review"[^>]*disabled/);
+        assert.equal(app.node("#main").scrollTop, 42, "redrawing the launcher preserves the current main-view scroll position");
         assert.equal(app.node("#toast").textContent, reloadFails ? "State reload failed" : "Review could not be queued");
         assert.match(app.node("#toast").className, /error/);
+        if (reloadFails) assert.match(reviews, /data-composer="preserved-draft"/, "pinned comment drafts remain visible after the failed reload");
     }
 });
 
@@ -1475,23 +1574,33 @@ test("pinned composer text and original revision survive reload and scope switch
     assert.match(reloaded.run(`composerHtml(${JSON.stringify(pinnedKey)}, pinnedComposers.get(${JSON.stringify(pinnedKey)}))`), /keep across reload/);
 });
 
-test("the top bar shows the review scope, and the learning controls only when the settings are known", async () => {
+test("the sidebar shows review scope near the file tree, and learning controls only when settings are known", async () => {
     const app = await loadApp();
     const top = () => {
         app.run("renderTop()");
         return app.node("#top").innerHTML;
+    };
+    const footer = () => {
+        app.run("renderLoadStatus()");
+        return app.node("#review-status-controls").innerHTML;
+    };
+    const side = () => {
+        app.run("renderSide()");
+        return app.node("#side").innerHTML;
     };
     const toggle = (html: string) => required(html.match(/<span class="seg"[^>]*>.*?<\/span>/))[0];
     app.state.settings = settingsFixture({ configured: true });
 
     app.state.review = reviewFixture();
     let html = top();
-    assert.match(html, /data-scope="all" aria-pressed="true"/);
-    assert.match(html, /data-scope="pending" aria-pressed="false"/);
+    assert.doesNotMatch(html, /data-scope=/);
+    assert.match(toggle(side()), /data-scope="all" aria-pressed="true"/);
+    assert.match(toggle(side()), /data-scope="pending" aria-pressed="false"/);
+    assert.match(html, /change-context-heading.*Revision captured 2026.*r1 · 2 files.*<\/div><div class="change-context-details">/s);
     assert.match(html, /<span class="muted">vs<\/span><span class="pill mono" title="merge-base def">main<\/span>/);
     assert.match(html, /↑1 ↓2/);
     assert.match(html, />3 uncommitted</);
-    assert.doesNotMatch(toggle(html), /disabled/);
+    assert.doesNotMatch(toggle(side()), /disabled/);
 
     app.state.pullRequest = { number: 7, url: "https://github.com/SergeyTeplyakov/Self-Review/pull/7" };
     html = top();
@@ -1506,24 +1615,28 @@ test("the top bar shows the review scope, and the learning controls only when th
 
     app.state.review = reviewFixture({ scope: "pending", title: "feature (pending changes)", branch: 'x"><img src=1>' });
     html = top();
-    assert.match(html, /data-scope="all" aria-pressed="false"/);
-    assert.match(html, /data-scope="pending" aria-pressed="true"/);
+    assert.doesNotMatch(html, /data-scope=/);
+    assert.match(toggle(side()), /data-scope="all" aria-pressed="false"/);
+    assert.match(toggle(side()), /data-scope="pending" aria-pressed="true"/);
     assert.match(html, /<span class="muted">uncommitted changes only<\/span>/);
     assert.doesNotMatch(html, />vs<|merge-base|↑|no upstream|\d+ uncommitted|<img/, "pending changes have no base, upstream or uncommitted count to show");
 
     app.state.switching = true;
-    assert.equal(required(toggle(top()).match(/ disabled/g)).length, 2, "both scope buttons are disabled while a switch is in flight");
+    assert.equal(required(toggle(side()).match(/ disabled/g)).length, 2, "both scope buttons are disabled while a switch is in flight");
     app.state.switching = false;
 
     for (const [autoSaveLearnedRules, label] of [[false, "Off"], [true, "On"]]) {
         app.state.settings = settingsFixture({ autoSaveLearnedRules, configured: true });
-        assert.match(top(), new RegExp(`Auto-save learned rules: ${label}</span><button data-action="configure"[^>]*>Manual review settings`), String(autoSaveLearnedRules));
+        assert.match(top(), new RegExp(`<details class="review-settings-menu"><summary[^>]*>Settings</summary>.*<button data-action="configure"[^>]*>Manual review settings`, "s"), String(autoSaveLearnedRules));
+        assert.doesNotMatch(app.node("#top").innerHTML, /Delivery:|Auto-save learned rules:/);
+        assert.match(footer(), new RegExp(`Auto-save learned rules: ${label}`), String(autoSaveLearnedRules));
     }
     app.state.settings = null;
     html = top();
     assert.doesNotMatch(html, /Auto-save learned rules:|Manual review settings|data-action="configure"/);
-    assert.match(html, /aria-labelledby="manual-review-title"/);
+    assert.doesNotMatch(html, /review-settings-menu/);
     assert.match(html, /data-action="refresh"/);
+    assert.equal(footer(), "");
 });
 
 test("the first-use banner offers manual saving or auto-save, with the old dismissal still supported", async () => {
@@ -1670,7 +1783,7 @@ test("the banner, Configure checkbox, and dismissal persist auto-save settings a
     assert.deepEqual(posts.at(-1), ["POST", "/api/settings", { autoSaveLearnedRules: false }]);
     assert.equal(app.state.settings.autoSaveLearnedRules, false);
     assert.equal(app.node("#banner").hidden, true, "choosing manual saving settles the question");
-    assert.match(app.node("#top").innerHTML, /Auto-save learned rules: Off/);
+    assert.match(app.node("#review-status-controls").innerHTML, /Auto-save learned rules: Off/);
     assert.equal(app.node("#toast").textContent, "Auto-save learned rules: Off");
 
     settings = settingsFixture();
@@ -1680,22 +1793,26 @@ test("the banner, Configure checkbox, and dismissal persist auto-save settings a
     assert.equal(app.node("#banner").hidden, true);
     assert.equal(app.state.settings.configured, false, "Not now leaves the auto-save setting at its default");
     assert.equal(app.state.settings.autoSaveLearnedRules, false);
-    assert.match(app.node("#top").innerHTML, /Auto-save learned rules: Off/);
+    assert.match(app.node("#review-status-controls").innerHTML, /Auto-save learned rules: Off/);
 
     await click("configure");
     assert.equal(dialog(app).autoSaveLearnedRules, false);
     assert.equal(dialog(app).delivery, "immediate");
     await app.run("onChange")({ target: Object.assign(new MockElement("INPUT"), { name: "autoSaveLearnedRules", checked: true }) });
     await app.run("onChange")({ target: { name: "delivery", value: "batch" } });
+    const settingsMenu = app.node(".review-settings-menu");
+    const settingsSummary = app.node(".review-settings-menu > summary");
+    app.node('[data-action="configure"]').closest = (selector) => selector === "details:not([open])" ? settingsMenu : null;
+    settingsMenu.querySelector = (selector) => selector === "summary" ? settingsSummary : null;
     await click("dialog-save");
     assert.deepEqual(posts.at(-1), ["POST", "/api/settings", { autoSaveLearnedRules: true, delivery: "batch" }]);
     assert.equal(app.state.dialog, null);
     assert.equal(app.state.settings.autoSaveLearnedRules, true);
     assert.equal(app.state.settings.delivery, "batch");
     assert.equal(app.node("#dialog").innerHTML, "");
-    assert.match(app.node("#top").innerHTML, /Delivery: Batch<\/span>.*Auto-save learned rules: On/);
+    assert.match(app.node("#review-status-controls").innerHTML, /Delivery: Batch<\/span>.*Auto-save learned rules: On/);
     assert.equal(app.node("#toast").textContent, "Saved. Auto-save learned rules: On · Delivery: Batch");
-    assert.equal(app.focused.at(-1), '[data-action="configure"]');
+    assert.equal(app.focused.at(-1), ".review-settings-menu > summary", "focus returns to the visible Settings summary after the menu collapses");
 
     await click("configure");
     failure = "disk full";
@@ -1851,7 +1968,7 @@ test("switching scope loads the other review, remembers each review's own view, 
     };
     const app = await loadApp({ fetch });
     const click = clicker(app);
-    app.run("render = () => {}; var switchingSeen = []; renderTop = () => { switchingSeen.push(state.switching); };");
+    app.run("render = () => {}; var switchingSeen = []; var switchingSideHtml = []; renderTop = () => { switchingSeen.push(state.switching); }; renderSide = () => { switchingSideHtml.push(scopeToggleHtml(scopeOf(state.review))); };");
 
     await app.run("loadState()");
     assert.equal(app.state.review.reviewId, "a");
@@ -1870,6 +1987,10 @@ test("switching scope loads the other review, remembers each review's own view, 
     assert.equal(app.read("state.collapsedDirs"), null);
     assert.equal(app.read("state.pendingJump"), null);
     assert.equal(app.state.switching, false);
+    const switchingSideHtml = app.read<string[]>("switchingSideHtml");
+    assert.match(switchingSideHtml[0], /data-scope="all"[^>]* disabled/);
+    assert.match(switchingSideHtml[0], /data-scope="pending"[^>]* disabled/);
+    assert.doesNotMatch(switchingSideHtml[1], / disabled/, "the scope controls re-enable after the switch");
 
     const before = calls.length;
     await click("scope", { scope: "pending" });
@@ -1908,6 +2029,10 @@ test("the top bar offers Submit review while drafts wait, and shows how comments
         app.run("renderTop()");
         return app.node("#top").innerHTML;
     };
+    const footer = () => {
+        app.run("renderLoadStatus()");
+        return app.node("#review-status-controls").innerHTML;
+    };
     app.state.settings = settingsFixture({ configured: true });
     app.state.review = reviewFixture({ threads: draftThreads() });
 
@@ -1932,13 +2057,15 @@ test("the top bar offers Submit review while drafts wait, and shows how comments
         app.state.settings = settingsFixture({ configured: true, delivery });
         app.state.review = reviewFixture({ deliveryMode });
         html = top();
-        assert.match(html, new RegExp(`Delivery: ${pill}</span>`), `${delivery}/${deliveryMode}`);
-        assert.equal(/data-action="delivery-reask"[^>]*>Change</.test(html), reask, `only a decided ask-mode review offers Change (${delivery}/${deliveryMode})`);
+        assert.doesNotMatch(html, /Delivery:/);
+        const footerHtml = footer();
+        assert.match(footerHtml, new RegExp(`Delivery: ${pill}</span>`), `${delivery}/${deliveryMode}`);
+        assert.equal(/data-action="delivery-reask"[^>]*>Change</.test(footerHtml), reask, `only a decided ask-mode review offers Change (${delivery}/${deliveryMode})`);
     }
     app.state.settings = null;
     app.state.review = reviewFixture({ threads: draftThreads() });
     html = top();
-    assert.doesNotMatch(html, /Delivery:/);
+    assert.equal(footer(), "");
     assert.match(html, /Submit review \(2\)/, "a comment held on request can still be submitted without settings");
 });
 

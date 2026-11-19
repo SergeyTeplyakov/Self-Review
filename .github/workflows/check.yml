@@ -22,4 +22,7 @@ jobs:
       - run: npm ci --ignore-scripts --omit=optional
       - run: npm run typecheck
       - run: npm test
-      - run: test -z "$(git status --porcelain --untracked-files=all -- extensions/self-review/dist)"
+      - run: |
+          status="$(git status --porcelain --untracked-files=all -- extensions/self-review/dist)"
+          printf '%s\n' "$status"
+          test -z "$status"

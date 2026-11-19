@@ -4,8 +4,10 @@
 // repository's auto-save setting, proposes or saves guidelines drawn from the feedback.
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { readFile } from "node:fs/promises";
 import { joinSession, createCanvas, CanvasError } from "@github/copilot-sdk/extension";
 import { Store, migrateLegacyDataRoot } from "./lib/store.mjs";
+import { parseExtensionVersion } from "./lib/extension-version.mjs";
 import { ReviewService, ReviewError, THREAD_KINDS, THREAD_STATUSES, OUTCOMES, LESSON_STATUSES, SCOPES } from "./lib/review-service.mjs";
 import { SettingsService } from "./lib/settings.mjs";
 import { Delivery } from "./lib/delivery.mjs";
@@ -17,6 +19,9 @@ import { isRecord } from "./web/contracts.mjs";
 import { ReviewSkills } from "./lib/review-skills.mjs";
 const CANVAS_ID = "self-review";
 const WEB_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "web");
+const MODULE_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
+const DISTRIBUTION_DIRECTORY = path.basename(MODULE_DIRECTORY) === "dist" ? MODULE_DIRECTORY : path.join(MODULE_DIRECTORY, "dist");
+const extensionVersion = parseExtensionVersion(JSON.parse(await readFile(path.join(DISTRIBUTION_DIRECTORY, "version.json"), "utf8")));
 const REPO_FIELDS = ["repoPath", "base", "paths", "exclude", "includeUntracked", "context"];
 let session = null;
 const log = (message, level = "info") => {
@@ -114,6 +119,7 @@ async function ensureServer(instanceId, reviewId) {
             service,
             delivery,
             agentReview,
+            extensionVersion,
             settings,
             reviewSkills,
             webRoot: WEB_ROOT,

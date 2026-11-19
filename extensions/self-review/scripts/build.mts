@@ -1,7 +1,8 @@
 import { execFileSync } from "node:child_process";
-import { copyFileSync, cpSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { copyFileSync, cpSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { distributionBuildId, normalizeDistributionLineEndings } from "./distribution-fingerprint.mjs";
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../../");
 const extensionRoot = path.join(repositoryRoot, "extensions", "self-review");
@@ -14,6 +15,17 @@ function clearDirectory(directory: string) {
     for (const entry of readdirSync(directory)) {
         rmSync(path.join(directory, entry), { recursive: true, force: true });
     }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function distributionFiles(directory: string): string[] {
+    return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+        const file = path.join(directory, entry.name);
+        return entry.isDirectory() ? distributionFiles(file) : [file];
+    });
 }
 
 mkdirSync(distributionRoot, { recursive: true });
@@ -39,6 +51,21 @@ for (const asset of ["index.html", "styles.css"]) {
 }
 cpSync(path.join(extensionRoot, "bundled-skills"), path.join(distributionRoot, "bundled-skills"), { recursive: true });
 cpSync(path.join(extensionRoot, "review-commands"), path.join(distributionRoot, "review-commands"), { recursive: true });
+
+const marketplace: unknown = JSON.parse(readFileSync(path.join(repositoryRoot, ".github", "plugin", "marketplace.json"), "utf8"));
+const selfReviewPlugin = isRecord(marketplace) && Array.isArray(marketplace.plugins)
+    ? marketplace.plugins.find((plugin) => isRecord(plugin) && plugin.name === "self-review-canvas")
+    : undefined;
+if (!isRecord(selfReviewPlugin) || typeof selfReviewPlugin.version !== "string" || !selfReviewPlugin.version.trim()) {
+    throw new Error("The Self-Review plugin metadata has no valid version.");
+}
+const files = distributionFiles(distributionRoot);
+normalizeDistributionLineEndings(files);
+const buildId = distributionBuildId(distributionRoot, files);
+writeFileSync(path.join(distributionRoot, "version.json"), `${JSON.stringify({
+    version: selfReviewPlugin.version,
+    buildId,
+}, null, 2)}\n`);
 
 mkdirSync(toolsDistributionRoot, { recursive: true });
 rmSync(path.join(toolsDistributionRoot, "dist"), { recursive: true, force: true });
