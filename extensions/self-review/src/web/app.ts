@@ -869,7 +869,7 @@ function highlightFile(file: DiffFile): string[][] {
 }
 
 const MD_RENDER_TOKENS = /\\[!-\/:-@[-`{-~]|`+|\*\*|!?\[/g;
-const MD_RENDER_DESTINATION = /\(((?:\\[!-\/:-@[-`{-~]|[^\\()\s]|\((?:\\[!-\/:-@[-`{-~]|[^\\()\s])*\))*)(?:\s+(?:"[^"]*"|'[^']*'))?\s*\)/y;
+const MD_RENDER_DESTINATION = /\((?:<((?:\\[!-\/:-@[-`{-~]|[^\\<>\r\n])*)>|((?:\\[!-\/:-@[-`{-~]|[^\\<>()\s]|\((?:\\[!-\/:-@[-`{-~]|[^\\<>()\s])*\))*))(?:\s+(?:"[^"]*"|'[^']*'))?\s*\)/y;
 
 function closingCodeRun(text: string, from: number, length: number): RegExpExecArray | null {
     const runs = /`+|\n/g;
@@ -900,7 +900,14 @@ function closingInlineDelimiter(text: string, from: number, kind: "bold" | "labe
 }
 
 function externalMarkdownUrl(destination: string): string | undefined {
-    const url = destination.replace(/\\([!-\/:-@[-`{-~])/g, "$1");
+    let decoder: HTMLTextAreaElement | undefined;
+    const url = destination.replace(/\\([!-\/:-@[-`{-~])|&(?:#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[a-zA-Z][a-zA-Z0-9]*);/g, (token, punctuation) => {
+        if (typeof punctuation === "string") return punctuation;
+        // Only a single syntactically valid reference, never arbitrary markup, reaches the decoder.
+        decoder ??= document.createElement("textarea");
+        decoder.innerHTML = token;
+        return decoder.value;
+    });
     if (!/^https?:\/\//i.test(url) || !URL.canParse(url)) return undefined;
     return new URL(url).href;
 }
@@ -933,7 +940,8 @@ function inline(text: string, allowLinks = true): string {
             const link = close < 0 ? null : MD_RENDER_DESTINATION.exec(text);
             if (link) {
                 const end = MD_RENDER_DESTINATION.lastIndex;
-                const href = token === "[" && link[1] ? externalMarkdownUrl(link[1]) : undefined;
+                const destination = link[1] ?? link[2];
+                const href = token === "[" && destination ? externalMarkdownUrl(destination) : undefined;
                 html += href
                     ? `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer" data-markdown-link>${inline(text.slice(tokens.lastIndex, close), false)}</a>`
                     : esc(text.slice(match.index, end));

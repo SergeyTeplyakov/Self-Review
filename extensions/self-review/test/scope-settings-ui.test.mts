@@ -188,6 +188,29 @@ test("reply Markdown respects code inside bold and balanced link labels", async 
     assert.ok(html.includes("data-markdown-link><code>x]</code> and [y]</a>"));
 });
 
+test("reply Markdown accepts angle destinations and decodes references before validating URLs", async () => {
+    const app = await loadApp();
+    const references = new Map([["&amp;", "&"], ["&#x32;", "2"], ["&colon;", ":"]]);
+    Object.assign(app.document, { createElement: (tag: string) => {
+        assert.equal(tag, "textarea");
+        return {
+            value: "",
+            set innerHTML(reference: string) {
+                assert.ok(references.has(reference), "only a single known reference reaches the decoder");
+                this.value = references.get(reference) ?? "";
+            },
+        };
+    } });
+    const body = "[issue](<https://example.test/a b>) [search](https://example.test/?q=one&amp;page=&#x32;) "
+        + "[literal](https://example.test/?q=one\\&amp;page=2) [local](file&colon;///tmp/notes)";
+    const html = app.run(`md(${JSON.stringify(body)})`);
+    assert.equal(html.match(/<a\b/g)?.length, 3);
+    assert.match(html, /href="https:\/\/example\.test\/a%20b"/);
+    assert.match(html, /href="https:\/\/example\.test\/\?q=one&amp;page=2"/);
+    assert.match(html, /href="https:\/\/example\.test\/\?q=one&amp;amp;page=2"/);
+    assert.match(html, /\[local\]\(file&amp;colon;\/\/\/tmp\/notes\)/);
+});
+
 test("agent reply keeps non-web destinations, raw HTML and code inert", async () => {
     const app = await loadApp();
     const body = [
