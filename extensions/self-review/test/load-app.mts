@@ -15,9 +15,16 @@ export class MockElement {
     hidden = false;
     inert = false;
     scrollTop = 0;
+    open?: boolean;
     classList = { toggle: (_name: string, _force?: boolean) => false };
     closest(_selector: string): MockElement | null {
         return this;
+    }
+    querySelector(_selector: string): MockElement | null {
+        return null;
+    }
+    contains(_node: unknown): boolean {
+        return false;
     }
 
     constructor(tagName = "DIV") {

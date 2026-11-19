@@ -666,6 +666,34 @@ test("Agent review settings has a heading, General and Review skills tabs, no Ru
     assert.equal(posts.length, 0, "opening settings never saves or starts work");
 });
 
+test("header rerenders preserve the open Settings menu and focused menu control", async () => {
+    const app = await loadApp();
+    app.state.review = reviewFixture();
+    app.state.settings = settingsFixture();
+    app.state.agentReviewAvailable = true;
+
+    const focusEvents: string[] = [];
+    const summary = Object.assign(new MockElement("SUMMARY"), { focus: () => focusEvents.push("summary") });
+    const configure = Object.assign(new MockElement("BUTTON"), {
+        dataset: { action: "configure" },
+        focus: () => focusEvents.push("configure"),
+    });
+    const menu = Object.assign(new MockElement("DETAILS"), { open: true });
+    menu.contains = (node) => node === summary || node === configure;
+    menu.querySelector = (selector) => selector === "summary" ? summary : selector === '[data-action="configure"]' ? configure : null;
+    app.node("#top").querySelector = (selector) => selector === ".review-settings-menu" ? menu : null;
+
+    app.document.activeElement = configure;
+    app.run("renderTop()");
+    assert.equal(menu.open, true, "an unrelated header update does not close Settings");
+    assert.equal(focusEvents.at(-1), "configure", "the focused settings action remains usable");
+
+    app.document.activeElement = summary;
+    app.run("renderTop()");
+    assert.equal(menu.open, true);
+    assert.equal(focusEvents.at(-1), "summary", "focus on the Settings summary survives an update");
+});
+
 test("bundled skill loading failures keep unsaved choices and can be retried", async () => {
     let fail = true;
     const { app, posts, click } = await skillsApp(bundledCatalog(["ponytail-review"]), { fail: () => fail });
@@ -925,6 +953,7 @@ test("legacy one-model defaults open the dialog instead of starting a review", a
 
 test("one-click run reloads defaults and requires the same scope and revision", async () => {
     const app = await loadApp();
+    app.run("renderRuler = () => {};");
     app.run('loadState = async () => { state.agentReviewSettings = { models: ["updated-model"], focus: "review", skipDialog: false }; }');
     app.state.review = reviewFixture();
     app.state.agentReviewAvailable = true;
@@ -1007,6 +1036,7 @@ test("saving user defaults remains available after the review scope or revision 
 test("one-click failures surface errors and release the button even if reloading state fails", async () => {
     for (const reloadFails of [false, true]) {
         const app = await loadApp({ fetch: async () => jsonResponse({ error: { message: "Review could not be queued" } }, 500) });
+        app.run("renderRuler = () => {};");
         app.run(reloadFails
             ? 'window.loadCount = 0; loadState = async () => { window.loadCount++; if (window.loadCount > 1) throw new Error("State reload failed"); renderMain(); }'
             : "loadState = async () => { renderMain(); }");
@@ -1014,6 +1044,10 @@ test("one-click failures surface errors and release the button even if reloading
         app.state.view = { type: "agent-comments" };
         app.state.agentReviewAvailable = true;
         app.state.agentReviewSettings = { models: ["model-a", "model-b"], focus: "both", skipDialog: true };
+        if (reloadFails) {
+            app.state.snapshot = { revisionId: "r1", files: [] };
+            app.run('pinnedComposers.set("preserved-draft", { kind: "file", path: "src/a.ts", revisionId: "r1" })');
+        }
         app.run("renderMain()");
         app.node("#main").scrollTop = 42;
         await clicker(app)("agent-review");
@@ -1025,6 +1059,7 @@ test("one-click failures surface errors and release the button even if reloading
         assert.equal(app.node("#main").scrollTop, 42, "redrawing the launcher preserves the current main-view scroll position");
         assert.equal(app.node("#toast").textContent, reloadFails ? "State reload failed" : "Review could not be queued");
         assert.match(app.node("#toast").className, /error/);
+        if (reloadFails) assert.match(reviews, /data-composer="preserved-draft"/, "pinned comment drafts remain visible after the failed reload");
     }
 });
 
@@ -1933,7 +1968,7 @@ test("switching scope loads the other review, remembers each review's own view, 
     };
     const app = await loadApp({ fetch });
     const click = clicker(app);
-    app.run("render = () => {}; var switchingSeen = []; renderTop = () => { switchingSeen.push(state.switching); };");
+    app.run("render = () => {}; var switchingSeen = []; var switchingSideHtml = []; renderTop = () => { switchingSeen.push(state.switching); }; renderSide = () => { switchingSideHtml.push(scopeToggleHtml(scopeOf(state.review))); };");
 
     await app.run("loadState()");
     assert.equal(app.state.review.reviewId, "a");
@@ -1952,6 +1987,10 @@ test("switching scope loads the other review, remembers each review's own view, 
     assert.equal(app.read("state.collapsedDirs"), null);
     assert.equal(app.read("state.pendingJump"), null);
     assert.equal(app.state.switching, false);
+    const switchingSideHtml = app.read<string[]>("switchingSideHtml");
+    assert.match(switchingSideHtml[0], /data-scope="all"[^>]* disabled/);
+    assert.match(switchingSideHtml[0], /data-scope="pending"[^>]* disabled/);
+    assert.doesNotMatch(switchingSideHtml[1], / disabled/, "the scope controls re-enable after the switch");
 
     const before = calls.length;
     await click("scope", { scope: "pending" });

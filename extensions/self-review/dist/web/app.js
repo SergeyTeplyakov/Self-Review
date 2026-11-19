@@ -1293,6 +1293,13 @@ function renderTop() {
     const r = state.review;
     if (!r)
         return;
+    const top = requiredElement("#top");
+    const previousSettingsMenu = top.querySelector(".review-settings-menu");
+    const active = document.activeElement;
+    const activeInSettingsMenu = active instanceof HTMLElement && previousSettingsMenu?.contains(active);
+    const settingsMenuWasOpen = previousSettingsMenu?.open ?? false;
+    const focusedSettingsSummary = activeInSettingsMenu && active === previousSettingsMenu?.querySelector("summary");
+    const focusedSettingsAction = activeInSettingsMenu && active instanceof HTMLElement ? active.dataset.action : undefined;
     const rev = r.revisions.find((x) => x.revisionId === r.currentRevisionId);
     const git = r.git ?? {};
     const scope = scopeOf(r);
@@ -1335,7 +1342,17 @@ function renderTop() {
         controls.push(`<button class="primary" data-action="submit-review" title="Send every draft comment to Copilot together, as one review"${state.submitting ? " disabled>Submitting…" : `>Submit review (${drafts})`}</button>`);
     if (controls.length)
         parts.push(`<div class="review-controls">${controls.join("")}</div>`);
-    requiredElement("#top").innerHTML = parts.join("");
+    top.innerHTML = parts.join("");
+    const settingsMenu = top.querySelector(".review-settings-menu");
+    if (!settingsMenu)
+        return;
+    settingsMenu.open = settingsMenuWasOpen;
+    if (activeInSettingsMenu) {
+        if (focusedSettingsSummary || !settingsMenuWasOpen)
+            settingsMenu.querySelector("summary")?.focus();
+        else if (focusedSettingsAction)
+            settingsMenu.querySelector(`[data-action="${focusedSettingsAction}"]`)?.focus();
+    }
 }
 // ---------- Repository settings: first-use banner, per-review delivery question, and Configure dialog ----------
 function learningBannerHtml() {
@@ -1627,11 +1644,7 @@ async function runAgentReview() {
     finally {
         state.startingReview = false;
         renderTop();
-        const main = $("#main");
-        const scrollTop = main?.scrollTop ?? 0;
-        renderMain();
-        if (main)
-            main.scrollTop = scrollTop;
+        render();
         await loadState();
     }
 }
@@ -1790,6 +1803,7 @@ async function switchScope(scope) {
         return;
     state.switching = true;
     renderTop();
+    renderSide();
     try {
         await api("POST", "scope", { scope });
         await loadState();
