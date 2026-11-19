@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { parseExtensionVersion } from "../src/lib/extension-version.mjs";
 
 const extensionRoot = fileURLToPath(new URL("..", import.meta.url));
 
@@ -34,6 +35,7 @@ test("the installation-shaped distribution contains executable modules and all b
         "dist/extension.mjs",
         "dist/lib/server.mjs",
         "dist/lib/settings.mjs",
+        "dist/version.json",
         "dist/review-commands/explain/SKILL.md",
         "dist/review-commands/learn/SKILL.md",
         "dist/web/app.js",
@@ -42,6 +44,10 @@ test("the installation-shaped distribution contains executable modules and all b
         "dist/web/settings-api.mjs",
         "dist/web/styles.css",
     ]) assert.ok(installedPaths.has(file), `missing installed file ${file}`);
+
+    const extensionVersion = parseExtensionVersion(JSON.parse(await readFile(path.join(installedDist, "version.json"), "utf8")) as unknown);
+    assert.match(extensionVersion.version, /^\d+\.\d+\.\d+$/);
+    assert.match(extensionVersion.buildId, /^[a-f0-9]{12}$/);
 
     for (const file of installedFiles.filter((candidate) => candidate.endsWith(".mjs"))) {
         execFileSync(process.execPath, ["--check", file], { stdio: "pipe" });

@@ -23,6 +23,7 @@ import type { SettingsService } from "./settings.mjs";
 import type { ReviewSkills } from "./review-skills.mjs";
 import { ReviewWatcher } from "./review-watcher.mjs";
 import { MAX_IMAGE_BYTES, readCommentImage, saveCommentImage } from "./comment-images.mjs";
+import type { ExtensionVersion } from "./extension-version.mjs";
 
 const MAX_JSON = 1024 * 1024;
 const PULL_REQUEST_CACHE_MS = 30_000;
@@ -103,6 +104,7 @@ interface StartReviewServerOptions {
     service: ReviewService;
     delivery: Delivery;
     webRoot: string;
+    extensionVersion?: ExtensionVersion;
     log?: Log;
     settings?: SettingsService;
     agentReview?: AgentReview;
@@ -167,6 +169,7 @@ export async function startReviewServer({
     service,
     delivery,
     webRoot,
+    extensionVersion,
     log = () => {},
     settings,
     onReviewChange,
@@ -296,7 +299,18 @@ export async function startReviewServer({
                 // PR discovery can outlive a scope/branch change; pair it only with the review it describes.
                 const review = await service.getReview(reviewId);
                 const currentPullRequest = initial.repoRoot === review.repoRoot && initial.branch === review.branch ? pullRequest : null;
-                return send(res, 200, { instanceId, review, refresh: service.refreshState(reviewId), session: { busy: delivery.busy }, pullRequest: currentPullRequest, agentReviewAvailable: Boolean(agentReview), reviewSkillsAvailable: Boolean(reviewSkills), agentReviewSuggestedModels: SUGGESTED_REVIEWERS, ...settingsState });
+                return send(res, 200, {
+                    instanceId,
+                    review,
+                    refresh: service.refreshState(reviewId),
+                    session: { busy: delivery.busy },
+                    pullRequest: currentPullRequest,
+                    agentReviewAvailable: Boolean(agentReview),
+                    reviewSkillsAvailable: Boolean(reviewSkills),
+                    agentReviewSuggestedModels: SUGGESTED_REVIEWERS,
+                    ...settingsState,
+                    ...(extensionVersion ? { extensionVersion } : {}),
+                });
             }
             if (parts[0] === "review-skills" && parts.length === 1) {
                 if (!reviewSkills) throw new HttpError(501, "unsupported", "Bundled review skills are not available.");

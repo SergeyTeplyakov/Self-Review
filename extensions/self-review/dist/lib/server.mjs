@@ -129,7 +129,7 @@ function openInDefaultBrowser(url) {
         });
     });
 }
-export async function startReviewServer({ instanceId, getReviewId, service, delivery, webRoot, log = () => { }, settings, onReviewChange, agentReview, reviewSkills, findPullRequest = findOpenPullRequest, openCommentLink = openInDefaultBrowser, }) {
+export async function startReviewServer({ instanceId, getReviewId, service, delivery, webRoot, extensionVersion, log = () => { }, settings, onReviewChange, agentReview, reviewSkills, findPullRequest = findOpenPullRequest, openCommentLink = openInDefaultBrowser, }) {
     const settingsHttp = new SettingsHttp(settings, log);
     const reviewWatcher = new ReviewWatcher(service, log);
     const token = randomBytes(24).toString("base64url");
@@ -249,7 +249,18 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
                 // PR discovery can outlive a scope/branch change; pair it only with the review it describes.
                 const review = await service.getReview(reviewId);
                 const currentPullRequest = initial.repoRoot === review.repoRoot && initial.branch === review.branch ? pullRequest : null;
-                return send(res, 200, { instanceId, review, refresh: service.refreshState(reviewId), session: { busy: delivery.busy }, pullRequest: currentPullRequest, agentReviewAvailable: Boolean(agentReview), reviewSkillsAvailable: Boolean(reviewSkills), agentReviewSuggestedModels: SUGGESTED_REVIEWERS, ...settingsState });
+                return send(res, 200, {
+                    instanceId,
+                    review,
+                    refresh: service.refreshState(reviewId),
+                    session: { busy: delivery.busy },
+                    pullRequest: currentPullRequest,
+                    agentReviewAvailable: Boolean(agentReview),
+                    reviewSkillsAvailable: Boolean(reviewSkills),
+                    agentReviewSuggestedModels: SUGGESTED_REVIEWERS,
+                    ...settingsState,
+                    ...(extensionVersion ? { extensionVersion } : {}),
+                });
             }
             if (parts[0] === "review-skills" && parts.length === 1) {
                 if (!reviewSkills)

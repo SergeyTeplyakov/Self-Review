@@ -110,20 +110,40 @@ body { display: flex; flex-direction: column; overflow: hidden; }
 #review-status-slot {
     flex: 0 0 3.5rem;
     min-height: 0;
-    border-top: 1px solid var(--mr-border);
-}
-.review-status:not([hidden]) {
     display: flex;
     align-items: center;
     gap: 8px;
+    padding: 0 16px;
+    border-top: 1px solid var(--mr-border);
+}
+.review-status:not([hidden]) {
+    flex: 1 1 0;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
     height: 100%;
-    padding: 4px 16px;
+    padding: 4px 0;
 }
 .review-status-message {
+    flex: 1 1 auto;
     min-width: 0;
     max-height: 100%;
     overflow: auto;
     overflow-wrap: anywhere;
+    text-align: right;
+}
+.review-status > button { flex: none; }
+.review-status-controls {
+    display: flex;
+    flex: 0 1 auto;
+    align-items: center;
+    justify-content: flex-start;
+    flex-wrap: wrap;
+    gap: 8px;
+    min-width: 0;
+    max-width: 70%;
 }
 
 button, select, textarea, input { font: inherit; color: inherit; }
@@ -162,13 +182,17 @@ select {
 .change-context-heading .title { overflow-wrap: anywhere; }
 .change-context-details { padding-top: 8px; border-top: 1px solid var(--mr-border); }
 .change-context-details .spacer { flex: 1; }
-.review-workflows { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; padding-top: 12px; border-top: 1px solid var(--mr-border); }
-.review-lane { display: flex; min-width: 0; flex-direction: column; gap: 12px; padding: 12px; border: 1px solid var(--mr-border); border-radius: var(--mr-radius); }
-.review-lane-heading h2 { margin: 0 0 4px; font-size: 1.05em; }
-.review-lane-heading p { margin: 0; }
-.review-lane-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.review-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding-top: 8px; border-top: 1px solid var(--mr-border); }
 .feedback-draft-count { color: var(--mr-muted); }
 button.agent-review-launch { padding: 7px 14px; font-weight: 600; }
+.change-context-details button.agent-review-launch { padding: 3px 10px; }
+.review-settings-menu { position: relative; }
+.review-settings-menu > summary { display: inline-flex; align-items: center; cursor: pointer; list-style: none; border: 1px solid var(--mr-border); border-radius: var(--mr-radius); padding: 5px 10px; }
+.review-settings-menu > summary::-webkit-details-marker { display: none; }
+.review-settings-options { position: absolute; z-index: 2; top: calc(100% + 4px); right: 0; display: flex; min-width: max-content; flex-direction: column; gap: 4px; padding: 4px; border: 1px solid var(--mr-border); border-radius: var(--mr-radius); background: var(--mr-bg); box-shadow: 0 4px 12px rgb(0 0 0 / 18%); }
+.review-settings-options button { width: 100%; text-align: left; white-space: nowrap; }
+.agent-reviews-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.agent-reviews-heading h2 { margin: 0; }
 .skill-group { display: flex; flex-direction: column; gap: 6px; }
 .review-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--mr-border); margin: 4px 0 12px; }
 .review-tab { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none; padding: 6px 10px; color: var(--mr-muted); }
@@ -207,10 +231,6 @@ a.pill:hover { text-decoration: underline; }
 
 .add { color: var(--mr-green); }
 .del { color: var(--mr-red); }
-
-@media (max-width: 720px) {
-    .review-workflows { grid-template-columns: 1fr; }
-}
 
 #layout { display: flex; flex: 1; min-height: 0; position: relative; }
 
@@ -262,6 +282,9 @@ a.pill:hover { text-decoration: underline; }
 .nav-item .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .nav-item .dir { color: var(--mr-muted); }
 #side .section { padding: 10px 12px 4px; font-size: 0.85em; text-transform: uppercase; letter-spacing: 0.04em; color: var(--mr-muted); }
+.tree-scope { padding: 4px 12px 8px; }
+.tree-scope .seg { display: flex; width: 100%; }
+.tree-scope .seg button { flex: 1; padding: 3px 4px; font-size: 0.8em; white-space: nowrap; }
 .nav-item.tree { padding-left: calc(6px + var(--depth, 0) * 14px); gap: 4px; }
 .nav-item.tree .stat { opacity: 0.85; }
 .nav-item .meta { color: var(--mr-muted); font-size: 0.85em; white-space: nowrap; min-width: 4.5em; text-align: right; }
@@ -555,7 +578,7 @@ table.lessons-table th { color: var(--mr-muted); font-weight: 600; font-size: 0.
 #toast.error { background: var(--mr-red); color: #fff; }
 .banner { padding: 6px 10px; border: 1px solid var(--mr-yellow); color: var(--mr-yellow); border-radius: var(--mr-radius); margin-bottom: 10px; }
 
-/* Review scope toggle: a two-button segmented control in the top bar. */
+/* Review scope toggle: a two-button segmented control above the file tree. */
 .seg { display: inline-flex; }
 .seg button { border-radius: 0; margin-left: -1px; }
 .seg button:first-child { border-radius: var(--mr-radius) 0 0 var(--mr-radius); margin-left: 0; }

@@ -4,9 +4,11 @@
 // repository's auto-save setting, proposes or saves guidelines drawn from the feedback.
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { readFile } from "node:fs/promises";
 import { joinSession, createCanvas, CanvasError } from "@github/copilot-sdk/extension";
 import type { Canvas, CanvasAction, CanvasJsonSchema } from "@github/copilot-sdk/extension";
 import { Store, migrateLegacyDataRoot } from "./lib/store.mjs";
+import { parseExtensionVersion } from "./lib/extension-version.mjs";
 import { ReviewService, ReviewError, THREAD_KINDS, THREAD_STATUSES, OUTCOMES, LESSON_STATUSES, SCOPES } from "./lib/review-service.mjs";
 import { SettingsService } from "./lib/settings.mjs";
 import { Delivery } from "./lib/delivery.mjs";
@@ -19,6 +21,9 @@ import { ReviewSkills } from "./lib/review-skills.mjs";
 
 const CANVAS_ID = "self-review";
 const WEB_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "web");
+const MODULE_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
+const DISTRIBUTION_DIRECTORY = path.basename(MODULE_DIRECTORY) === "dist" ? MODULE_DIRECTORY : path.join(MODULE_DIRECTORY, "dist");
+const extensionVersion = parseExtensionVersion(JSON.parse(await readFile(path.join(DISTRIBUTION_DIRECTORY, "version.json"), "utf8")) as unknown);
 const REPO_FIELDS: readonly string[] = ["repoPath", "base", "paths", "exclude", "includeUntracked", "context"];
 type Session = Awaited<ReturnType<typeof joinSession>>;
 type OpenContext = Parameters<Canvas["open"]>[0];
@@ -127,6 +132,7 @@ async function ensureServer(instanceId: string, reviewId: string): Promise<Insta
             service,
             delivery,
             agentReview,
+            extensionVersion,
             settings,
             reviewSkills,
             webRoot: WEB_ROOT,
