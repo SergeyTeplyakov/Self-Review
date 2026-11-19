@@ -10,7 +10,7 @@ import { relocate } from "./anchors.mjs";
 import { hunkExcerpt, selectedLines } from "./diff.mjs";
 import { ReviewError, isRecord } from "../web/contracts.mjs";
 import { parseReviewCommand } from "../web/review-commands.mjs";
-import { commentImageIds } from "./comment-images.mjs";
+import { checkBatchImageBudget, commentImageIds } from "./comment-images.mjs";
 export { ReviewError } from "../web/contracts.mjs";
 import type { Log, ReviewScope, DeliveryChoice } from "../../types/contracts.js";
 import type { Store } from "./store.mjs";
@@ -34,6 +34,7 @@ export interface MessageDelivery {
     processedBy?: string;
     sessionMessageId?: string | null;
     batchId?: string;
+    submittedBatchId?: string;
     error?: string | null;
     updatedAt?: string;
     queuedAt?: string;
@@ -176,6 +177,7 @@ export interface MessageInput {
     outcome?: unknown;
     verification?: unknown;
     inReplyTo?: unknown;
+    batchId?: unknown;
     lessons?: unknown;
     descriptionVersion?: unknown;
 }
@@ -949,21 +951,25 @@ export class ReviewService extends EventEmitter {
                 if (target?.delivery?.state === "draft") {
                     throw new ReviewError("conflict", `Message ${input.inReplyTo} is a draft the reviewer has not sent yet; reply after it is delivered.`);
                 }
+                const requestedBatch = optionalString(input.batchId, "batchId");
+                const originalBatch = target?.delivery?.submittedBatchId ?? target?.delivery?.batchId;
+                if (requestedBatch && (!input.inReplyTo || requestedBatch !== originalBatch)) {
+                    throw invalid("batchId must identify the submission that included the reply target.");
+                }
+                const batchId = requestedBatch ?? target?.delivery?.batchId;
+                const answered = batchId ? thread.messages.filter((m) =>
+                    m.author === "user" && (m.delivery?.submittedBatchId ?? m.delivery?.batchId) === batchId)
+                    : target?.author === "user" ? [target] : [];
                 if (target?.delivery) {
                     const repliedAt = nowIso();
-                    target.delivery = { ...target.delivery, state: "replied", repliedAt };
                     // One reply answers every comment the same submitted review added to this thread.
-                    const batchId = target.delivery.batchId;
-                    for (const m of batchId ? thread.messages : []) {
-                        if (m !== target && m.author === "user" && m.delivery?.batchId === batchId && m.delivery?.state !== "replied") {
+                    for (const m of answered) {
+                        if (m.delivery && m.delivery.state !== "replied") {
                             m.delivery = { ...m.delivery, state: "replied", repliedAt };
                         }
                     }
                 }
                 message.lessonIds = [];
-                const batchId = target?.delivery?.batchId;
-                const answered = batchId ? thread.messages.filter((m) => m.author === "user" && m.delivery?.batchId === batchId)
-                : target?.author === "user" ? [target] : [];
                 const sourceComment = answered.length === 1 ? answered[0] : undefined;
                 const explainOnly = answered.length > 0 && answered.every((m) => parseReviewCommand(m.body)?.name === "explain");
                 const needsLearnSource = answered.length > 1 && answered.some((m) => parseReviewCommand(m.body)?.name === "learn");
@@ -1016,10 +1022,8 @@ export class ReviewService extends EventEmitter {
             await saveRule(this.store, review.repoRoot, proposal);
             return { review, value: { lesson: proposal, saved: true } };
         });
-        if (saved) {
-            this.changed(reviewId, "message");
-            await this.store.appendLesson(lesson);
-        }
+        if (saved) this.changed(reviewId, "message");
+        await this.store.appendLesson(lesson);
         return lesson;
     }
 
@@ -1047,7 +1051,8 @@ export class ReviewService extends EventEmitter {
             const initial = current?.state === "draft" || (current?.state === "saving" && !current.attempts);
             if (!initial && !(retry && ["failed", "no-reply"].includes(current?.state ?? ""))) return { write: false, value: null };
             const attempt = { attemptId: randomUUID(), attempts: (current?.attempts ?? 0) + 1 };
-            message.delivery = { state: "saving", ...attempt, senderSessionId, claimPid: this.pid, error: null, updatedAt: nowIso() };
+            const submittedBatchId = current?.submittedBatchId ?? current?.batchId;
+            message.delivery = { state: "saving", ...attempt, submittedBatchId, senderSessionId, claimPid: this.pid, error: null, updatedAt: nowIso() };
             return { review, value: attempt };
         });
         if (claim) this.changed(reviewId, "delivery");
@@ -1056,11 +1061,12 @@ export class ReviewService extends EventEmitter {
 
     // Claims every draft in one atomic update so a submitted review is sent once, as one batch.
     async claimDrafts(reviewId: string, { senderSessionId }: { senderSessionId?: string } = {}) {
-        const claims = await this.store.updateReview(reviewId, (review) => {
+        const claims = await this.store.updateReview(reviewId, async (review) => {
             if (!review) throw notFound(`Review ${reviewId} not found.`);
             if (isRetiredCommitReview(review)) throw retiredCommitError(review);
             const drafts = allMessages(review).filter((e) => e.message.author === "user" && e.message.delivery?.state === "draft");
             if (!drafts.length) return { write: false, value: [] };
+            await checkBatchImageBudget(this.store, reviewId, drafts.flatMap(({ message }) => message.imageIds ?? []));
             const batchId = randomUUID();
             const value = drafts.map(({ thread, message }) => {
                 const attempt = { attemptId: randomUUID(), attempts: (message.delivery!.attempts ?? 0) + 1 };

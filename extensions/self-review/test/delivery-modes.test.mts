@@ -306,8 +306,10 @@ test("submitting a review sends every draft in one prompt grouped by thread", as
     assert.match(prompt, /^## Thread 2 of 2: file b\.cs$/m);
     assert.match(prompt, /### New user comments\n\*\*Comment 1 of 2:\*\*\nRename this\n\n\*\*Comment 2 of 2:\*\*\nAnd add a test/);
     assert.match(prompt, /### New user comment\nWhy is this needed\?/);
-    assert.ok(prompt.includes(`Reply with threadId \`${earlier.thread.threadId}\` and inReplyTo \`${second.message.messageId}\`.`));
-    assert.ok(prompt.includes(`Reply with threadId \`${other.thread.threadId}\` and inReplyTo \`${other.message.messageId}\`.`));
+    const batchId = (await service.findMessage(reviewId, second.message.messageId)).message.delivery?.batchId;
+    assert.ok(batchId);
+    assert.ok(prompt.includes(`Reply with threadId \`${earlier.thread.threadId}\`, inReplyTo \`${second.message.messageId}\` and batchId \`${batchId}\`.`));
+    assert.ok(prompt.includes(`Reply with threadId \`${other.thread.threadId}\`, inReplyTo \`${other.message.messageId}\` and batchId \`${batchId}\`.`));
     assert.match(prompt, /- \*\*user:\*\* Earlier delivered comment\n- \*\*agent \(answered\):\*\* Earlier agent answer/, "the history carries what the agent already saw");
     assert.equal(displayPrompt, "Review submitted · 3 comments in 2 threads: a.cs, b.cs");
     for (const id of markers) assert.equal(await stateOf(service, reviewId, id), "queued");

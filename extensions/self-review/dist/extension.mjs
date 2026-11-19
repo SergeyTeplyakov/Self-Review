@@ -420,6 +420,7 @@ const actions = [
                 reviewId: reviewIdProp,
                 threadId: { type: "string" },
                 inReplyTo: { type: "string", description: "messageId of the user comment being answered." },
+                batchId: { type: "string", description: "Submission ID from the batch prompt. Omit for an individually delivered comment." },
                 body: { type: "string", description: "Markdown. What changed (files/lines) or the answer." },
                 outcome: { type: "string", enum: OUTCOMES },
                 verification: { type: "string", description: "How the change was verified (build/test command and result)." },
@@ -453,6 +454,7 @@ const actions = [
                 outcome: input.outcome,
                 verification: input.verification,
                 inReplyTo: input.inReplyTo,
+                batchId: input.batchId,
                 lessons: input.lessons,
             });
             let revision = null;

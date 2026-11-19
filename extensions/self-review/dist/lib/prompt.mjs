@@ -281,7 +281,9 @@ export function buildBatchPrompt({ review, groups, instanceId, autoSaveLearnedRu
                 ordinaryThreads.add(thread);
         }
         lines.push("");
-        lines.push(`Reply with threadId \`${thread.threadId}\` and inReplyTo \`${last.messageId}\`.`);
+        const batchId = last.delivery?.submittedBatchId ?? last.delivery?.batchId;
+        const submission = batchId ? ` and batchId \`${batchId}\`` : "";
+        lines.push(`Reply with threadId \`${thread.threadId}\`, inReplyTo \`${last.messageId}\`${submission}.`);
     });
     lines.push("");
     lines.push("## What to do");
@@ -294,7 +296,7 @@ export function buildBatchPrompt({ review, groups, instanceId, autoSaveLearnedRu
     }
     lines.push("4. Reply once in each thread (this is how the user sees your answers):");
     lines.push("   `invoke_canvas_action` with `instanceId: \"" + instanceId + "\"`, `actionName: \"reply\"`, input:");
-    lines.push("   `{ reviewId: \"" + review.reviewId + "\", threadId, inReplyTo, body, outcome: answered|changed|blocked|disagreed|needs-input, verification?" + LESSONS_SHAPE + " }`, with the threadId and inReplyTo listed for that thread.");
+    lines.push("   `{ reviewId: \"" + review.reviewId + "\", threadId, inReplyTo, batchId?, body, outcome: answered|changed|blocked|disagreed|needs-input, verification?" + LESSONS_SHAPE + " }`, with the threadId, inReplyTo, and batchId listed for that thread.");
     lines.push("   One reply covers all of a thread's new comments. Keep each reply short: what you changed (files/lines) or the answer, and how you verified it.");
     lines.push(reopenLine(instanceId, review.reviewId));
     lines.push(RESOLUTION_STEP);

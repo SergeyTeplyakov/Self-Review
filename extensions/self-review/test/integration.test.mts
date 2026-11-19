@@ -541,6 +541,25 @@ test("pasted image bytes survive drafts and reopen, and reach SDK attachment opt
         })));
         assert.ok(received[1].prompt.includes(`${draft.messageId}-image-1`));
         assert.ok(received[1].prompt.includes(`${otherDraft.messageId}-image-1`));
+        const large = Buffer.alloc(2 * 1024 * 1024);
+        png.copy(large);
+        const largeUpload = await fetch(endpoint("comment-images"), { method: "POST", headers, body: new Uint8Array(large) });
+        assert.equal(largeUpload.status, 200);
+        const largeId = (await largeUpload.json() as { imageId: string }).imageId;
+        const drafts: string[] = [];
+        for (let i = 0; i < 9; i++) {
+            const draftResponse = await post("threads", { kind: "overview", body: `Draft ${i}`, imageIds: [largeId], draft: true });
+            assert.equal(draftResponse.status, 200);
+            drafts.push((await draftResponse.json() as { messageId: string }).messageId);
+        }
+        const oversized = await post("submit", {});
+        assert.equal(oversized.status, 400);
+        assert.match(await oversized.text(), /Send some comments individually/);
+        assert.equal(received.length, 2);
+        for (const id of drafts) assert.equal((await reopened.findMessage(reviewId, id)).message.delivery?.state, "draft");
+        const draftToSend = await reopened.findMessage(reviewId, drafts[0]);
+        await reviewDelivery.deliver(reviewId, draftToSend.thread.threadId, drafts[0], "images");
+        assert.equal((await post("submit", {})).status, 200);
     } finally {
         await server.close();
     }
@@ -622,6 +641,44 @@ for (const other of ["/learn Use this layout.", "/explain Why this layout?", "Us
         assert.equal((await getReview()).lessons.find((item) => item.lessonId === accepted.message.lessonIds?.[0])?.sourceMessageId, second.messageId);
     });
 }
+
+test("a late batch reply can cite an individually retried /learn comment", async () => {
+    const { thread, message: learn } = await service.createThread(reviewId, { kind: "overview", body: "/learn Use a predictable layout.", hold: true });
+    const { message: explain } = await service.addMessage(reviewId, thread.threadId, { body: "/explain Why?", hold: true });
+    await service.claimDrafts(reviewId);
+    const batchId = required((await service.findMessage(reviewId, explain.messageId)).message.delivery?.batchId);
+    await service.setDelivery(reviewId, learn.messageId, { state: "no-reply" });
+    assert.ok(await service.claimDelivery(reviewId, thread.threadId, learn.messageId, { retry: true }));
+    await assert.rejects(service.addMessage(reviewId, thread.threadId, {
+        author: "agent", inReplyTo: learn.messageId, batchId: "wrong-batch", body: "Wrong submission.",
+    }), /batchId must identify/);
+    const rule = "Use predictable member layouts.";
+    const response = await service.addMessage(reviewId, thread.threadId, {
+        author: "agent", inReplyTo: explain.messageId, batchId, body: rule,
+        lessons: [{ rule, sourceMessageId: learn.messageId }],
+    });
+    const lesson = required((await getReview()).lessons.find((item) => item.lessonId === response.message.lessonIds?.[0]));
+    assert.equal(lesson.sourceMessageId, learn.messageId);
+    assert.equal((await service.findMessage(reviewId, learn.messageId)).message.delivery?.state, "replied");
+});
+
+test("retrying a saved guideline repairs its journal after an append failure", async (t) => {
+    const { thread, message } = await service.createThread(reviewId, { kind: "overview", body: "/learn Prefer explicit limits." });
+    const rule = "Prefer explicit limits.";
+    const reply = await service.addMessage(reviewId, thread.threadId, {
+        author: "agent", inReplyTo: message.messageId, body: rule, lessons: [{ rule }],
+    });
+    const id = required(reply.message.lessonIds?.[0]);
+    const file = path.join(repo, ".github", "copilot-instructions.md");
+    t.after(() => rm(file, { force: true }));
+    t.mock.method(store, "appendLesson", async () => { throw new Error("Journal unavailable"); }, { times: 1 });
+    await assert.rejects(service.saveLesson(reviewId, id, { rule, scope: "repo" }), /Journal unavailable/);
+    assert.equal((await getReview()).lessons.find((item) => item.lessonId === id)?.status, "saved");
+    assert.equal((await store.readLessons()).find((item) => item.lessonId === id)?.status, "proposed");
+    assert.equal((await service.saveLesson(reviewId, id, { rule, scope: "repo" })).status, "saved");
+    assert.equal((await store.readLessons()).find((item) => item.lessonId === id)?.status, "saved");
+    assert.equal(await readFile(file, "utf8"), `- ${rule}\n`);
+});
 
 test("auto-save verifies a personal guideline in the isolated home, not the repository", async (t) => {
     const home = await mkdtemp(path.join(os.tmpdir(), "self-review-personal-"));

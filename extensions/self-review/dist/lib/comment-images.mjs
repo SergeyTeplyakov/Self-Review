@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { ReviewError } from "../web/contracts.mjs";
 export const MAX_IMAGE_BYTES = 2 * 1024 * 1024;
+const MAX_BATCH_IMAGE_BYTES = 16 * 1024 * 1024;
 const MAX_IMAGES = 4;
 const TYPES = { png: "image/png", jpg: "image/jpeg", gif: "image/gif", webp: "image/webp" };
 function imageType(bytes) {
@@ -59,4 +60,19 @@ export async function commentImageIds(store, reviewId, input) {
     const ids = [...new Set(input)];
     await Promise.all(ids.map((id) => readCommentImage(store, reviewId, id)));
     return ids;
+}
+export async function checkBatchImageBudget(store, reviewId, images) {
+    let total = 0;
+    const sizes = new Map();
+    for (const id of images) {
+        let size = sizes.get(id);
+        if (size === undefined) {
+            size = (await stat(imageLocation(store, reviewId, id).file)).size;
+            sizes.set(id, size);
+        }
+        total += size;
+        if (total > MAX_BATCH_IMAGE_BYTES) {
+            throw new ReviewError("invalid_input", "This review exceeds the 16 MB total image limit. Send some comments individually, then submit the remaining drafts.");
+        }
+    }
 }
