@@ -182,7 +182,8 @@ switches the PR worktree to that fresh tip (detached if another worktree owns
 `main`) and refreshes the All changes canvas so the merged PR diff is no longer
 shown. It removes the local PR branch only when the worktree is clean and the
 branch has no unpushed commits; otherwise it stops and reports without
-discarding work.
+discarding work. If the merge commit is not on `origin/main` after one refetch,
+it defers cleanup and reports the blocker without changing the checkout.
 
 ## Updating
 

@@ -119,7 +119,10 @@ After GitHub confirms the PR is merged:
 1. Record the PR's merge commit, run `git fetch origin`, and verify that merge
    commit is an ancestor of `origin/main` (for example,
    `git merge-base --is-ancestor <merge-commit> origin/main`). If it is not
-   present yet, fetch again and wait; do not switch to a stale `origin/main`.
+   present yet, fetch once more and recheck. If it is still absent (including
+   after a merge into a non-main target), defer cleanup: leave the branch and
+   worktree unchanged, report that the PR merged but cleanup is blocked, and
+   stop. Never wait indefinitely or substitute another checkout destination.
 2. Before changing the checkout, inspect the worktree and the PR branch's
    upstream and compare the local branch with its last verified remote PR head.
    If there is uncommitted or unpushed work, stop and report it; never discard
