@@ -8,7 +8,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
     Delivery, ReviewService, SettingsService, Store, computeReviewId, normalizeRemoteUrl, pathKey,
-    repoIdentity, runGit, scopeOf, startReviewServer,
+    repoIdentity, repoSettings, runGit, scopeOf, selectInstructionMapping, startReviewServer,
 } from "./modules.mjs";
 import type { Review, ReviewService as ReviewServiceType, ReviewThread } from "../src/lib/review-service.mjs";
 import type { Delivery as DeliveryType, SendOptions } from "../src/lib/delivery.mjs";
@@ -50,7 +50,8 @@ after(async () => {
 // Every test gets its own store so reviews, lessons, and settings never leak between tests.
 function fresh(): { store: StoreType; service: ReviewServiceType } {
     const store = new Store(path.join(tmp, `data-${++seq}`));
-    return { store, service: new ReviewService({ store }) };
+    const settings = new SettingsService({ store });
+    return { store, service: new ReviewService({ store, settings }) };
 }
 
 async function waitFor<T>(predicate: () => T | Promise<T>, label: string, timeoutMs = 5000): Promise<Awaited<T>> {
@@ -66,7 +67,7 @@ async function waitFor<T>(predicate: () => T | Promise<T>, label: string, timeou
 interface HttpJson extends Record<string, unknown> {
     review?: { reviewId: string; currentRevisionId: string; scope?: string };
     error?: { code: string; message: string };
-    settings?: { repoName: string; autoSaveLearnedRules: boolean; delivery: string; configured: boolean; dismissed: boolean } | null;
+    settings?: { repoName: string; autoSaveLearnedRules: boolean; delivery: string; instructionMappings: unknown[]; configured: boolean; dismissed: boolean } | null;
     scope?: string;
     reviewId?: string;
     [key: string]: unknown;
@@ -342,8 +343,11 @@ test("committing pending work empties the pending review while the all review ke
 
 test("a proposed guideline is saved by Self-Review or declined by the agent", async (t) => {
     const { store, service } = fresh();
+    const settings = new SettingsService({ store });
     const { reviewId, thread, message } = await commentThread(service);
     const rule = "Prefer early returns over nested conditionals.";
+    const mapping = { pathPrefix: "", instructionRoot: "", splitLanguageSpecific: true };
+    await settings.update(repo, { instructionMappings: [mapping] });
     t.after(() => rm(path.join(repo, ".github"), { recursive: true, force: true }));
 
     const proposal = await agentReply(service, reviewId, thread, { inReplyTo: message.messageId, lessons: [{ rule, status: "proposed" }] });
@@ -352,12 +356,16 @@ test("a proposed guideline is saved by Self-Review or declined by the agent", as
     assert.deepEqual([lesson.status, lesson.scope, lesson.savedTo, lesson.rule], ["proposed", "repo", null, rule], "a proposal is not saved anywhere yet");
     assert.deepEqual(proposal.message.lessonIds, [lesson.lessonId]);
 
-    const saved = await service.saveLesson(reviewId, lesson.lessonId, { rule, scope: "repo" });
+    const saved = await service.saveLesson(reviewId, lesson.lessonId, {
+        rule, scope: "repo", mapping,
+        destination: { kind: "language", language: "csharp", applyTo: "**/*.cs" },
+    });
     const settled = (await service.getReview(reviewId)).lessons;
     assert.equal(settled.length, 1, "the proposal is updated, not duplicated");
     assert.deepEqual([saved.status, saved.savedTo, settled[0].status, settled[0].savedTo, settled[0].rule],
-        ["saved", ".github/copilot-instructions.md", "saved", ".github/copilot-instructions.md", rule]);
-    assert.match(await readFile(path.join(repo, ".github", "copilot-instructions.md"), "utf8"), /- Prefer early returns over nested conditionals\./);
+        ["saved", ".github/instructions/csharp.instructions.md", "saved", ".github/instructions/csharp.instructions.md", rule]);
+    assert.match(await readFile(path.join(repo, ".github", "instructions", "csharp.instructions.md"), "utf8"), /applyTo: "\*\*\/\*\.cs"/);
+    assert.match(await readFile(path.join(repo, ".github", "instructions", "csharp.instructions.md"), "utf8"), /- Prefer early returns over nested conditionals\./);
     assert.ok(settled[0].updatedAt);
 
     await agentReply(service, reviewId, thread, { lessons: [{ rule: "Log the correlation id.", status: "proposed" }] });
@@ -374,6 +382,114 @@ test("a proposed guideline is saved by Self-Review or declined by the agent", as
         lessons.map((l) => [l.lessonId, l.status]),
         "the latest record of each lesson wins",
     );
+});
+
+test("legacy repository proposals recover their reviewed path from the thread before saving", async (t) => {
+    const { store, service } = fresh();
+    const settings = new SettingsService({ store });
+    const { reviewId, thread, message } = await commentThread(service);
+    await settings.update(repo, { instructionMappings: [{ pathPrefix: "", instructionRoot: "", splitLanguageSpecific: true }] });
+    t.after(() => rm(path.join(repo, ".github"), { recursive: true, force: true }));
+
+    await agentReply(service, reviewId, thread, {
+        inReplyTo: message.messageId,
+        lessons: [{ rule: "Keep error paths explicit.", status: "proposed" }],
+    });
+    await store.updateReview(reviewId, (current) => {
+        const review = required(current);
+        delete review.lessons[0].reviewedPath;
+        delete review.lessons[0].destination;
+        return { review };
+    });
+
+    const lesson = await service.getReview(reviewId).then((review) => required(review.lessons[0]));
+    assert.deepEqual(
+        await service.previewLessonDestination(reviewId, lesson.lessonId, {
+            mapping: { pathPrefix: "", instructionRoot: "", splitLanguageSpecific: true },
+            destination: { kind: "language", language: "csharp", applyTo: "**/*.cs" },
+        }),
+        { savedTo: ".github/instructions/csharp.instructions.md", needsConfirmation: true },
+    );
+    const saved = await service.saveLesson(reviewId, lesson.lessonId, { rule: lesson.rule, scope: "repo" });
+    assert.deepEqual([saved.status, saved.reviewedPath, saved.savedTo], ["saved", "a.cs", ".github/instructions/csharp.instructions.md"]);
+    assert.match(await readFile(path.join(repo, ".github", "instructions", "csharp.instructions.md"), "utf8"), /- Keep error paths explicit\./);
+});
+
+test("concurrent instruction-mapping updates preserve additions from different reviews", async () => {
+    const { store } = fresh();
+    const settings = new SettingsService({ store });
+    const first = { pathPrefix: "src/First", instructionRoot: "src/First", splitLanguageSpecific: true };
+    const second = { pathPrefix: "src/Second", instructionRoot: "src/Second", splitLanguageSpecific: false };
+
+    await Promise.all([
+        settings.updateInstructionMappings(repo, (mappings) => [...mappings, first]),
+        settings.updateInstructionMappings(repo, (mappings) => [...mappings, second]),
+    ]);
+
+    assert.deepEqual(
+        (await settings.get(repo)).instructionMappings.sort((a, b) => a.pathPrefix.localeCompare(b.pathPrefix)),
+        [first, second],
+    );
+});
+
+test("instruction-mapping updates reject a merged list over the settings limit without persisting it", async () => {
+    const { store } = fresh();
+    const settings = new SettingsService({ store });
+    const mappings = Array.from({ length: 100 }, (_, index) => ({
+        pathPrefix: `src/Area${index}`, instructionRoot: `src/Area${index}`, splitLanguageSpecific: true,
+    }));
+    await settings.update(repo, { instructionMappings: mappings });
+
+    await assert.rejects(
+        settings.updateInstructionMappings(repo, (current) => [...current, {
+            pathPrefix: "src/Overflow", instructionRoot: "src/Overflow", splitLanguageSpecific: true,
+        }]),
+        (error) => errorHasCode(error, "invalid_input"),
+    );
+    assert.equal((await settings.get(repo)).instructionMappings.length, 100);
+});
+
+test("editing mappings rejects a stale Configure snapshot instead of erasing a concurrent addition", async () => {
+    const { store } = fresh();
+    const settings = new SettingsService({ store });
+    const original = { pathPrefix: "src/Area", instructionRoot: "src/Area", splitLanguageSpecific: true };
+    const concurrent = { pathPrefix: "src/Other", instructionRoot: "src/Other", splitLanguageSpecific: false };
+    const edited = { pathPrefix: "src/Area", instructionRoot: "docs/Area", splitLanguageSpecific: true };
+    await settings.update(repo, { instructionMappings: [original] });
+    await settings.update(repo, { instructionMappings: [original, concurrent] });
+
+    await assert.rejects(
+        settings.update(repo, {
+            instructionMappings: [edited],
+            expectedInstructionMappings: [original],
+        }),
+        (error) => errorHasCode(error, "conflict"),
+    );
+    assert.deepEqual((await settings.get(repo)).instructionMappings, [original, concurrent]);
+});
+
+test("saving rejects a confirmed mapping shadowed by a more-specific entry", async () => {
+    const { store, service } = fresh();
+    const settings = new SettingsService({ store });
+    const { reviewId, thread, message } = await commentThread(service);
+    const specific = { pathPrefix: "a.cs", instructionRoot: "src/Specific", splitLanguageSpecific: true };
+    await settings.update(repo, { instructionMappings: [specific] });
+    await agentReply(service, reviewId, thread, {
+        inReplyTo: message.messageId,
+        lessons: [{ rule: "Keep error paths explicit.", status: "proposed" }],
+    });
+    const lesson = await service.getReview(reviewId).then((review) => required(review.lessons[0]));
+
+    await assert.rejects(
+        service.saveLesson(reviewId, lesson.lessonId, {
+            rule: lesson.rule, scope: "repo",
+            mapping: { pathPrefix: "", instructionRoot: "", splitLanguageSpecific: true },
+            destination: { kind: "general" },
+        }),
+        /shadowed by a more-specific mapping/,
+    );
+    assert.deepEqual((await settings.get(repo)).instructionMappings, [specific]);
+    await assert.rejects(access(path.join(repo, ".github", "copilot-instructions.md")), { code: "ENOENT" });
 });
 
 test("legacy lessons without a status still read as saved", async () => {
@@ -563,6 +679,11 @@ test("local-only bare repository worktrees use the repository name without chang
     const key = `local:${pathKey(path.resolve(worktree, common.stdout.trim()))}`;
     assert.deepEqual(await repoIdentity(bare), { key, name: "local-bare.git" });
     assert.deepEqual(await repoIdentity(worktree), { key, name: "local-bare.git" });
+    const { store } = fresh();
+    const settings = new SettingsService({ store });
+    const mapping = { pathPrefix: "src", instructionRoot: "src", splitLanguageSpecific: false };
+    await settings.update(bare, { instructionMappings: [mapping] });
+    assert.deepEqual((await settings.get(worktree)).instructionMappings, [mapping]);
 });
 
 test("SettingsService defaults learned-rule auto-save off and stores the boolean per repository", async () => {
@@ -571,15 +692,15 @@ test("SettingsService defaults learned-rule auto-save off and stores the boolean
     const other = path.join(tmp, "other-repo");
     await runGit(tmp, ["init", "-q", "-b", "main", other]);
 
-    const initial = { repoName: "proj", autoSaveLearnedRules: false, delivery: "immediate", configured: false, dismissed: false };
+    const initial = { repoName: "proj", autoSaveLearnedRules: false, delivery: "immediate", instructionMappings: [], configured: false, dismissed: false };
     assert.deepEqual(await settings.get(repo), initial);
     assert.deepEqual(await settings.update(repo, { dismissed: true }), { ...initial, dismissed: true }, "dismissing the prompt does not enable auto-save");
     assert.deepEqual(await settings.update(repo, { autoSaveLearnedRules: true }), { ...initial, autoSaveLearnedRules: true, configured: true, dismissed: true });
     assert.deepEqual(await new SettingsService({ store }).get(repo), { ...initial, autoSaveLearnedRules: true, configured: true, dismissed: true }, "the choice is stored, not cached");
     assert.deepEqual(await settings.update(repo, { dismissed: false }), { ...initial, autoSaveLearnedRules: true, configured: true }, "the prompt flag does not touch auto-save");
     assert.deepEqual(await settings.update(repo, { autoSaveLearnedRules: false }), { ...initial, configured: true }, "false is an explicit choice, not the unset state");
-    assert.deepEqual(await settings.get(other), { repoName: "other-repo", autoSaveLearnedRules: false, delivery: "immediate", configured: false, dismissed: false }, "other repositories are unaffected");
-    assert.deepEqual(await settings.update(other, { autoSaveLearnedRules: true }), { repoName: "other-repo", autoSaveLearnedRules: true, delivery: "immediate", configured: true, dismissed: false });
+    assert.deepEqual(await settings.get(other), { repoName: "other-repo", autoSaveLearnedRules: false, delivery: "immediate", instructionMappings: [], configured: false, dismissed: false }, "other repositories are unaffected");
+    assert.deepEqual(await settings.update(other, { autoSaveLearnedRules: true }), { repoName: "other-repo", autoSaveLearnedRules: true, delivery: "immediate", instructionMappings: [], configured: true, dismissed: false });
     assert.equal((await settings.get(repo)).autoSaveLearnedRules, false);
 
     const saved = JSON.parse(await readFile(store.settingsFile(), "utf8"));
@@ -596,17 +717,44 @@ test("SettingsService shares a choice between clones of the same remote", async 
         await runGit(tmp, ["init", "-q", "-b", "main", dir]);
         await git(dir, "remote", "add", "origin", url);
     }
-    await settings.update(first, { autoSaveLearnedRules: true });
-    assert.deepEqual(await settings.get(second), { repoName: "repo", autoSaveLearnedRules: true, delivery: "immediate", configured: true, dismissed: false });
+    const mappings = [
+        { pathPrefix: "", instructionRoot: "", splitLanguageSpecific: true },
+        { pathPrefix: "src/Services", instructionRoot: "src/Services", splitLanguageSpecific: false },
+    ];
+    await settings.update(first, { autoSaveLearnedRules: true, instructionMappings: mappings });
+    assert.deepEqual(await settings.get(second), {
+        repoName: "repo", autoSaveLearnedRules: true, delivery: "immediate", instructionMappings: mappings,
+        pathCaseSensitive: process.platform !== "win32" && process.platform !== "darwin", configured: true, dismissed: false,
+    });
+});
+
+test("instruction mappings select the longest whole path prefix", () => {
+    const root = { pathPrefix: "", instructionRoot: "", splitLanguageSpecific: true };
+    const services = { pathPrefix: "src/Services", instructionRoot: "src/Services", splitLanguageSpecific: false };
+    const nemo = { pathPrefix: "src/Services/NeMo", instructionRoot: "src/Services/NeMo", splitLanguageSpecific: true };
+    assert.equal(selectInstructionMapping([root, services, nemo], "src/Services/NeMo/Rules.cs"), nemo);
+    assert.equal(selectInstructionMapping([root, services, nemo], "src/Services/Nemotron/Rules.cs"), services);
+    assert.equal(selectInstructionMapping([root, services, nemo], "tests/Rules.cs"), root);
+    assert.equal(selectInstructionMapping([services, nemo], "tests/Rules.cs"), null);
+});
+
+test("repository settings accept older payloads without path case metadata", () => {
+    const legacy = {
+        repoName: "repo", autoSaveLearnedRules: false, delivery: "immediate",
+        instructionMappings: [], configured: false, dismissed: false,
+    };
+    assert.deepEqual(repoSettings(legacy), legacy);
+    assert.equal(repoSettings({ ...legacy, pathCaseSensitive: true }).pathCaseSensitive, true);
+    assert.throws(() => repoSettings({ ...legacy, pathCaseSensitive: "yes" }), /Invalid repository settings response/);
 });
 
 test("SettingsService rejects invalid updates without writing anything", async () => {
     const { store } = fresh();
     const settings = new SettingsService({ store });
-    for (const patch of [undefined, {}, { learning: "auto" }, { autoSaveLearnedRules: "yes" }, { autoSaveLearnedRules: null }, { dismissed: "yes" }, { dismissed: 1 }, { dismissed: null }, { autoSaveLearnedRules: true, dismissed: "no" }, { delivery: "later" }, { delivery: null }, { delivery: 1 }, { autoSaveLearnedRules: true, delivery: "later" }]) {
+    for (const patch of [undefined, {}, { learning: "auto" }, { expectedInstructionMappings: [] }, { autoSaveLearnedRules: "yes" }, { autoSaveLearnedRules: null }, { dismissed: "yes" }, { dismissed: 1 }, { dismissed: null }, { autoSaveLearnedRules: true, dismissed: "no" }, { delivery: "later" }, { delivery: null }, { delivery: 1 }, { autoSaveLearnedRules: true, delivery: "later" }]) {
         await assert.rejects(() => settings.update(repo, patch), (error) => errorHasCode(error, "invalid_input"), JSON.stringify(patch));
     }
-    assert.deepEqual(await settings.get(repo), { repoName: "proj", autoSaveLearnedRules: false, delivery: "immediate", configured: false, dismissed: false });
+    assert.deepEqual(await settings.get(repo), { repoName: "proj", autoSaveLearnedRules: false, delivery: "immediate", instructionMappings: [], configured: false, dismissed: false });
     await assert.rejects(() => access(store.settingsFile()), { code: "ENOENT" });
 });
 
@@ -616,13 +764,13 @@ test("an unreadable or hand-edited settings file never blocks reading the effect
     await writeFile(store.settingsFile(), "{ not json");
     const logs: string[] = [];
     const settings = new SettingsService({ store, log: (m) => logs.push(m) });
-    assert.deepEqual(await settings.get(repo), { repoName: "proj", autoSaveLearnedRules: false, delivery: "immediate", configured: false, dismissed: false });
+    assert.deepEqual(await settings.get(repo), { repoName: "proj", autoSaveLearnedRules: false, delivery: "immediate", instructionMappings: [], configured: false, dismissed: false });
     assert.equal(logs.length, 1);
     assert.match(logs[0], /^settings unreadable: /);
 
     const { key } = await repoIdentity(repo);
     await writeFile(store.settingsFile(), JSON.stringify({ version: 1, repos: { [key]: { learning: "loud", promptDismissed: "yes" } } }));
-    assert.deepEqual(await settings.get(repo), { repoName: "proj", autoSaveLearnedRules: false, delivery: "immediate", configured: false, dismissed: false }, "unknown legacy values are ignored");
+    assert.deepEqual(await settings.get(repo), { repoName: "proj", autoSaveLearnedRules: false, delivery: "immediate", instructionMappings: [], configured: false, dismissed: false }, "unknown legacy values are ignored");
 });
 
 test("Delivery hands the repository's auto-save boolean to the prompt and falls back to off when it cannot be read", async () => {
@@ -678,12 +826,12 @@ test("the settings API stores the auto-save boolean per repository and the next 
 
     await withServer({ instanceId: "inst-settings", getReviewId: () => reviewId, service, delivery, settings }, async ({ headers, state, post }) => {
         const initial = await state();
-        assert.deepEqual(initial.settings, { repoName: "proj", autoSaveLearnedRules: false, delivery: "immediate", configured: false, dismissed: false });
+        assert.deepEqual(initial.settings, { repoName: "proj", autoSaveLearnedRules: false, delivery: "immediate", instructionMappings: [], configured: false, dismissed: false });
         assert.equal(required(initial.review).scope, "all");
 
         const chosen = await post("/api/settings", { autoSaveLearnedRules: false });
         assert.equal(chosen.status, 200);
-        assert.deepEqual(chosen.json, { repoName: "proj", autoSaveLearnedRules: false, delivery: "immediate", configured: true, dismissed: false });
+        assert.deepEqual(chosen.json, { repoName: "proj", autoSaveLearnedRules: false, delivery: "immediate", instructionMappings: [], configured: true, dismissed: false });
         assert.deepEqual((await state()).settings, chosen.json);
         assert.deepEqual((await post("/api/settings", { dismissed: true })).json, { ...chosen.json, dismissed: true });
 

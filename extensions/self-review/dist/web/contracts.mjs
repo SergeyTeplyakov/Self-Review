@@ -16,6 +16,32 @@ export function isRecord(value) {
 export function isDeliveryMode(value) {
     return value === "immediate" || value === "batch" || value === "ask";
 }
+function repoRelativePath(value, name) {
+    if (typeof value !== "string" || value.includes("\\") || value.startsWith("/") || /^[a-zA-Z]:/.test(value)
+        || /[\u0000-\u001f]/.test(value) || value.split("/").some((part) => part === "." || part === "..")) {
+        throw new ReviewError("invalid_input", `${name} must be a repository-relative path without traversal.`);
+    }
+    return value.replace(/\/+$/, "");
+}
+function parseInstructionMappings(value) {
+    if (!Array.isArray(value) || value.length > 100) {
+        throw new ReviewError("invalid_input", "instructionMappings must be an array of at most 100 mappings.");
+    }
+    const mappings = value.map((mapping) => {
+        if (!isRecord(mapping) || typeof mapping.splitLanguageSpecific !== "boolean") {
+            throw new ReviewError("invalid_input", "Each instruction mapping requires a splitLanguageSpecific boolean.");
+        }
+        return {
+            pathPrefix: repoRelativePath(mapping.pathPrefix, "pathPrefix"),
+            instructionRoot: repoRelativePath(mapping.instructionRoot, "instructionRoot"),
+            splitLanguageSpecific: mapping.splitLanguageSpecific,
+        };
+    });
+    if (new Set(mappings.map((mapping) => mapping.pathPrefix)).size !== mappings.length) {
+        throw new ReviewError("invalid_input", "Instruction mapping path prefixes must be unique.");
+    }
+    return mappings;
+}
 export function reviewOptions(input) {
     if (!isRecord(input) || !Array.isArray(input.models) || input.models.length < 1 || input.models.length > 4) {
         throw new ReviewError("invalid_input", `Choose one to four distinct reviewers: exact model IDs or ${FUSION_REVIEWER}.`);
@@ -47,8 +73,9 @@ export function agentReviewDefaults(defaults) {
     return { ...options, skipDialog: defaults.skipDialog };
 }
 export function settingsPatch(value) {
-    if (!isRecord(value) || (value.autoSaveLearnedRules === undefined && value.delivery === undefined && value.dismissed === undefined)) {
-        throw new ReviewError("invalid_input", "Provide autoSaveLearnedRules, delivery, or dismissed.");
+    if (!isRecord(value) || (value.autoSaveLearnedRules === undefined && value.delivery === undefined
+        && value.dismissed === undefined && value.instructionMappings === undefined)) {
+        throw new ReviewError("invalid_input", "Provide autoSaveLearnedRules, delivery, dismissed, or instructionMappings.");
     }
     if (value.autoSaveLearnedRules !== undefined && typeof value.autoSaveLearnedRules !== "boolean") {
         throw new ReviewError("invalid_input", "autoSaveLearnedRules must be a boolean.");
@@ -59,7 +86,16 @@ export function settingsPatch(value) {
     if (value.dismissed !== undefined && typeof value.dismissed !== "boolean") {
         throw new ReviewError("invalid_input", "dismissed must be a boolean.");
     }
-    return { autoSaveLearnedRules: value.autoSaveLearnedRules, delivery: value.delivery, dismissed: value.dismissed };
+    if (value.expectedInstructionMappings !== undefined && value.instructionMappings === undefined) {
+        throw new ReviewError("invalid_input", "expectedInstructionMappings requires instructionMappings.");
+    }
+    return {
+        autoSaveLearnedRules: value.autoSaveLearnedRules, delivery: value.delivery, dismissed: value.dismissed,
+        instructionMappings: value.instructionMappings === undefined ? undefined : parseInstructionMappings(value.instructionMappings),
+        expectedInstructionMappings: value.expectedInstructionMappings === undefined
+            ? undefined
+            : parseInstructionMappings(value.expectedInstructionMappings),
+    };
 }
 export function settingsDocument(value) {
     if (value === null)
@@ -76,6 +112,14 @@ export function settingsDocument(value) {
             || (entry.updatedAt !== undefined && typeof entry.updatedAt !== "string")) {
             throw new Error(`Invalid settings for repository ${key}.`);
         }
+        if (entry.instructionMappings !== undefined) {
+            try {
+                entry.instructionMappings = parseInstructionMappings(entry.instructionMappings);
+            }
+            catch (error) {
+                throw new Error(`Invalid instruction mappings for repository ${key}: ${error instanceof Error ? error.message : String(error)}`);
+            }
+        }
         repos.set(key, entry);
     }
     return { ...value, version: value.version, repos: Object.fromEntries(repos) };
@@ -83,11 +127,15 @@ export function settingsDocument(value) {
 export function repoSettings(value) {
     if (!isRecord(value) || typeof value.repoName !== "string"
         || typeof value.autoSaveLearnedRules !== "boolean" || !isDeliveryMode(value.delivery)
-        || typeof value.configured !== "boolean" || typeof value.dismissed !== "boolean") {
+        || typeof value.configured !== "boolean" || typeof value.dismissed !== "boolean"
+        || (value.pathCaseSensitive !== undefined && typeof value.pathCaseSensitive !== "boolean")) {
         throw new Error("Invalid repository settings response.");
     }
+    const instructionMappings = value.instructionMappings === undefined ? [] : parseInstructionMappings(value.instructionMappings);
     return {
         repoName: value.repoName, autoSaveLearnedRules: value.autoSaveLearnedRules, delivery: value.delivery,
+        instructionMappings,
+        ...(value.pathCaseSensitive !== undefined ? { pathCaseSensitive: value.pathCaseSensitive } : {}),
         configured: value.configured, dismissed: value.dismissed,
     };
 }
