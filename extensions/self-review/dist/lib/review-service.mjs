@@ -565,7 +565,15 @@ export class ReviewService extends EventEmitter {
                 return { write: false, value: null };
             if (created)
                 await this.store.writeSnapshot(reviewId, revisionId, { revisionId, ...snapshot });
-            return { review, value: { revisionId: revisionId, created, moved } };
+            return {
+                review,
+                value: { revisionId: revisionId, created, moved },
+                publication: isCurrent ? {
+                    isCurrent,
+                    discardedValue: null,
+                    discard: created ? () => this.store.discardSnapshot(reviewId, revisionId) : undefined,
+                } : undefined,
+            };
         });
         if (!result)
             return null;

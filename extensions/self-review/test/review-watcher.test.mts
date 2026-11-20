@@ -1,10 +1,12 @@
 import { test } from "node:test";
 import type { TestContext } from "node:test";
 import assert from "node:assert/strict";
+import { readdirSync } from "node:fs";
 import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { setTimeout as realDelay } from "node:timers/promises";
 import { captureSnapshot, Delivery, ReviewService, ReviewWatcher, Store, runGit, startReviewServer } from "./modules.mjs";
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -25,7 +27,8 @@ async function fixture(t: TestContext) {
     await writeFile(path.join(repo, ".gitignore"), "node_modules/\nbuild/\n");
     await git("add", ".");
     await git("commit", "-qm", "base");
-    const service = new ReviewService({ store: new Store(path.join(tmp, "data")) });
+    const store = new Store(path.join(tmp, "data"));
+    const service = new ReviewService({ store });
     const id = await service.ensureReview({ repoPath: repo, scope: "pending", exclude: ["excluded.ts"] });
     let refreshes = 0;
     const logs: string[] = [];
@@ -34,7 +37,7 @@ async function fixture(t: TestContext) {
         refresh: async (id, current) => { refreshes++; return service.refresh(id, current); },
     }, (text) => logs.push(text), 100);
     t.after(async () => { await watcher.close(); await rm(tmp, { recursive: true, force: true }); });
-    return { tmp, repo, git, service, id, watcher, logs, count: () => refreshes };
+    return { tmp, repo, git, store, service, id, watcher, logs, count: () => refreshes };
 }
 
 test("pending and all match Git's inventory and patch without counting CRLF index stat mismatches", async (t) => {
@@ -142,6 +145,70 @@ test("debounce waits for the last event and releases every watcher and pending t
     assert.equal(calls, 3, "close cancels the queued refresh");
     assert.ok([...sources.values()].every((entry) => entry.closed));
 });
+
+test("ignored writes do not delay publication of a settled tracked edit", async (t) => {
+    const f = await fixture(t);
+    await mkdir(path.join(f.repo, "build"));
+    let change: (file: string) => void = () => assert.fail("checkout watcher not registered");
+    const published: number[] = [];
+    const watcher = new ReviewWatcher({
+        getReview: (id) => f.service.getReview(id),
+        refresh: async (id, current) => {
+            // Even an ignored event delivered during capture must not invalidate it.
+            if (published.length) change("build/noise.log");
+            const result = await f.service.refresh(id, current);
+            if (result) published.push((await f.service.getReview(id)).git!.uncommittedFiles);
+        },
+    }, (text) => f.logs.push(text), 100, (root, callback) => {
+        if (root === f.repo) change = callback;
+        return { close() {} };
+    });
+    t.after(() => watcher.close());
+    await watcher.setReview(f.id);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    await writeFile(path.join(f.repo, "file.ts"), "tracked edit\n");
+    change("file.ts");
+    for (let i = 0; i < 10; i++) {
+        await appendFile(path.join(f.repo, "build", "noise.log"), "ignored write\n");
+        change("build/noise.log");
+        t.mock.timers.tick(20);
+    }
+    // Let Git finish without advancing the mocked clock past the last noise event.
+    const deadline = Date.now() + 5000;
+    while (published.length < 2 && Date.now() < deadline) await realDelay(25);
+    assert.deepEqual(published, [0, 1]);
+});
+
+for (const phase of ["snapshot", "metadata"] as const) {
+    test(`invalidation during ${phase} persistence preserves the visible revision`, async (t) => {
+        const f = await fixture(t);
+        const before = await f.service.getReview(f.id);
+        await writeFile(path.join(f.repo, "file.ts"), "transient contents\n");
+        let current = true;
+        const writer = phase === "snapshot" ? (() => {
+            const writeSnapshot = f.store.writeSnapshot.bind(f.store);
+            return t.mock.method(f.store, "writeSnapshot", async (...args: Parameters<typeof writeSnapshot>) => {
+                await writeSnapshot(...args);
+                current = false;
+            });
+        })() : undefined;
+        const metadata = f.store.reviewFile(f.id);
+        const result = await f.service.refresh(f.id, () => {
+            if (phase === "metadata" && readdirSync(path.dirname(metadata)).some((name) =>
+                name.startsWith(`${path.basename(metadata)}.`) && name.endsWith(".tmp"))) current = false;
+            return current;
+        });
+        assert.equal(result, null);
+        assert.equal(current, false, "the capture was invalidated at the intended persistence boundary");
+        assert.deepEqual(await f.service.getReview(f.id), before);
+        assert.equal(await f.store.readSnapshot(f.id, "r2"), null);
+        assert.equal(readdirSync(path.dirname(metadata)).some((name) => name.endsWith(".tmp")), false);
+        writer?.mock.restore();
+        await writeFile(path.join(f.repo, "file.ts"), "settled contents\n");
+        const settled = await f.service.refresh(f.id, () => true);
+        assert.equal(settled?.revisionId, "r2", "the cancelled revision was not published");
+    });
+}
 
 test("repeated dist rebuilds never publish transient uncommitted counts", async (t) => {
     const f = await fixture(t);

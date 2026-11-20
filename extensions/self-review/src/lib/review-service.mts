@@ -758,7 +758,15 @@ export class ReviewService extends EventEmitter {
             const moved = await this.relocateThreads(review, revisionId!, snapshot.baseCommit);
             if (isCurrent && !isCurrent()) return { write: false, value: null };
             if (created) await this.store.writeSnapshot(reviewId, revisionId!, { revisionId, ...snapshot });
-            return { review, value: { revisionId: revisionId!, created, moved } };
+            return {
+                review,
+                value: { revisionId: revisionId!, created, moved },
+                publication: isCurrent ? {
+                    isCurrent,
+                    discardedValue: null,
+                    discard: created ? () => this.store.discardSnapshot(reviewId, revisionId!) : undefined,
+                } : undefined,
+            };
         });
         if (!result) return null;
         if (result.created || result.moved) this.changed(reviewId, "revision");

@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { watch } from "node:fs";
 import { lstat } from "node:fs/promises";
 import path from "node:path";
@@ -90,6 +91,27 @@ export class ReviewWatcher {
                 await this.service.refresh(reviewId, isCurrent);
                 if (isCurrent())
                     needsRefresh = false;
+            };
+            const isIgnored = (file) => {
+                if (matchesPaths([known], [file]))
+                    return false;
+                let parent = path.posix.dirname(file);
+                while (parent !== "." && !known.submodules.has(parent))
+                    parent = path.posix.dirname(parent);
+                const relative = parent === "." ? file : path.posix.relative(parent, file);
+                const nested = known.submoduleFiles.get(parent);
+                if (nested && matchesPaths([nested], [relative]))
+                    return false;
+                // Classify unknown paths before they can invalidate a capture. Use the
+                // current index and ignore rules, not a cache that could miss rule changes.
+                const result = spawnSync("git", ["check-ignore", "-z", "--stdin"], {
+                    cwd: path.join(review.repoRoot, parent),
+                    input: `${relative}\0`,
+                    env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
+                    windowsHide: true,
+                });
+                // Only discard an event if Git confirms it is ignored.
+                return result.status === 0;
             };
             const add = (root, metadata) => {
                 const flush = () => {
@@ -209,6 +231,8 @@ export class ReviewWatcher {
                         return;
                     const file = filename?.replace(/\\/g, "/") ?? "";
                     if (metadata ? file && !gitInput(file) : file.split("/").includes(".git"))
+                        return;
+                    if (!metadata && file && isIgnored(file))
                         return;
                     eventVersion++;
                     const absolute = path.join(root, file);
