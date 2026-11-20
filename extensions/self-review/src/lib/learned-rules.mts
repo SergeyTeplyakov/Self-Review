@@ -39,17 +39,31 @@ function globRegex(glob: string): RegExp {
     return new RegExp(`^${escaped}$`);
 }
 
-function appliesTo(pattern: string, filePath: string): boolean {
-    const file = filePath.replace(/\\/g, "/").replace(/^\.\/+/, "");
-    return globRegex(pattern.replace(/\\/g, "/")).test(file);
+function applyToPatterns(value: string): string[] {
+    return value.split(",").map((pattern) => pattern.trim()).filter(Boolean);
 }
 
-function applyToFrom(contents: string): string | null {
+function appliesTo(pattern: string | string[], filePath: string): boolean {
+    const file = filePath.replace(/\\/g, "/").replace(/^\.\/+/, "");
+    const patterns = typeof pattern === "string" ? applyToPatterns(pattern) : pattern;
+    return patterns.some((item) => globRegex(item.replace(/\\/g, "/")).test(file));
+}
+
+function applyToFrom(contents: string): string[] | null {
     const frontMatter = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(contents)?.[1];
     const entry = frontMatter?.split(/\r?\n/).find((line) => /^\s*applyTo\s*:\s*/.test(line));
-    const value = entry?.replace(/^\s*applyTo\s*:\s*/, "").trim();
+    let value = entry?.replace(/^\s*applyTo\s*:\s*/, "").trim();
     if (!value) return null;
-    return value.replace(/^(['"])(.*)\1$/, "$2");
+    if (value.startsWith('"') || value.startsWith("'")) {
+        const quote = value.charAt(0);
+        const closingQuote = value.indexOf(quote, 1);
+        if (closingQuote <= 0 || (value.slice(closingQuote + 1).trim() && !/^\s+#/.test(value.slice(closingQuote + 1)))) return null;
+        value = value.slice(1, closingQuote);
+    } else {
+        value = value.replace(/\s+#.*$/, "").trim();
+    }
+    const patterns = applyToPatterns(value);
+    return patterns.length ? patterns : null;
 }
 
 function safeRelativePath(value: string): string[] {
@@ -60,7 +74,7 @@ function safeRelativePath(value: string): string[] {
     return value ? value.split("/") : [];
 }
 
-async function ensureSafeDirectory(repoRoot: string, relative: string): Promise<string> {
+async function ensureSafeDirectory(repoRoot: string, relative: string, create = true): Promise<string | null> {
     const root = await realpath(repoRoot);
     const parts = safeRelativePath(relative);
     let current = root;
@@ -73,6 +87,7 @@ async function ensureSafeDirectory(repoRoot: string, relative: string): Promise<
             }
         } catch (error) {
             if (!isMissing(error)) throw error;
+            if (!create) return null;
             try {
                 await mkdir(current);
             } catch (createError) {
@@ -125,78 +140,114 @@ function validateDestination(destination: RuleDestination): RuleDestination {
     if (destination.kind === "general") return destination;
     if (destination.kind !== "language" || !destination.language || !/^[a-z0-9][a-z0-9-]{0,39}$/i.test(destination.language)
         || !destination.applyTo || destination.applyTo.length > 240
-        || /[\u0000-\u001f]/.test(destination.applyTo) || destination.applyTo.startsWith("/")) {
-        throw new ReviewError("invalid_input", "A language-specific guideline needs a language and repository-relative applyTo pattern.");
+        || /[\u0000-\u001f"\\]/.test(destination.applyTo) || destination.applyTo.startsWith("/")) {
+        throw new ReviewError("invalid_input", "A language-specific guideline needs a language and a repository-relative applyTo pattern without quotes or backslashes.");
     }
     return destination;
+}
+
+interface ResolvedRuleDestination {
+    file: string;
+    savedTo: string;
+    createScopedFile: boolean;
+}
+
+async function resolveRepositoryRuleDestination(
+    repoRoot: string,
+    mapping: InstructionMapping,
+    reviewedPath: string,
+    destinationInput: RuleDestination,
+    createDirectories: boolean,
+): Promise<ResolvedRuleDestination> {
+    const destination = validateDestination(destinationInput);
+    if (destination.kind === "language" && reviewedPath && !appliesTo(destination.applyTo!, reviewedPath)) {
+        throw new ReviewError("invalid_input", `The applyTo pattern does not cover ${reviewedPath}.`);
+    }
+    const instructionRoot = safeRelativePath(mapping.instructionRoot).join("/");
+    const rootLabel = instructionRoot ? `${instructionRoot}/` : "";
+    const scopedDirectoryRelative = `${rootLabel}.github/instructions`;
+    const scopedDirectory = destination.kind === "language"
+        ? await ensureSafeDirectory(repoRoot, scopedDirectoryRelative, createDirectories)
+        : null;
+    const scoped = destination.kind === "language" && !mapping.splitLanguageSpecific && scopedDirectory
+        ? await matchingScopedFile(scopedDirectory, reviewedPath)
+        : null;
+    let createScopedFile = false;
+
+    if (destination.kind === "language" && mapping.splitLanguageSpecific) {
+        const name = `${destination.language}.instructions.md`;
+        const relativeFile = `${scopedDirectoryRelative}/${name}`;
+        const file = path.join(repoRoot, ...safeRelativePath(relativeFile));
+        const contents = scopedDirectory ? await readInstructionFile(file) : null;
+        if (contents === null) {
+            createScopedFile = true;
+        } else {
+            const pattern = applyToFrom(contents);
+            if (!pattern || (reviewedPath && !appliesTo(pattern, reviewedPath))) {
+                throw new ReviewError("conflict", `The existing ${relativeFile} does not apply to ${reviewedPath}.`);
+            }
+        }
+        return { file, savedTo: relativeFile, createScopedFile };
+    } else if (destination.kind === "language" && scoped) {
+        return {
+            file: scoped.file,
+            savedTo: `${scopedDirectoryRelative}/${path.basename(scoped.file)}`,
+            createScopedFile: false,
+        };
+    }
+
+    const generalRelative = `${rootLabel}.github/copilot-instructions.md`;
+    const generalDirectory = await ensureSafeDirectory(repoRoot, `${rootLabel}.github`, createDirectories);
+    const file = path.join(repoRoot, ...safeRelativePath(generalRelative));
+    if (generalDirectory) await readInstructionFile(file);
+    return { file, savedTo: generalRelative, createScopedFile: false };
+}
+
+export async function previewRepositoryRuleDestination(
+    repoRoot: string,
+    mapping: InstructionMapping,
+    reviewedPath: string,
+    destination: RuleDestination,
+): Promise<{ savedTo: string; needsConfirmation: boolean }> {
+    const resolved = await resolveRepositoryRuleDestination(repoRoot, mapping, reviewedPath, destination, false);
+    return { savedTo: resolved.savedTo, needsConfirmation: resolved.createScopedFile };
 }
 
 export async function saveRepositoryRule(
     repoRoot: string,
     mapping: InstructionMapping,
     reviewedPath: string,
-    destinationInput: RuleDestination,
+    destination: RuleDestination,
     rule: string,
     confirmedNewFile: boolean,
     lock: <T>(key: string, action: () => Promise<T>) => Promise<T>,
+    expectedSavedTo?: string,
 ): Promise<{ savedTo: string; needsConfirmation: boolean }> {
-    const destination = validateDestination(destinationInput);
-    const instructionRoot = safeRelativePath(mapping.instructionRoot).join("/");
-    const mappedRoot = await ensureSafeDirectory(repoRoot, instructionRoot);
-    const rootLabel = instructionRoot ? `${instructionRoot}/` : "";
-    const generalRelative = `${rootLabel}.github/copilot-instructions.md`;
-    const scopedDirectoryRelative = `${rootLabel}.github/instructions`;
-    const scopedDirectory = destination.kind === "language"
-        ? await ensureSafeDirectory(repoRoot, scopedDirectoryRelative)
-        : null;
-    const scoped = destination.kind === "language" && !mapping.splitLanguageSpecific && scopedDirectory
-        ? await matchingScopedFile(scopedDirectory, reviewedPath)
-        : null;
-    let file: string;
-    let relativeFile: string;
-    let contents: string | null;
-    let createScopedFile = false;
-
-    if (destination.kind === "language" && mapping.splitLanguageSpecific) {
-        if (!scopedDirectory) throw new ReviewError("invalid_input", "The scoped instruction directory is unavailable.");
-        if (scoped) {
-            file = scoped.file;
-            contents = scoped.contents;
-            relativeFile = `${scopedDirectoryRelative}/${path.basename(file)}`;
-        } else {
-            const name = `${destination.language}.instructions.md`;
-            file = path.join(scopedDirectory, name);
-            relativeFile = `${scopedDirectoryRelative}/${name}`;
-            contents = await readInstructionFile(file);
-            if (contents === null) {
-                createScopedFile = true;
-            } else {
-                const pattern = applyToFrom(contents);
-                if (!pattern || !appliesTo(pattern, reviewedPath)) {
-                    throw new ReviewError("conflict", `The existing ${relativeFile} does not apply to ${reviewedPath}.`);
+    const resolved = await resolveRepositoryRuleDestination(repoRoot, mapping, reviewedPath, destination, false);
+    if (resolved.createScopedFile && !confirmedNewFile) return { savedTo: resolved.savedTo, needsConfirmation: true };
+    if (expectedSavedTo !== undefined && expectedSavedTo !== resolved.savedTo) {
+        throw new ReviewError("conflict", `The instruction destination changed to ${resolved.savedTo}. Review and confirm the updated destination.`);
+    }
+    const file = resolved.file;
+    await lock(`guideline-file:${file}`, async () => {
+        await ensureSafeDirectory(repoRoot, path.posix.dirname(resolved.savedTo));
+        const current = await readInstructionFile(file);
+        if (destination.kind === "language" && mapping.splitLanguageSpecific) {
+            if (current === null && !resolved.createScopedFile) {
+                throw new ReviewError("conflict", `The instruction destination changed to ${resolved.savedTo}. Review and confirm the updated destination.`);
+            }
+            if (current !== null) {
+                const pattern = applyToFrom(current);
+                if (!pattern || (reviewedPath && !appliesTo(pattern, reviewedPath))) {
+                    throw new ReviewError("conflict", `The existing ${resolved.savedTo} does not apply to ${reviewedPath}.`);
                 }
             }
         }
-    } else if (destination.kind === "language" && scoped) {
-        file = scoped.file;
-        contents = scoped.contents;
-        relativeFile = `${scopedDirectoryRelative}/${path.basename(file)}`;
-    } else {
-        file = path.join(mappedRoot, ".github", "copilot-instructions.md");
-        relativeFile = generalRelative;
-        const generalDirectory = await ensureSafeDirectory(repoRoot, `${rootLabel}.github`);
-        file = path.join(generalDirectory, "copilot-instructions.md");
-        contents = await readInstructionFile(file);
-    }
-
-    if (createScopedFile && !confirmedNewFile) return { savedTo: relativeFile, needsConfirmation: true };
-    await lock(`guideline-file:${file}`, async () => {
-        const current = await readInstructionFile(file);
-        const text = current ?? contents ?? "";
+        const text = current ?? "";
         const containsRule = text.split(/\r?\n/).some((line) => line.trim().replace(/^(?:[-*+]|\d+\.)\s+/, "") === rule);
         if (!containsRule) {
             const newline = text.includes("\r\n") ? "\r\n" : "\n";
-            if (createScopedFile && current === null) {
+            if (resolved.createScopedFile && current === null) {
                 await appendFile(file, `---${newline}applyTo: "${destination.applyTo}"${newline}---${newline}${newline}- ${rule}${newline}`, "utf8");
             } else {
                 await appendFile(file, `${text ? (text.endsWith("\n") ? newline : newline + newline) : ""}- ${rule}${newline}`, "utf8");
@@ -207,5 +258,5 @@ export async function saveRepositoryRule(
             throw new ReviewError("conflict", "Could not verify the saved guideline.");
         }
     });
-    return { savedTo: relativeFile, needsConfirmation: false };
+    return { savedTo: resolved.savedTo, needsConfirmation: false };
 }

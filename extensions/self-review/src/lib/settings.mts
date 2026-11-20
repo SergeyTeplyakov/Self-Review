@@ -74,9 +74,14 @@ export function normalizeRemoteUrl(url: unknown): string {
 }
 
 // Case-insensitive file systems (the Windows and macOS defaults) fold a path's case; others keep it.
+/** @param {string} [platform] */
+export function pathCaseSensitive(platform = process.platform): boolean {
+    return platform !== "win32" && platform !== "darwin";
+}
+
 /** @param {string} p @param {string} [platform] */
 export function pathKey(p: string, platform = process.platform): string {
-    return platform === "win32" || platform === "darwin" ? p.toLowerCase() : p;
+    return pathCaseSensitive(platform) ? p : p.toLowerCase();
 }
 
 export function selectInstructionMapping(mappings: InstructionMapping[], reviewedPath: string): InstructionMapping | null {
@@ -184,11 +189,13 @@ export class SettingsService {
             this.log(`settings unreadable: ${err instanceof Error ? err.message : String(err)}`);
         }
         const autoSave = storedAutoSave(entry);
+        const instructionMappings = storedInstructionMappings(entry);
         return {
             repoName: identity.name,
             autoSaveLearnedRules: autoSave ?? false,
             delivery: isDeliveryMode(entry?.delivery) ? entry.delivery : DEFAULT_DELIVERY,
-            instructionMappings: storedInstructionMappings(entry),
+            instructionMappings,
+            ...(instructionMappings.length ? { pathCaseSensitive: pathCaseSensitive() } : {}),
             configured: autoSave !== undefined,
             dismissed: entry?.promptDismissed === true,
         };
@@ -207,9 +214,28 @@ export class SettingsService {
             }
             if (patch.delivery !== undefined) entry.delivery = patch.delivery;
             if (patch.dismissed !== undefined) entry.promptDismissed = patch.dismissed;
-            if (patch.instructionMappings !== undefined) entry.instructionMappings = patch.instructionMappings;
+            if (patch.instructionMappings !== undefined) {
+                if (patch.expectedInstructionMappings !== undefined
+                    && JSON.stringify(storedInstructionMappings(entry)) !== JSON.stringify(patch.expectedInstructionMappings)) {
+                    throw new ReviewError("conflict", "Repository instruction mappings changed while Settings was open. Reopen Settings and reapply the changes.");
+                }
+                entry.instructionMappings = patch.instructionMappings;
+            }
             settings.repos[identity.key] = { ...entry, name: identity.name, updatedAt: new Date().toISOString() };
         });
         return this.get(repoRoot);
+    }
+
+    async updateInstructionMappings(
+        repoRoot: string,
+        update: (mappings: InstructionMapping[]) => InstructionMapping[],
+    ): Promise<void> {
+        const identity = await repoIdentity(repoRoot, this.git);
+        await this.store.updateSettings((settings) => {
+            const entry = { ...settings.repos[identity.key] };
+            const mappings = update(storedInstructionMappings(entry));
+            entry.instructionMappings = settingsPatch({ instructionMappings: mappings }).instructionMappings!;
+            settings.repos[identity.key] = { ...entry, name: identity.name, updatedAt: new Date().toISOString() };
+        });
     }
 }

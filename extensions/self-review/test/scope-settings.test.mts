@@ -8,7 +8,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
     Delivery, ReviewService, SettingsService, Store, computeReviewId, normalizeRemoteUrl, pathKey,
-    repoIdentity, runGit, scopeOf, selectInstructionMapping, startReviewServer,
+    repoIdentity, repoSettings, runGit, scopeOf, selectInstructionMapping, startReviewServer,
 } from "./modules.mjs";
 import type { Review, ReviewService as ReviewServiceType, ReviewThread } from "../src/lib/review-service.mjs";
 import type { Delivery as DeliveryType, SendOptions } from "../src/lib/delivery.mjs";
@@ -384,6 +384,114 @@ test("a proposed guideline is saved by Self-Review or declined by the agent", as
     );
 });
 
+test("legacy repository proposals recover their reviewed path from the thread before saving", async (t) => {
+    const { store, service } = fresh();
+    const settings = new SettingsService({ store });
+    const { reviewId, thread, message } = await commentThread(service);
+    await settings.update(repo, { instructionMappings: [{ pathPrefix: "", instructionRoot: "", splitLanguageSpecific: true }] });
+    t.after(() => rm(path.join(repo, ".github"), { recursive: true, force: true }));
+
+    await agentReply(service, reviewId, thread, {
+        inReplyTo: message.messageId,
+        lessons: [{ rule: "Keep error paths explicit.", status: "proposed" }],
+    });
+    await store.updateReview(reviewId, (current) => {
+        const review = required(current);
+        delete review.lessons[0].reviewedPath;
+        delete review.lessons[0].destination;
+        return { review };
+    });
+
+    const lesson = await service.getReview(reviewId).then((review) => required(review.lessons[0]));
+    assert.deepEqual(
+        await service.previewLessonDestination(reviewId, lesson.lessonId, {
+            mapping: { pathPrefix: "", instructionRoot: "", splitLanguageSpecific: true },
+            destination: { kind: "language", language: "csharp", applyTo: "**/*.cs" },
+        }),
+        { savedTo: ".github/instructions/csharp.instructions.md", needsConfirmation: true },
+    );
+    const saved = await service.saveLesson(reviewId, lesson.lessonId, { rule: lesson.rule, scope: "repo" });
+    assert.deepEqual([saved.status, saved.reviewedPath, saved.savedTo], ["saved", "a.cs", ".github/instructions/csharp.instructions.md"]);
+    assert.match(await readFile(path.join(repo, ".github", "instructions", "csharp.instructions.md"), "utf8"), /- Keep error paths explicit\./);
+});
+
+test("concurrent instruction-mapping updates preserve additions from different reviews", async () => {
+    const { store } = fresh();
+    const settings = new SettingsService({ store });
+    const first = { pathPrefix: "src/First", instructionRoot: "src/First", splitLanguageSpecific: true };
+    const second = { pathPrefix: "src/Second", instructionRoot: "src/Second", splitLanguageSpecific: false };
+
+    await Promise.all([
+        settings.updateInstructionMappings(repo, (mappings) => [...mappings, first]),
+        settings.updateInstructionMappings(repo, (mappings) => [...mappings, second]),
+    ]);
+
+    assert.deepEqual(
+        (await settings.get(repo)).instructionMappings.sort((a, b) => a.pathPrefix.localeCompare(b.pathPrefix)),
+        [first, second],
+    );
+});
+
+test("instruction-mapping updates reject a merged list over the settings limit without persisting it", async () => {
+    const { store } = fresh();
+    const settings = new SettingsService({ store });
+    const mappings = Array.from({ length: 100 }, (_, index) => ({
+        pathPrefix: `src/Area${index}`, instructionRoot: `src/Area${index}`, splitLanguageSpecific: true,
+    }));
+    await settings.update(repo, { instructionMappings: mappings });
+
+    await assert.rejects(
+        settings.updateInstructionMappings(repo, (current) => [...current, {
+            pathPrefix: "src/Overflow", instructionRoot: "src/Overflow", splitLanguageSpecific: true,
+        }]),
+        (error) => errorHasCode(error, "invalid_input"),
+    );
+    assert.equal((await settings.get(repo)).instructionMappings.length, 100);
+});
+
+test("editing mappings rejects a stale Configure snapshot instead of erasing a concurrent addition", async () => {
+    const { store } = fresh();
+    const settings = new SettingsService({ store });
+    const original = { pathPrefix: "src/Area", instructionRoot: "src/Area", splitLanguageSpecific: true };
+    const concurrent = { pathPrefix: "src/Other", instructionRoot: "src/Other", splitLanguageSpecific: false };
+    const edited = { pathPrefix: "src/Area", instructionRoot: "docs/Area", splitLanguageSpecific: true };
+    await settings.update(repo, { instructionMappings: [original] });
+    await settings.update(repo, { instructionMappings: [original, concurrent] });
+
+    await assert.rejects(
+        settings.update(repo, {
+            instructionMappings: [edited],
+            expectedInstructionMappings: [original],
+        }),
+        (error) => errorHasCode(error, "conflict"),
+    );
+    assert.deepEqual((await settings.get(repo)).instructionMappings, [original, concurrent]);
+});
+
+test("saving rejects a confirmed mapping shadowed by a more-specific entry", async () => {
+    const { store, service } = fresh();
+    const settings = new SettingsService({ store });
+    const { reviewId, thread, message } = await commentThread(service);
+    const specific = { pathPrefix: "a.cs", instructionRoot: "src/Specific", splitLanguageSpecific: true };
+    await settings.update(repo, { instructionMappings: [specific] });
+    await agentReply(service, reviewId, thread, {
+        inReplyTo: message.messageId,
+        lessons: [{ rule: "Keep error paths explicit.", status: "proposed" }],
+    });
+    const lesson = await service.getReview(reviewId).then((review) => required(review.lessons[0]));
+
+    await assert.rejects(
+        service.saveLesson(reviewId, lesson.lessonId, {
+            rule: lesson.rule, scope: "repo",
+            mapping: { pathPrefix: "", instructionRoot: "", splitLanguageSpecific: true },
+            destination: { kind: "general" },
+        }),
+        /shadowed by a more-specific mapping/,
+    );
+    assert.deepEqual((await settings.get(repo)).instructionMappings, [specific]);
+    await assert.rejects(access(path.join(repo, ".github", "copilot-instructions.md")), { code: "ENOENT" });
+});
+
 test("legacy lessons without a status still read as saved", async () => {
     const { store, service } = fresh();
     const { reviewId, thread, message } = await commentThread(service);
@@ -614,7 +722,10 @@ test("SettingsService shares a choice between clones of the same remote", async 
         { pathPrefix: "src/Services", instructionRoot: "src/Services", splitLanguageSpecific: false },
     ];
     await settings.update(first, { autoSaveLearnedRules: true, instructionMappings: mappings });
-    assert.deepEqual(await settings.get(second), { repoName: "repo", autoSaveLearnedRules: true, delivery: "immediate", instructionMappings: mappings, configured: true, dismissed: false });
+    assert.deepEqual(await settings.get(second), {
+        repoName: "repo", autoSaveLearnedRules: true, delivery: "immediate", instructionMappings: mappings,
+        pathCaseSensitive: process.platform !== "win32" && process.platform !== "darwin", configured: true, dismissed: false,
+    });
 });
 
 test("instruction mappings select the longest whole path prefix", () => {
@@ -627,10 +738,20 @@ test("instruction mappings select the longest whole path prefix", () => {
     assert.equal(selectInstructionMapping([services, nemo], "tests/Rules.cs"), null);
 });
 
+test("repository settings accept older payloads without path case metadata", () => {
+    const legacy = {
+        repoName: "repo", autoSaveLearnedRules: false, delivery: "immediate",
+        instructionMappings: [], configured: false, dismissed: false,
+    };
+    assert.deepEqual(repoSettings(legacy), legacy);
+    assert.equal(repoSettings({ ...legacy, pathCaseSensitive: true }).pathCaseSensitive, true);
+    assert.throws(() => repoSettings({ ...legacy, pathCaseSensitive: "yes" }), /Invalid repository settings response/);
+});
+
 test("SettingsService rejects invalid updates without writing anything", async () => {
     const { store } = fresh();
     const settings = new SettingsService({ store });
-    for (const patch of [undefined, {}, { learning: "auto" }, { autoSaveLearnedRules: "yes" }, { autoSaveLearnedRules: null }, { dismissed: "yes" }, { dismissed: 1 }, { dismissed: null }, { autoSaveLearnedRules: true, dismissed: "no" }, { delivery: "later" }, { delivery: null }, { delivery: 1 }, { autoSaveLearnedRules: true, delivery: "later" }]) {
+    for (const patch of [undefined, {}, { learning: "auto" }, { expectedInstructionMappings: [] }, { autoSaveLearnedRules: "yes" }, { autoSaveLearnedRules: null }, { dismissed: "yes" }, { dismissed: 1 }, { dismissed: null }, { autoSaveLearnedRules: true, dismissed: "no" }, { delivery: "later" }, { delivery: null }, { delivery: 1 }, { autoSaveLearnedRules: true, delivery: "later" }]) {
         await assert.rejects(() => settings.update(repo, patch), (error) => errorHasCode(error, "invalid_input"), JSON.stringify(patch));
     }
     assert.deepEqual(await settings.get(repo), { repoName: "proj", autoSaveLearnedRules: false, delivery: "immediate", instructionMappings: [], configured: false, dismissed: false });

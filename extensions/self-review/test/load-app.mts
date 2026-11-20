@@ -23,6 +23,9 @@ export class MockElement {
     querySelector(_selector: string): MockElement | null {
         return null;
     }
+    querySelectorAll(_selector: string): MockElement[] {
+        return [];
+    }
     contains(_node: unknown): boolean {
         return false;
     }

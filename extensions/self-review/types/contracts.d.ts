@@ -26,6 +26,7 @@ export interface RepoSettings {
     autoSaveLearnedRules: boolean;
     delivery: DeliveryMode;
     instructionMappings: InstructionMapping[];
+    pathCaseSensitive?: boolean;
     configured: boolean;
     dismissed: boolean;
 }
@@ -35,6 +36,7 @@ export interface SettingsPatch {
     delivery?: DeliveryMode;
     dismissed?: boolean;
     instructionMappings?: InstructionMapping[];
+    expectedInstructionMappings?: InstructionMapping[];
 }
 
 // Historical files may lack delivery, and invalid mode strings are ignored when read.

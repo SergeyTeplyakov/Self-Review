@@ -29,7 +29,7 @@ export const { Delivery } = delivery;
 export const { parseUnifiedDiff, synthesizeAddedFile, hunkAnchorRange, selectedLines, hunkExcerpt } = diff;
 export const git = gitModule;
 export const { runGit, captureSnapshot, readWorkingFile, safeJoin } = gitModule;
-export const { inferRuleDestination, saveRepositoryRule } = learnedRules;
+export const { inferRuleDestination, previewRepositoryRuleDestination, saveRepositoryRule } = learnedRules;
 export const { buildCommentPrompt, buildBatchPrompt, marker } = prompt;
 export const { findOpenPullRequest } = pullRequest;
 export const { ReviewService, computeReviewId, scopeOf } = reviewService;
@@ -39,7 +39,7 @@ export const { SettingsService, DEFAULT_DELIVERY, DELIVERY_MODES, resolveDeliver
 export const { settingsActions } = settingsActionsModule;
 export const { SettingsHttp } = settingsHttp;
 export const { Store, migrateLegacyDataRoot, defaultDataRoot } = store;
-export const { agentReviewDefaults, reviewOptions, settingsDocument, settingsPatch } = contracts;
+export const { agentReviewDefaults, repoSettings, reviewOptions, settingsDocument, settingsPatch } = contracts;
 export const { createSettingsApi } = settingsApi;
 export const { REVIEW_COMMANDS, reviewCommandSuggestions, parseReviewCommand } = reviewCommands;
 export const { completionHooks, COMPLETION_REVIEW_GUIDANCE } = completionGuidance;

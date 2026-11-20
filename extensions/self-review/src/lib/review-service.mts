@@ -11,10 +11,10 @@ import { hunkExcerpt, selectedLines } from "./diff.mjs";
 import { ReviewError, isRecord, settingsPatch } from "../web/contracts.mjs";
 import { parseReviewCommand } from "../web/review-commands.mjs";
 import { checkBatchImageBudget, commentImageIds } from "./comment-images.mjs";
-import { inferRuleDestination, saveRepositoryRule, type RuleDestination } from "./learned-rules.mjs";
+import { inferRuleDestination, previewRepositoryRuleDestination, saveRepositoryRule, type RuleDestination } from "./learned-rules.mjs";
 import { selectInstructionMapping, type SettingsService } from "./settings.mjs";
 export { ReviewError } from "../web/contracts.mjs";
-import type { Log, ReviewScope, DeliveryChoice } from "../../types/contracts.js";
+import type { InstructionMapping, Log, ReviewScope, DeliveryChoice } from "../../types/contracts.js";
 import type { Store } from "./store.mjs";
 import type { DiffFile, DiffSide } from "./diff.mjs";
 import type { Snapshot } from "./git.mjs";
@@ -396,7 +396,59 @@ function findThread(review: Review, threadId: string) {
 
 const normalizeRule = (rule: string) => rule.toLowerCase().replace(/\s+/g, " ").replace(/[\s.;:!,]+$/, "").trim();
 
-async function saveRule(store: Store, repoRoot: string, lesson: Lesson, settings: SettingsService | undefined, confirmedNewFile = false): Promise<boolean> {
+function reviewedPathForLesson(review: Review, lesson: Lesson): string | undefined {
+    if (lesson.reviewedPath !== undefined) return lesson.reviewedPath;
+    const thread = review.threads.find((item) => item.threadId === lesson.threadId);
+    if (thread?.kind === "overview") return "";
+    return thread?.location?.path ?? thread?.anchor?.path;
+}
+
+function destinationFromInput(value: unknown, fallback: RuleDestination): RuleDestination {
+    if (value === undefined) return fallback;
+    if (!isRecord(value) || (value.kind !== "general" && value.kind !== "language")) {
+        throw invalid("Provide a general or language-specific destination.");
+    }
+    return value.kind === "general" ? { kind: "general" } : {
+        kind: "language",
+        ...(typeof value.language === "string" ? { language: value.language } : {}),
+        ...(typeof value.applyTo === "string" ? { applyTo: value.applyTo } : {}),
+    };
+}
+
+function mappingsWithConfirmedChoice(
+    mappings: InstructionMapping[],
+    value: unknown,
+    reviewedPath: string,
+): { mappings: InstructionMapping[]; mapping: InstructionMapping; changed: boolean } {
+    let next = mappings;
+    let confirmed: InstructionMapping | undefined;
+    if (value !== undefined) {
+        const selected = settingsPatch({ instructionMappings: [value] }).instructionMappings?.[0];
+        if (!selected) throw invalid("Provide one valid instruction mapping.");
+        confirmed = selected;
+        next = mappings.filter((item) => item.pathPrefix !== selected.pathPrefix);
+        next.push(selected);
+    }
+    const mapping = selectInstructionMapping(next, reviewedPath);
+    if (!mapping) throw invalid("Choose an instruction destination before saving this repository guideline.");
+    if (confirmed) {
+        if (mapping.pathPrefix !== confirmed.pathPrefix
+            || mapping.instructionRoot !== confirmed.instructionRoot
+            || mapping.splitLanguageSpecific !== confirmed.splitLanguageSpecific) {
+            throw invalid("The confirmed instruction mapping is shadowed by a more-specific mapping for this file.");
+        }
+    }
+    return { mappings: next, mapping, changed: confirmed !== undefined };
+}
+
+async function saveRule(
+    store: Store,
+    repoRoot: string,
+    lesson: Lesson,
+    settings: SettingsService | undefined,
+    confirmedNewFile = false,
+    expectedSavedTo?: string,
+): Promise<boolean> {
     const personal = lesson.scope === "personal";
     if ((!personal && lesson.scope !== "repo") || !lesson.rule.trim() || RULE_CONTROL_CHARACTERS.test(lesson.rule)) {
         throw invalid("The guideline needs a valid scope and single-line rule.");
@@ -416,6 +468,7 @@ async function saveRule(store: Store, repoRoot: string, lesson: Lesson, settings
         const result = await saveRepositoryRule(
             repoRoot, mapping, lesson.reviewedPath, destination, lesson.rule, confirmedNewFile,
             (key, action) => store.lock(key, action),
+            expectedSavedTo,
         );
         if (result.needsConfirmation) {
             lesson.saveError = `Confirm creating ${result.savedTo} before saving this guideline.`;
@@ -1106,8 +1159,8 @@ export class ReviewService extends EventEmitter {
         return result;
     }
 
-    async saveLesson(reviewId: string, lessonId: string, { rule, scope, mapping, destination }: {
-        rule?: unknown; scope?: unknown; mapping?: unknown; destination?: unknown;
+    async saveLesson(reviewId: string, lessonId: string, { rule, scope, mapping, destination, expectedSavedTo }: {
+        rule?: unknown; scope?: unknown; mapping?: unknown; destination?: unknown; expectedSavedTo?: unknown;
     }) {
         if (typeof rule !== "string" || (scope !== "repo" && scope !== "personal")) throw invalid("Provide the displayed rule and scope.");
         const { lesson, saved } = await this.store.updateReview(reviewId, async (review) => {
@@ -1121,30 +1174,55 @@ export class ReviewService extends EventEmitter {
             if (proposal.status === "saved") {
                 return { write: false, value: { lesson: proposal, saved: false }, journalLessons: [proposal] };
             }
-            if (destination !== undefined) {
-                if (!isRecord(destination) || (destination.kind !== "general" && destination.kind !== "language")) {
-                    throw invalid("Provide a general or language-specific destination.");
+            if (expectedSavedTo !== undefined && typeof expectedSavedTo !== "string") {
+                throw invalid("expectedSavedTo must be a string.");
+            }
+            if (proposal.scope === "repo") {
+                const reviewedPath = reviewedPathForLesson(review, proposal);
+                if (reviewedPath === undefined) {
+                    throw new ReviewError("conflict", "This guideline has no recoverable reviewed file location.");
                 }
-                proposal.destination = destination.kind === "general" ? { kind: "general" } : {
-                    kind: "language",
-                    ...(typeof destination.language === "string" ? { language: destination.language } : {}),
-                    ...(typeof destination.applyTo === "string" ? { applyTo: destination.applyTo } : {}),
-                };
+                proposal.reviewedPath = reviewedPath;
+                proposal.destination = destinationFromInput(destination, proposal.destination ?? inferRuleDestination(reviewedPath));
+            } else if (destination !== undefined) {
+                proposal.destination = destinationFromInput(destination, proposal.destination ?? { kind: "general" });
             }
             if (mapping !== undefined) {
                 if (!this.settings) throw new ReviewError("unsupported", "Instruction mapping settings are unavailable.");
-                const validated = settingsPatch({ instructionMappings: [mapping] }).instructionMappings;
-                if (!validated?.[0]) throw invalid("Provide one valid instruction mapping.");
                 const current = await this.settings.get(review.repoRoot);
-                const next = current.instructionMappings.filter((item) => item.pathPrefix !== validated[0].pathPrefix);
-                next.push(validated[0]);
-                await this.settings.update(review.repoRoot, { instructionMappings: next });
+                const selection = mappingsWithConfirmedChoice(current.instructionMappings, mapping, proposal.reviewedPath ?? "");
+                if (proposal.scope === "repo") {
+                    await previewRepositoryRuleDestination(review.repoRoot, selection.mapping, proposal.reviewedPath ?? "", proposal.destination ?? { kind: "general" });
+                }
+                if (selection.changed) {
+                    await this.settings.updateInstructionMappings(review.repoRoot, (mappings) =>
+                        mappingsWithConfirmedChoice(mappings, mapping, proposal.reviewedPath ?? "").mappings);
+                }
             }
-            const didSave = await saveRule(this.store, review.repoRoot, proposal, this.settings, true);
+            const didSave = await saveRule(this.store, review.repoRoot, proposal, this.settings, true, expectedSavedTo);
             return { review, value: { lesson: proposal, saved: didSave }, journalLessons: [proposal] };
         });
         if (saved) this.changed(reviewId, "message");
         return lesson;
+    }
+
+    async previewLessonDestination(reviewId: string, lessonId: string, { mapping, destination }: {
+        mapping?: unknown; destination?: unknown;
+    }) {
+        if (!this.settings) throw new ReviewError("unsupported", "Instruction mapping settings are unavailable.");
+        const review = await this.getReview(reviewId);
+        if (isRetiredCommitReview(review)) throw retiredCommitError(review);
+        const proposal = review.lessons.find((item) => item.lessonId === lessonId);
+        if (!proposal) throw notFound(`Guideline ${lessonId} not found.`);
+        if (proposal.scope !== "repo" || (proposal.status ?? "saved") !== "proposed") {
+            throw invalid("Only proposed repository guidelines have a configurable destination.");
+        }
+        const reviewedPath = reviewedPathForLesson(review, proposal);
+        if (reviewedPath === undefined) throw new ReviewError("conflict", "This guideline has no recoverable reviewed file location.");
+        const current = await this.settings.get(review.repoRoot);
+        const selection = mappingsWithConfirmedChoice(current.instructionMappings, mapping, reviewedPath);
+        const ruleDestination = destinationFromInput(destination, proposal.destination ?? inferRuleDestination(reviewedPath));
+        return previewRepositoryRuleDestination(review.repoRoot, selection.mapping, reviewedPath, ruleDestination);
     }
 
     async setThreadStatus(reviewId: string, threadId: string, status: unknown) {

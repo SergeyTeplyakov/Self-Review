@@ -13,9 +13,9 @@ Mappings and their split setting are stored per user in Self-Review's existing s
 
 ## First use and saving
 
-When `/learn` or another repository-rule proposal has no applicable mapping, its proposal card stays unsaved and asks for a destination. The card starts with a suggestion based on the reviewed file and the agent's language, `applyTo`, and instruction-file analysis. Confirm or edit the path prefix, instruction root, rule kind, language, and glob; the proposed destination is visible before saving. Self-Review remembers the confirmed mapping for that path prefix. It never silently falls back to the repository-root instruction file.
+When `/learn` or another repository-rule proposal has no applicable mapping, its proposal card stays unsaved and asks for a destination. The card starts with a suggestion based on the reviewed file and the agent's language, `applyTo`, and instruction-file analysis. Confirm or edit the path prefix, instruction root, rule kind, language, and glob; Self-Review resolves the actual destination through the provider and displays it before saving. A language rule's `applyTo` must cover the reviewed file before it can be saved. Self-Review remembers the confirmed mapping for that path prefix. It never silently falls back to the repository-root instruction file.
 
-With **Auto-save learned rules** on, a proposal is still held if no mapping applies. A language rule that would create a new scoped instruction file is also held for confirmation; Self-Review does not create that file automatically. Once the mapped destination is configured and confirmed, Self-Review saves the rule and reads it back before marking it saved. Manual saves use the same routing and verification as auto-save. Existing rule deduplication and file locking continue to apply.
+With **Auto-save learned rules** on, a proposal is still held if no mapping applies. A language rule that would create a new scoped instruction file is also held for confirmation; Self-Review does not create that file automatically. Before writing, Self-Review verifies the provider-resolved destination still matches the one shown for confirmation. Once the mapped destination is configured and confirmed, Self-Review saves the rule and reads it back before marking it saved. Manual saves use the same routing and verification as auto-save. Existing rule deduplication and file locking continue to apply.
 
 ## Split language-specific rules
 
@@ -24,6 +24,8 @@ Each mapping has **Split language-specific rules into scoped files**, on by defa
 - **On:** For a language-specific rule, Self-Review uses only the exact `<language>.instructions.md` file under the mapped root's `.github/instructions`. If that file exists and its `applyTo` covers the reviewed file, Self-Review appends there. If it is missing, the proposal card asks you to confirm creating it with the suggested `applyTo`; topical files are not reused just because their `applyTo` matches. It does not write to ancestor or repository-root instruction files.
 - **Off:** Self-Review does not require the split. It appends to a matching applicable instruction file under the mapped root when one exists, or uses that root's general instruction file.
 - **Repository-wide rules:** These always go to the mapped root's general instruction file, regardless of the split setting.
+
+Existing scoped instruction files may use comma-separated `applyTo` globs; Self-Review matches any listed pattern and ignores a standard trailing YAML comment.
 
 An ancestor instruction file can inform the agent's suggestion and help avoid duplicate guidance, but it is never a fallback destination for a mapped rule.
 

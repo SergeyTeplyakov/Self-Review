@@ -217,7 +217,26 @@ type ContentEntry =
 type PendingComment = { clientRequestId: string; sending?: boolean; error?: string | null };
 type Selection = { path: string; hunk: number; anchor: number; from: number; to: number; full: boolean };
 type RowPosition = { path: string; h: number; i: number; full: boolean };
-type ConfigureDialog = { type: "configure"; autoSaveLearnedRules: boolean; delivery: DeliveryMode; instructionMappings: InstructionMapping[]; saving: boolean; error: string };
+type ConfigureDialog = {
+    type: "configure";
+    autoSaveLearnedRules: boolean;
+    delivery: DeliveryMode;
+    originalInstructionMappings: InstructionMapping[];
+    instructionMappings: InstructionMapping[];
+    saving: boolean;
+    error: string;
+};
+type DestinationFormDraft = {
+    signature: string;
+    edited: boolean;
+    pathPrefix: string;
+    instructionRoot: string;
+    splitLanguageSpecific: boolean;
+    destinationKind: "general" | "language";
+    language: string;
+    applyTo: string;
+    detailsOpen: boolean;
+};
 type AgentReviewDialog = {
     type: "agent-review";
     reviewId: string;
@@ -611,6 +630,8 @@ const state: State = {
 
 const FOLDER_VIEW_ROW_BUDGET = 3000;
 const settingsApi = createSettingsApi((method, path, body) => api(method, path, body));
+const destinationPreviewRequests = new WeakMap<HTMLElement, { key: string; requestId: symbol; promise: Promise<{ savedTo: string; needsConfirmation: boolean } | null> }>();
+const destinationFormDrafts = new Map<string, DestinationFormDraft>();
 
 const DELIVERY_MODES = ["immediate", "batch", "ask"] as const;
 type DeliveryMode = (typeof DELIVERY_MODES)[number];
@@ -1473,6 +1494,7 @@ function render() {
     renderBanner();
     renderSide();
     renderMain();
+    refreshDestinationPreviews();
     const outsideReplies = outsideDraftRepliesHtml();
     if (pinnedComposers.size || outsideReplies) {
         main.insertAdjacentHTML("afterbegin", outsideReplies + [...pinnedComposers].map(([key, options]) =>
@@ -1658,9 +1680,11 @@ function renderDialog() {
 
 function openConfigure() {
     if (!state.settings || state.dialog) return;
+    const mappings = state.settings.instructionMappings.map((mapping) => ({ ...mapping }));
     state.dialog = {
         type: "configure", autoSaveLearnedRules: autoSaveLearnedRules(), delivery: deliveryRepoMode(),
-        instructionMappings: state.settings.instructionMappings.map((mapping) => ({ ...mapping })),
+        originalInstructionMappings: mappings.map((mapping) => ({ ...mapping })),
+        instructionMappings: mappings,
         saving: false, error: "",
     };
     renderDialog();
@@ -1981,9 +2005,13 @@ async function saveConfigure(): Promise<void> {
     d.error = "";
     renderDialog();
     try {
+        const mappingsChanged = JSON.stringify(d.instructionMappings) !== JSON.stringify(d.originalInstructionMappings);
         await updateSettings({
             autoSaveLearnedRules: d.autoSaveLearnedRules, delivery: d.delivery,
-            instructionMappings: d.instructionMappings,
+            ...(mappingsChanged ? {
+                instructionMappings: d.instructionMappings,
+                expectedInstructionMappings: d.originalInstructionMappings,
+            } : {}),
         });
         state.dialog = null;
         renderDialog();
@@ -2128,6 +2156,7 @@ function renderSide(): void {
 function renderMain(): void {
     const main = $("#main");
     if (!main) return;
+    captureDestinationFormDrafts(main);
     if (state.view.type === "file") {
         const file = displayFile(state.view.path);
         if (file) {
@@ -2312,64 +2341,181 @@ function deliveryHtml(m: ReviewMessage): string {
 }
 
 function mappingForPath(reviewedPath: string): InstructionMapping | undefined {
-    const file = reviewedPath.replace(/\\/g, "/").replace(/^\.\/+/, "").toLowerCase();
+    const caseSensitive = state.settings?.pathCaseSensitive ?? true;
+    const normalize = (value: string) => {
+        const normalized = value.replace(/\\/g, "/").replace(/^\.\/+/, "");
+        return caseSensitive ? normalized : normalized.toLowerCase();
+    };
+    const file = normalize(reviewedPath);
     return [...(state.settings?.instructionMappings ?? [])]
         .filter((mapping) => {
-            const prefix = mapping.pathPrefix.toLowerCase();
+            const prefix = normalize(mapping.pathPrefix);
             return !prefix || file === prefix || file.startsWith(`${prefix}/`);
         })
         .sort((a, b) => b.pathPrefix.length - a.pathPrefix.length)[0];
 }
 
-function suggestedDestination(lesson: Lesson): NonNullable<Lesson["destination"]> {
+function reviewedPathForLesson(lesson: Lesson): string | undefined {
+    if (lesson.reviewedPath !== undefined) return lesson.reviewedPath;
+    const thread = state.review?.threads.find((item) => item.threadId === lesson.threadId);
+    if (thread?.kind === "overview") return "";
+    return thread?.location?.path ?? thread?.anchor?.path;
+}
+
+function suggestedDestination(lesson: Lesson, reviewedPath = lesson.reviewedPath): NonNullable<Lesson["destination"]> {
     if (lesson.destination) return lesson.destination;
-    const extension = lesson.reviewedPath?.replace(/\\/g, "/").split(".").at(-1)?.toLowerCase() ?? "";
-    const names: Record<string, string> = { cs: "csharp", ts: "typescript", tsx: "typescript", js: "javascript", jsx: "javascript", py: "python", ps1: "powershell" };
+    const extension = reviewedPath?.replace(/\\/g, "/").split(".").at(-1)?.toLowerCase() ?? "";
+    const names: Record<string, string> = {
+        cs: "csharp", js: "javascript", jsx: "javascript", mjs: "javascript", cjs: "javascript",
+        ts: "typescript", tsx: "typescript", py: "python", ps1: "powershell", go: "go",
+        rs: "rust", java: "java", rb: "ruby", php: "php", sh: "shell", sql: "sql",
+    };
     const language = names[extension];
     return language
         ? { kind: "language", language, applyTo: `**/*.${extension}` }
         : { kind: "general" };
 }
 
-function proposalDestinationPreview(form: HTMLElement): string {
+function lessonDestinationSignature(lesson: Lesson, reviewedPath: string | undefined): string {
+    return JSON.stringify([lesson.rule, lesson.scope, reviewedPath ?? null]);
+}
+
+function destinationFormDraftKey(lessonId: string, messageId: string): string {
+    return JSON.stringify([lessonId, messageId]);
+}
+
+function captureDestinationFormDrafts(main: HTMLElement): void {
+    for (const form of Array.from(main.querySelectorAll<HTMLElement>("[data-lesson-form]"))) {
+        const lessonId = form.dataset.lessonForm;
+        const messageId = form.dataset.lessonMessage;
+        const signature = form.dataset.lessonSignature;
+        const input = (name: string) => form.querySelector<HTMLInputElement | HTMLSelectElement>(`[name="${name}"]`);
+        const pathPrefix = input("pathPrefix");
+        const instructionRoot = input("instructionRoot");
+        const splitLanguageSpecific = input("splitLanguageSpecific");
+        const destinationKind = input("destinationKind");
+        const language = input("language");
+        const applyTo = input("applyTo");
+        const details = form.querySelector<HTMLDetailsElement>("details.lesson-destination");
+        if (!lessonId || !messageId || !signature || !pathPrefix || !instructionRoot || !splitLanguageSpecific
+            || !destinationKind || !language || !applyTo || !details) continue;
+        destinationFormDrafts.set(destinationFormDraftKey(lessonId, messageId), {
+            signature,
+            edited: form.dataset.destinationEdited === "true",
+            pathPrefix: pathPrefix.value,
+            instructionRoot: instructionRoot.value,
+            splitLanguageSpecific: splitLanguageSpecific instanceof HTMLInputElement && splitLanguageSpecific.checked,
+            destinationKind: destinationKind.value === "language" ? "language" : "general",
+            language: language.value,
+            applyTo: applyTo.value,
+            detailsOpen: details.open,
+        });
+    }
+}
+
+function destinationFormProposal(form: HTMLElement): { mapping: InstructionMapping; destination: NonNullable<Lesson["destination"]> } {
     const input = (name: string) => form.querySelector<HTMLInputElement | HTMLSelectElement>(`[name="${name}"]`);
     const root = input("instructionRoot")?.value.replace(/\/+$/, "") ?? "";
     const kind = input("destinationKind")?.value === "language" ? "language" : "general";
-    const language = input("language")?.value.trim() || "language";
     const splitInput = input("splitLanguageSpecific");
-    const split = splitInput instanceof HTMLInputElement ? splitInput.checked : true;
-    const base = root ? `${root}/.github` : ".github";
-    return kind === "language" && split
-        ? `${base}/instructions/${language}.instructions.md`
-        : `${base}/copilot-instructions.md`;
+    const language = input("language")?.value.trim() ?? "";
+    const applyTo = input("applyTo")?.value.trim() ?? "";
+    return {
+        mapping: {
+            pathPrefix: input("pathPrefix")?.value ?? "",
+            instructionRoot: root,
+            splitLanguageSpecific: splitInput instanceof HTMLInputElement ? splitInput.checked : true,
+        },
+        destination: kind === "language" ? { kind, language, applyTo } : { kind: "general" },
+    };
 }
 
-function lessonDestinationForm(lesson: Lesson): string {
-    const mapping = lesson.reviewedPath ? mappingForPath(lesson.reviewedPath) : undefined;
-    const parent = lesson.reviewedPath?.replace(/\\/g, "/").split("/").slice(0, -1).join("/") ?? "";
-    const destination = suggestedDestination(lesson);
-    const prefix = mapping?.pathPrefix ?? destination.pathPrefix ?? parent;
-    const root = mapping?.instructionRoot ?? destination.instructionRoot ?? parent;
-    const previewRoot = root ? `${root}/.github` : ".github";
-    const preview = destination.kind === "language" && (mapping?.splitLanguageSpecific ?? true)
-        ? `${previewRoot}/instructions/${destination.language ?? "language"}.instructions.md`
-        : `${previewRoot}/copilot-instructions.md`;
-    return `<details class="lesson-destination"><summary>Confirm repository destination</summary>`
-        + `<p class="muted">Reviewed file: <code>${esc(lesson.reviewedPath ?? "path unavailable")}</code>. This per-user mapping is shared by clones and worktrees of the same repository.</p>`
+async function updateDestinationPreview(form: HTMLElement): Promise<{ savedTo: string; needsConfirmation: boolean } | null> {
+    const lessonId = form.dataset.lessonForm;
+    const preview = form.querySelector<HTMLElement>("[data-destination-preview]");
+    if (!lessonId || !preview) return null;
+    const proposal = destinationFormProposal(form);
+    const key = JSON.stringify(proposal);
+    const existing = destinationPreviewRequests.get(form);
+    if (existing?.key === key) return existing.promise;
+    const requestId = Symbol();
+    form.dataset.destinationPreviewKey = key;
+    form.dataset.destinationPreviewState = "loading";
+    preview.textContent = "Resolving actual destination…";
+    const isCurrentRequest = () => form.dataset.destinationPreviewKey === key
+        && destinationPreviewRequests.get(form)?.requestId === requestId;
+    const promise = (async () => {
+        try {
+            const result: unknown = await api("POST", `lessons/${encodeURIComponent(lessonId)}/destination`, proposal);
+            if (!isRecord(result) || typeof result.savedTo !== "string" || typeof result.needsConfirmation !== "boolean") {
+                throw new Error("The provider returned an invalid destination preview.");
+            }
+            if (isCurrentRequest()) {
+                form.dataset.destinationPreviewState = "ready";
+                form.dataset.resolvedDestination = result.savedTo;
+                preview.textContent = `${result.savedTo}${result.needsConfirmation ? " (new file; confirmation required)" : ""}`;
+            }
+            return { savedTo: result.savedTo, needsConfirmation: result.needsConfirmation };
+        } catch (error: unknown) {
+            if (isCurrentRequest()) {
+                form.dataset.destinationPreviewState = "error";
+                preview.textContent = `Unable to resolve destination: ${errorMessage(error)}`;
+            }
+            if (destinationPreviewRequests.get(form)?.requestId === requestId) destinationPreviewRequests.delete(form);
+            return null;
+        }
+    })();
+    destinationPreviewRequests.set(form, { key, requestId, promise });
+    return promise;
+}
+
+function refreshDestinationPreviews(): void {
+    for (const form of Array.from(document.querySelectorAll<HTMLElement>("#main [data-lesson-form]"))) {
+        if (form.dataset.destinationPreviewState !== "ready") void updateDestinationPreview(form);
+    }
+}
+
+function lessonDestinationForm(lesson: Lesson, messageId: string): string {
+    const reviewedPath = reviewedPathForLesson(lesson);
+    const mapping = reviewedPath !== undefined ? mappingForPath(reviewedPath) : undefined;
+    const parent = reviewedPath?.replace(/\\/g, "/").split("/").slice(0, -1).join("/") ?? "";
+    const suggestion = suggestedDestination(lesson, reviewedPath);
+    const signature = lessonDestinationSignature(lesson, reviewedPath);
+    const draftKey = destinationFormDraftKey(lesson.lessonId, messageId);
+    const previousDraft = destinationFormDrafts.get(draftKey);
+    const draft = previousDraft?.signature === signature ? previousDraft : undefined;
+    if (previousDraft && !draft) destinationFormDrafts.delete(draftKey);
+    const editedDraft = draft?.edited ? draft : undefined;
+    const destination = editedDraft
+        ? { kind: editedDraft.destinationKind, language: editedDraft.language, applyTo: editedDraft.applyTo }
+        : suggestion;
+    const prefix = editedDraft?.pathPrefix ?? mapping?.pathPrefix ?? destination.pathPrefix ?? parent;
+    const root = editedDraft?.instructionRoot ?? mapping?.instructionRoot ?? destination.instructionRoot ?? parent;
+    const splitLanguageSpecific = editedDraft?.splitLanguageSpecific ?? mapping?.splitLanguageSpecific ?? true;
+    return `<details class="lesson-destination"${draft?.detailsOpen ? " open" : ""}><summary>Confirm repository destination</summary>`
+        + `<p class="muted">Reviewed file: <code>${esc(reviewedPath ?? "path unavailable")}</code>. This per-user mapping is shared by clones and worktrees of the same repository.</p>`
         + `<label>Path prefix <input name="pathPrefix" value="${esc(prefix)}" placeholder="(repository root)"></label>`
         + `<label>Instruction root <input name="instructionRoot" value="${esc(root)}" placeholder="(repository root)"></label>`
-        + `<label><input type="checkbox" name="splitLanguageSpecific"${mapping?.splitLanguageSpecific ?? true ? " checked" : ""}> Split language-specific rules into scoped files</label>`
+        + `<label><input type="checkbox" name="splitLanguageSpecific"${splitLanguageSpecific ? " checked" : ""}> Split language-specific rules into scoped files</label>`
         + `<label>Rule type <select name="destinationKind"><option value="language"${destination.kind === "language" ? " selected" : ""}>Language-specific</option><option value="general"${destination.kind === "general" ? " selected" : ""}>Repository-wide</option></select></label>`
         + `<label>Language <input name="language" value="${esc(destination.language ?? "")}" placeholder="csharp"></label>`
         + `<label>applyTo <input name="applyTo" value="${esc(destination.applyTo ?? "")}" placeholder="**/*.cs"></label>`
-        + `<p class="muted">Proposed destination: <code data-destination-preview>${esc(preview)}</code></p>`
+        + `<p class="muted">Actual destination: <code data-destination-preview>Resolving actual destination…</code></p>`
         + `<button data-action="save-lesson" data-lesson="${esc(lesson.lessonId)}">Confirm destination and save guideline</button>`
         + `</details>`;
 }
 
-function saveLessonButton(l: Lesson): string {
+function saveLessonButton(l: Lesson, messageId: string): string {
     if (l.status !== "proposed" || (l.scope !== "repo" && l.scope !== "personal")) return "";
-    if (l.scope === "repo") return ` <span data-lesson-form="${esc(l.lessonId)}">${lessonDestinationForm(l)}${l.saveError ? ` <span role="status">${esc(l.saveError)}</span>` : ""}</span>`;
+    if (l.scope === "repo") {
+        const reviewedPath = reviewedPathForLesson(l);
+        const signature = lessonDestinationSignature(l, reviewedPath);
+        const draftKey = destinationFormDraftKey(l.lessonId, messageId);
+        const draft = destinationFormDrafts.get(draftKey);
+        const edited = draft?.signature === signature && draft.edited;
+        return ` <span data-lesson-form="${esc(l.lessonId)}" data-lesson-message="${esc(messageId)}" data-lesson-signature="${esc(signature)}"${edited ? ' data-destination-edited="true"' : ""} data-rule="${esc(l.rule)}" data-scope="${esc(l.scope)}">`
+            + `${lessonDestinationForm(l, messageId)}${l.saveError ? ` <span role="status">${esc(l.saveError)}</span>` : ""}</span>`;
+    }
     return ` <button data-action="save-lesson" data-lesson="${esc(l.lessonId)}" data-proposal="${esc(JSON.stringify({ rule: l.rule, scope: l.scope }))}">Save guideline</button>`
         + (l.saveError ? ` <span role="status">${esc(l.saveError)}</span>` : "");
 }
@@ -2386,7 +2532,7 @@ function messageHtml(m: ReviewMessage): string {
         + (savedLesson ? `<span class="badge lesson-saved">Lesson learned</span>` : "")
         + `</div>${md(m.body)}${imagesHtml(m.imageIds ?? [])}`
         + (m.verification ? `<div class="verification">Verification: ${inline(m.verification)}</div>` : "")
-        + (lessons.length ? `<div class="lessons">Guidelines:<ul>${lessons.map((l) => `<li><span class="badge">${esc(l.scope)}</span> ${lessonBadge(l)} ${inline(l.rule)}${l.savedTo ? ` <span class="muted mono">→ ${esc(l.savedTo)}</span>` : ""}${saveLessonButton(l)}</li>`).join("")}</ul></div>` : "")
+        + (lessons.length ? `<div class="lessons">Guidelines:<ul>${lessons.map((l) => `<li><span class="badge">${esc(l.scope)}</span> ${lessonBadge(l)} ${inline(l.rule)}${l.savedTo ? ` <span class="muted mono">→ ${esc(l.savedTo)}</span>` : ""}${saveLessonButton(l, m.messageId)}</li>`).join("")}</ul></div>` : "")
         + `</div>`;
 }
 
@@ -3079,21 +3225,37 @@ async function onClick(e: MouseEvent): Promise<void> {
                     const lessonId = value("lesson");
                     const candidate = target.closest<HTMLElement>("[data-lesson-form]");
                     const form = candidate?.dataset?.lessonForm ? candidate : null;
+                    const renderedProposal = form
+                        ? { rule: dataValue(form, "rule"), scope: dataValue(form, "scope") }
+                        : { rule: value("rule"), scope: value("scope") };
                     let proposal: unknown;
                     if (form) {
-                        const field = (name: string) => form.querySelector<HTMLInputElement | HTMLSelectElement>(`[name="${name}"]`);
-                        const split = field("splitLanguageSpecific");
-                        const mapping = {
-                            pathPrefix: field("pathPrefix")?.value ?? "",
-                            instructionRoot: field("instructionRoot")?.value ?? "",
-                            splitLanguageSpecific: split instanceof HTMLInputElement ? split.checked : true,
+                        const currentKey = JSON.stringify(destinationFormProposal(form));
+                        const previewIsCurrent = form.dataset.destinationPreviewState === "ready"
+                            && form.dataset.destinationPreviewKey === currentKey;
+                        if (!previewIsCurrent) {
+                            const resolved = await updateDestinationPreview(form);
+                            if (!resolved) {
+                                toast("Could not resolve the actual repository destination. Review the error above before saving.", true);
+                                break;
+                            }
+                            const latestKey = JSON.stringify(destinationFormProposal(form));
+                            if (form.dataset.destinationPreviewState !== "ready" || form.dataset.destinationPreviewKey !== latestKey) {
+                                toast("The destination changed while it was resolving. Review the updated preview, then confirm the save.");
+                            } else {
+                                toast("Destination preview updated. Review it, then confirm the save.");
+                            }
+                            break;
+                        }
+                        const resolved = await updateDestinationPreview(form);
+                        if (!resolved) {
+                            toast("Could not resolve the actual repository destination. Review the error above before saving.", true);
+                            break;
+                        }
+                        proposal = {
+                            ...renderedProposal, ...destinationFormProposal(form),
+                            expectedSavedTo: resolved.savedTo,
                         };
-                        const kind = field("destinationKind")?.value;
-                        const destination = kind === "language"
-                            ? { kind, language: field("language")?.value.trim(), applyTo: field("applyTo")?.value.trim() }
-                            : { kind: "general" };
-                        const lesson = state.review?.lessons.find((item) => item.lessonId === lessonId);
-                        proposal = { rule: lesson?.rule, scope: lesson?.scope, mapping, destination };
                     } else {
                         proposal = JSON.parse(value("proposal"));
                     }
@@ -3110,7 +3272,16 @@ async function onClick(e: MouseEvent): Promise<void> {
         }
     } catch (err: unknown) {
         if (action === "refresh") target.removeAttribute("disabled");
-        else toast(errorMessage(err), true);
+        else {
+            if (action === "save-lesson") {
+                const candidate = target.closest<HTMLElement>("[data-lesson-form]");
+                if (candidate?.dataset?.lessonForm) {
+                    destinationPreviewRequests.delete(candidate);
+                    await updateDestinationPreview(candidate);
+                }
+            }
+            toast(errorMessage(err), true);
+        }
     }
 }
 
@@ -3130,8 +3301,10 @@ async function onChange(e: Event): Promise<void> {
     if (el.closest?.("[data-lesson-form]")) {
         const candidate = el.closest<HTMLElement>("[data-lesson-form]");
         const form = candidate?.dataset?.lessonForm ? candidate : null;
-        const preview = form?.querySelector<HTMLElement>("[data-destination-preview]");
-        if (form && preview) preview.textContent = proposalDestinationPreview(form);
+        if (form) {
+            form.dataset.destinationEdited = "true";
+            void updateDestinationPreview(form);
+        }
     }
     if (el instanceof HTMLInputElement && el.name === "review-skill-defaults" && state.dialog?.type === "agent-review") {
         state.dialog.saveSkillDefaults = el.checked;
@@ -3198,8 +3371,10 @@ function onInput(e: Event): void {
     }
     const candidate = el.closest?.<HTMLElement>("[data-lesson-form]");
     const form = candidate?.dataset?.lessonForm ? candidate : null;
-    const preview = form?.querySelector<HTMLElement>("[data-destination-preview]");
-    if (form && preview) preview.textContent = proposalDestinationPreview(form);
+    if (form) {
+        form.dataset.destinationEdited = "true";
+        void updateDestinationPreview(form);
+    }
     if ((el.name === "review-models" || el.name === "review-intent") && state.dialog?.type === "agent-review") {
         state.dialog[el.name === "review-models" ? "models" : "intent"] = el.value;
         return;

@@ -37,7 +37,10 @@ function hasCode(error: unknown, code: string): boolean {
 test("shared options and patch codecs reject untrusted input without type assertions", () => {
     assert.deepEqual(reviewOptions(defaults), { models: defaults.models, focus: "both", intent: defaults.intent });
     assert.deepEqual(agentReviewDefaults(defaults), defaults);
-    assert.deepEqual(settingsPatch({ autoSaveLearnedRules: false, dismissed: false }), { autoSaveLearnedRules: false, delivery: undefined, dismissed: false, instructionMappings: undefined });
+    assert.deepEqual(settingsPatch({ autoSaveLearnedRules: false, dismissed: false }), {
+        autoSaveLearnedRules: false, delivery: undefined, dismissed: false,
+        instructionMappings: undefined, expectedInstructionMappings: undefined,
+    });
     for (const value of [null, [], {}, { models: ["model-a"], focus: "invalid" }, { ...defaults, models: ["a", "a"] }, { ...defaults, intent: 3 }]) {
         assert.throws(() => reviewOptions(value), (error) => hasCode(error, "invalid_input"));
     }

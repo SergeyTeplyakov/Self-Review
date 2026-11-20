@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { saveRepositoryRule } from "./modules.mjs";
+import { previewRepositoryRuleDestination, saveRepositoryRule } from "./modules.mjs";
 import type { InstructionMapping } from "../types/contracts.js";
 
 const noLock = async <T,>(_key: string, action: () => Promise<T>): Promise<T> => action();
@@ -52,6 +52,23 @@ test("split routing holds creation of the exact language file despite topical ap
     assert.equal(await readFile(file, "utf8"), `---\napplyTo: "**/*.cs"\n---\n\n- Prefer explicit checks.\n`);
 });
 
+test("held and stale destinations do not create instruction directories", async (t) => {
+    const repo = await fixture(t);
+    const mapping: InstructionMapping = { pathPrefix: "src/Area", instructionRoot: "src/Area", splitLanguageSpecific: true };
+    const file = path.join(repo, "src", "Area", ".github", "instructions", "csharp.instructions.md");
+
+    assert.deepEqual(
+        await saveRepositoryRule(repo, mapping, "src/Area/Rules.cs", language, "Use explicit checks.", false, noLock),
+        { savedTo: "src/Area/.github/instructions/csharp.instructions.md", needsConfirmation: true },
+    );
+    await assert.rejects(lstat(path.join(repo, "src")), { code: "ENOENT" });
+    await assert.rejects(
+        saveRepositoryRule(repo, mapping, "src/Area/Rules.cs", language, "Use explicit checks.", true, noLock, "wrong/destination.md"),
+        /destination changed/,
+    );
+    await assert.rejects(lstat(file), { code: "ENOENT" });
+});
+
 test("split-off routing uses a matching scoped file or the mapped root's general file", async (t) => {
     const repo = await fixture(t);
     const mapping: InstructionMapping = { pathPrefix: "src/Area", instructionRoot: "src/Area", splitLanguageSpecific: false };
@@ -60,12 +77,89 @@ test("split-off routing uses a matching scoped file or the mapped root's general
     assert.equal(saved.savedTo, "src/Area/.github/copilot-instructions.md");
     assert.equal(await readFile(general, "utf8"), "- Keep branches shallow.\n");
 
-    const scoped = path.join(repo, "src", "Area", ".github", "instructions", "csharp.instructions.md");
+    const scoped = path.join(repo, "src", "Area", ".github", "instructions", "csharp-documentation.instructions.md");
     await mkdir(path.dirname(scoped), { recursive: true });
     await writeFile(scoped, `---\napplyTo: "**/*.cs"\n---\n`);
+    assert.deepEqual(
+        await previewRepositoryRuleDestination(repo, mapping, "src/Area/Rules.cs", language),
+        { savedTo: "src/Area/.github/instructions/csharp-documentation.instructions.md", needsConfirmation: false },
+    );
     const routed = await saveRepositoryRule(repo, mapping, "src/Area/Rules.cs", language, "Use typed guards.", false, noLock);
-    assert.equal(routed.savedTo, "src/Area/.github/instructions/csharp.instructions.md");
+    assert.equal(routed.savedTo, "src/Area/.github/instructions/csharp-documentation.instructions.md");
     assert.equal((await readFile(general, "utf8")).includes("Use typed guards."), false);
+});
+
+test("split-off routing matches comma-separated applyTo patterns with trailing YAML comments", async (t) => {
+    const repo = await fixture(t);
+    const mapping: InstructionMapping = { pathPrefix: "", instructionRoot: "", splitLanguageSpecific: false };
+    const file = path.join(repo, ".github", "instructions", "typescript-guidance.instructions.md");
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, `---\napplyTo: "**/*.ts,**/*.tsx" # TypeScript sources\n---\n`);
+
+    assert.deepEqual(
+        await previewRepositoryRuleDestination(repo, mapping, "src/View.tsx", { kind: "language", language: "typescript", applyTo: "**/*.tsx" }),
+        { savedTo: ".github/instructions/typescript-guidance.instructions.md", needsConfirmation: false },
+    );
+    const saved = await saveRepositoryRule(repo, mapping, "src/View.tsx", { kind: "language", language: "typescript", applyTo: "**/*.tsx" }, "Prefer typed props.", false, noLock);
+    assert.equal(saved.savedTo, ".github/instructions/typescript-guidance.instructions.md");
+    assert.match(await readFile(file, "utf8"), /- Prefer typed props\./);
+});
+
+test("a concurrent scoped-file creator cannot bypass applyTo validation", async (t) => {
+    const repo = await fixture(t);
+    const mapping: InstructionMapping = { pathPrefix: "", instructionRoot: "", splitLanguageSpecific: true };
+    const file = path.join(repo, ".github", "instructions", "csharp.instructions.md");
+    const competingWriter = async <T,>(_key: string, action: () => Promise<T>): Promise<T> => {
+        await mkdir(path.dirname(file), { recursive: true });
+        await writeFile(file, `---\napplyTo: "**/*.ts"\n---\n`);
+        return action();
+    };
+
+    await assert.rejects(
+        saveRepositoryRule(repo, mapping, "src/Rules.cs", language, "Keep guards explicit.", true, competingWriter),
+        /does not apply to src\/Rules\.cs/,
+    );
+    assert.equal(await readFile(file, "utf8"), `---\napplyTo: "**/*.ts"\n---\n`);
+});
+
+test("language applyTo must cover the reviewed path before a scoped file can be created", async (t) => {
+    const repo = await fixture(t);
+    const mapping: InstructionMapping = { pathPrefix: "", instructionRoot: "", splitLanguageSpecific: true };
+    const destination = { ...language, applyTo: "**/*.ts" };
+    await assert.rejects(
+        saveRepositoryRule(repo, mapping, "src/View.tsx", destination, "Use explicit guards.", true, noLock),
+        /applyTo pattern does not cover/,
+    );
+    await assert.rejects(readFile(path.join(repo, ".github", "instructions", "csharp.instructions.md")), { code: "ENOENT" });
+});
+
+test("language applyTo rejects YAML quote and backslash characters", async (t) => {
+    const repo = await fixture(t);
+    const mapping: InstructionMapping = { pathPrefix: "", instructionRoot: "", splitLanguageSpecific: true };
+    for (const applyTo of ['**/rule".cs', "src\\*.cs"]) {
+        await assert.rejects(
+            saveRepositoryRule(repo, mapping, "src/Rules.cs", { ...language, applyTo }, "Use explicit guards.", true, noLock),
+            /applyTo pattern without quotes or backslashes/,
+        );
+    }
+    await assert.rejects(readFile(path.join(repo, ".github", "instructions", "csharp.instructions.md")), { code: "ENOENT" });
+});
+
+test("saving refuses when the provider-resolved destination changed after confirmation", async (t) => {
+    const repo = await fixture(t);
+    const mapping: InstructionMapping = { pathPrefix: "", instructionRoot: "", splitLanguageSpecific: false };
+    const preview = await previewRepositoryRuleDestination(repo, mapping, "src/Rules.cs", language);
+    assert.deepEqual(preview, { savedTo: ".github/copilot-instructions.md", needsConfirmation: false });
+
+    const scoped = path.join(repo, ".github", "instructions", "csharp-documentation.instructions.md");
+    await mkdir(path.dirname(scoped), { recursive: true });
+    await writeFile(scoped, `---\napplyTo: "**/*.cs"\n---\n`);
+    await assert.rejects(
+        saveRepositoryRule(repo, mapping, "src/Rules.cs", language, "Use explicit guards.", false, noLock, preview.savedTo),
+        /destination changed/,
+    );
+    assert.equal((await readFile(scoped, "utf8")).includes("Use explicit guards."), false);
+    await assert.rejects(readFile(path.join(repo, ".github", "copilot-instructions.md")), { code: "ENOENT" });
 });
 
 test("repository mapping paths reject traversal and symlink redirection", async (t) => {

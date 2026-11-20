@@ -109,9 +109,15 @@ export function settingsPatch(value: unknown): SettingsPatch {
     if (value.dismissed !== undefined && typeof value.dismissed !== "boolean") {
         throw new ReviewError("invalid_input", "dismissed must be a boolean.");
     }
+    if (value.expectedInstructionMappings !== undefined && value.instructionMappings === undefined) {
+        throw new ReviewError("invalid_input", "expectedInstructionMappings requires instructionMappings.");
+    }
     return {
         autoSaveLearnedRules: value.autoSaveLearnedRules, delivery: value.delivery, dismissed: value.dismissed,
         instructionMappings: value.instructionMappings === undefined ? undefined : parseInstructionMappings(value.instructionMappings),
+        expectedInstructionMappings: value.expectedInstructionMappings === undefined
+            ? undefined
+            : parseInstructionMappings(value.expectedInstructionMappings),
     };
 }
 
@@ -143,13 +149,15 @@ export function settingsDocument(value: unknown): SettingsDocument {
 export function repoSettings(value: unknown): RepoSettings {
     if (!isRecord(value) || typeof value.repoName !== "string"
         || typeof value.autoSaveLearnedRules !== "boolean" || !isDeliveryMode(value.delivery)
-        || typeof value.configured !== "boolean" || typeof value.dismissed !== "boolean") {
+        || typeof value.configured !== "boolean" || typeof value.dismissed !== "boolean"
+        || (value.pathCaseSensitive !== undefined && typeof value.pathCaseSensitive !== "boolean")) {
         throw new Error("Invalid repository settings response.");
     }
     const instructionMappings = value.instructionMappings === undefined ? [] : parseInstructionMappings(value.instructionMappings);
     return {
         repoName: value.repoName, autoSaveLearnedRules: value.autoSaveLearnedRules, delivery: value.delivery,
         instructionMappings,
+        ...(value.pathCaseSensitive !== undefined ? { pathCaseSensitive: value.pathCaseSensitive } : {}),
         configured: value.configured, dismissed: value.dismissed,
     };
 }
