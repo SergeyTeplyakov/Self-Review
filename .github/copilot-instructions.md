@@ -93,3 +93,7 @@ A UI change is not finished until the user can see it. Before reporting it done:
 
 Completing a change never implies running paid agent reviews, pushing, opening or
 merging a pull request, or publishing a release; each needs its own authorization.
+Invoking the repository-local `.github/skills/create-pr/` workflow authorizes its
+stated PR stages, including a merge only after its explicit safety gates pass.
+Higher-priority instructions, explicit no-merge requests, native permission or
+confirmation gates, branch protection, and repository policy still apply.
