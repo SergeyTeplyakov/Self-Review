@@ -1,11 +1,13 @@
 import { test } from "node:test";
 import type { TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { appendFile, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { readdirSync } from "node:fs";
+import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { Delivery, ReviewService, ReviewWatcher, Store, runGit, startReviewServer } from "./modules.mjs";
+import { setTimeout as realDelay } from "node:timers/promises";
+import { captureSnapshot, Delivery, ReviewService, ReviewWatcher, Store, runGit, startReviewServer } from "./modules.mjs";
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 async function until(predicate: () => boolean | Promise<boolean>): Promise<void> {
@@ -25,17 +27,76 @@ async function fixture(t: TestContext) {
     await writeFile(path.join(repo, ".gitignore"), "node_modules/\nbuild/\n");
     await git("add", ".");
     await git("commit", "-qm", "base");
-    const service = new ReviewService({ store: new Store(path.join(tmp, "data")) });
+    const store = new Store(path.join(tmp, "data"));
+    const service = new ReviewService({ store });
     const id = await service.ensureReview({ repoPath: repo, scope: "pending", exclude: ["excluded.ts"] });
     let refreshes = 0;
     const logs: string[] = [];
     const watcher = new ReviewWatcher({
         getReview: (id) => service.getReview(id),
-        refresh: async (id) => { refreshes++; return service.refresh(id); },
+        refresh: async (id, current) => { refreshes++; return service.refresh(id, current); },
     }, (text) => logs.push(text), 100);
     t.after(async () => { await watcher.close(); await rm(tmp, { recursive: true, force: true }); });
-    return { tmp, repo, git, service, id, watcher, logs, count: () => refreshes };
+    return { tmp, repo, git, store, service, id, watcher, logs, count: () => refreshes };
 }
+
+test("pending and all match Git's inventory and patch without counting CRLF index stat mismatches", async (t) => {
+    const f = await fixture(t);
+    const git = (...args: string[]) => f.git("-c", "core.autocrlf=true", ...args);
+    const generated = path.join(f.repo, "generated.txt");
+    const dist = "extensions/self-review/dist";
+    const testFile = "extensions/self-review/test/handwritten.test.mts";
+    await mkdir(path.join(f.repo, dist), { recursive: true });
+    await mkdir(path.dirname(path.join(f.repo, testFile)), { recursive: true });
+    await writeFile(path.join(f.repo, dist, "artifact.js"), "old output\n");
+    await writeFile(path.join(f.repo, testFile), "old test\n");
+    await writeFile(generated, "one\r\ntwo\r\n");
+    await git("add", ".");
+    await git("commit", "-qm", "add CRLF worktree file");
+    await git("switch", "-qc", "feature");
+    await writeFile(path.join(f.repo, ".gitattributes"), "generated.txt text eol=lf\n");
+    await git("add", ".gitattributes");
+    await git("commit", "-qm", "canonical line endings");
+    await writeFile(generated, "one\ntwo\n");
+    assert.match((await git("status", "--porcelain")).stdout, /^ M generated\.txt\r?$/m);
+    await writeFile(path.join(f.repo, "file.ts"), "edited\n");
+    await writeFile(path.join(f.repo, testFile), "new test\n");
+    await writeFile(path.join(f.repo, dist, "artifact.js"), "new output\n");
+    await writeFile(path.join(f.repo, "staged.ts"), "staged\n");
+    await git("add", "staged.ts");
+    await writeFile(path.join(f.repo, "new.ts"), "untracked\n");
+    const gitPaths = ["--", ".", `:(exclude)${dist}`];
+    const mergeBase = (await git("merge-base", "main", "HEAD")).stdout.trim();
+    const head = (await git("rev-parse", "HEAD")).stdout.trim();
+    assert.notEqual(mergeBase, head);
+    const indexPath = path.join(f.repo, ".git", "index");
+    const indexBefore = await readFile(indexPath);
+    for (const scope of ["pending", "all"] as const) {
+        const base = scope === "all" ? mergeBase : head;
+        const snapshot = await captureSnapshot({ repoRoot: f.repo, base: "main", scope, exclude: [dist] });
+        assert.equal(snapshot.baseCommit, base);
+        const tracked = (await git("diff", "--name-status", base, ...gitPaths)).stdout.trim().split(/\r?\n/);
+        const untracked = (await git("ls-files", "--others", "--exclude-standard", ...gitPaths)).stdout.trim().split(/\r?\n/);
+        const statusLetter: Record<string, string> = { modified: "M", added: "A", deleted: "D" };
+        assert.deepEqual(snapshot.files.map((file) => `${statusLetter[file.status]}\t${file.path}`).sort(),
+            [...tracked, ...untracked.map((file) => `A\t${file}`)].sort());
+        assert.deepEqual(snapshot.uncommittedFiles.sort(), [testFile, "file.ts", "new.ts", "staged.ts"]);
+        assert.ok(snapshot.files.some((file) => file.path === testFile), "the dist exclusion keeps handwritten tests");
+        assert.equal(snapshot.files.some((file) => file.path === ".gitattributes"), scope === "all");
+        for (const file of snapshot.files.filter((file) => !file.untracked)) {
+            const gitPatch = (await git("diff", "--no-color", base, "--", file.path)).stdout.split(/\r?\n/);
+            const gitEdits = gitPatch.slice(gitPatch.findIndex((line) => line.startsWith("@@")) + 1)
+                .filter((line) => line.startsWith("+") || line.startsWith("-"));
+            const snapshotEdits = file.hunks.flatMap((hunk) => hunk.rows.flatMap((row) =>
+                row.t === "ctx" ? [] : [(row.t === "add" ? "+" : "-") + row.s]));
+            assert.deepEqual(snapshotEdits, gitEdits, `${scope}: ${file.path}`);
+        }
+    }
+    assert.deepEqual(await readFile(indexPath), indexBefore, "review captures never rewrite the index");
+    await writeFile(generated, "one\nchanged\n");
+    const changed = await captureSnapshot({ repoRoot: f.repo, base: null, scope: "pending", exclude: [dist] });
+    assert.deepEqual(changed.uncommittedFiles.sort(), [testFile, "file.ts", "generated.txt", "new.ts", "staged.ts"]);
+});
 
 test("debounce waits for the last event and releases every watcher and pending timer on close", async (t) => {
     const f = await fixture(t);
@@ -65,14 +126,16 @@ test("debounce waits for the last event and releases every watcher and pending t
     await refreshed;
     assert.equal(calls, 2, "the burst produces exactly one refresh");
     await writeFile(path.join(f.repo, "file.ts"), "changed during continuous watcher noise\n");
-    const boundedRefresh = new Promise<void>((resolve) => { notify = resolve; });
+    const settledRefresh = new Promise<void>((resolve) => { notify = resolve; });
     source.change("file.ts");
-    for (let i = 0; i < 15; i++) {
-        t.mock.timers.tick(100);
-        source.change("ignored-output.log");
+    for (let i = 0; i < 20; i++) {
+        t.mock.timers.tick(99);
+        source.change("file.ts");
     }
-    await boundedRefresh;
-    assert.equal(calls, 3, "continuous events cannot postpone a relevant refresh beyond the maximum wait");
+    assert.equal(calls, 2, "even a long burst cannot force a refresh before it settles");
+    t.mock.timers.tick(100);
+    await settledRefresh;
+    assert.equal(calls, 3);
     source.fail(new Error("watch failed"));
     assert.ok(source.closed);
     assert.match(f.logs[0] ?? "", /watch failed.*Manual Refresh remains available/);
@@ -81,6 +144,222 @@ test("debounce waits for the last event and releases every watcher and pending t
     t.mock.timers.tick(500);
     assert.equal(calls, 3, "close cancels the queued refresh");
     assert.ok([...sources.values()].every((entry) => entry.closed));
+});
+
+test("ignored writes do not delay publication of a settled tracked edit", async (t) => {
+    const f = await fixture(t);
+    await mkdir(path.join(f.repo, "build"));
+    let change: (file: string) => void = () => assert.fail("checkout watcher not registered");
+    const published: number[] = [];
+    const checks: string[] = [];
+    const watcher = new ReviewWatcher({
+        getReview: (id) => f.service.getReview(id),
+        refresh: async (id, current) => {
+            // Even an ignored event delivered during capture must not invalidate it.
+            if (published.length) change("build/noise.log");
+            const result = await f.service.refresh(id, current);
+            if (result) published.push((await f.service.getReview(id)).git!.uncommittedFiles);
+        },
+    }, (text) => f.logs.push(text), 100, (root, callback) => {
+        if (root === f.repo) change = callback;
+        return { close() {} };
+    }, (root, args, options) => {
+        checks.push(options?.input ?? "");
+        return runGit(root, args, options);
+    });
+    t.after(() => watcher.close());
+    await watcher.setReview(f.id);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    await writeFile(path.join(f.repo, "file.ts"), "tracked edit\n");
+    change("file.ts");
+    for (let i = 0; i < 10; i++) {
+        await appendFile(path.join(f.repo, "build", "noise.log"), "ignored write\n");
+        change("build/noise.log");
+        change("build/other.log");
+        t.mock.timers.tick(20);
+    }
+    // Let Git finish without advancing the mocked clock past the last noise event.
+    const deadline = Date.now() + 5000;
+    while (published.length < 2 && Date.now() < deadline) await realDelay(25);
+    assert.deepEqual(published, [0, 1]);
+    assert.deepEqual(checks, ["build/noise.log\0build/other.log\0"], "ignored events share one async Git check");
+});
+
+test("a cancelled refresh retries when ignored-event classification finishes during cleanup", async (t) => {
+    const f = await fixture(t);
+    await mkdir(path.join(f.repo, "build"));
+    let change: (file: string) => void = () => assert.fail("checkout watcher not registered");
+    let calls = 0;
+    const watcher = new ReviewWatcher({
+        getReview: (id) => f.service.getReview(id),
+        refresh: async (id, current) => {
+            if (++calls === 2) {
+                change("build/noise.log");
+                assert.equal(current(), false, "pending classification cancels publication");
+                await until(current);
+                return null;
+            }
+            return f.service.refresh(id, current);
+        },
+    }, (text) => f.logs.push(text), 50, (root, callback) => {
+        if (root === f.repo) change = callback;
+        return { close() {} };
+    });
+    t.after(() => watcher.close());
+    await watcher.setReview(f.id);
+    await writeFile(path.join(f.repo, "file.ts"), "settled edit\n");
+    change("file.ts");
+    await until(async () => (await f.service.getReview(f.id)).git?.uncommittedFiles === 1);
+    assert.equal(calls, 3);
+    assert.deepEqual(f.logs, []);
+});
+
+test("tracked output excluded from the review does not delay a source refresh", async (t) => {
+    const f = await fixture(t);
+    await mkdir(path.join(f.repo, "dist"));
+    const artifact = path.join(f.repo, "dist", "build.js");
+    await writeFile(artifact, "original output\n");
+    await f.git("add", "dist");
+    await f.git("commit", "-qm", "track output");
+    const id = await f.service.ensureReview({ repoPath: f.repo, scope: "pending", exclude: ["dist"] });
+    let change: (file: string) => void = () => assert.fail("checkout watcher not registered");
+    const watcher = new ReviewWatcher({
+        getReview: (id) => f.service.getReview(id),
+        refresh: (id, current) => f.service.refresh(id, current),
+    }, (text) => f.logs.push(text), 100, (root, callback) => {
+        if (root === f.repo) change = callback;
+        return { close() {} };
+    });
+    t.after(() => watcher.close());
+    await watcher.setReview(id);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    await writeFile(path.join(f.repo, "file.ts"), "source edit\n");
+    change("file.ts");
+    for (let i = 0; i < 10; i++) {
+        await appendFile(artifact, "generated output\n");
+        change("dist/build.js");
+        t.mock.timers.tick(20);
+    }
+    const deadline = Date.now() + 5000;
+    while ((await f.service.getReview(id)).git?.uncommittedFiles === 0 && Date.now() < deadline) await realDelay(25);
+    assert.deepEqual((await f.service.getSnapshot(id)).files.map((file) => file.path), ["file.ts"]);
+});
+
+test("a settled watcher refresh survives rejection of the preceding manual capture", async (t) => {
+    const f = await fixture(t);
+    await writeFile(path.join(f.repo, "file.ts"), "settled edit\n");
+    let reject!: (error: Error) => void;
+    const promise = new Promise<never>((_resolve, fail) => { reject = fail; });
+    t.mock.method(f.service, "refreshOnce", () => promise);
+    const manual = f.service.refresh(f.id);
+    const rejected = assert.rejects(manual, /capture failed/);
+    const queued = f.service.refresh(f.id, () => true);
+    reject(new Error("capture failed"));
+    await rejected;
+    assert.equal((await queued)?.revisionId, "r2");
+    assert.equal((await f.service.getReview(f.id)).git?.uncommittedFiles, 1);
+});
+
+for (const phase of ["snapshot", "metadata"] as const) {
+    test(`invalidation during ${phase} persistence preserves the visible revision`, async (t) => {
+        const f = await fixture(t);
+        const before = await f.service.getReview(f.id);
+        await writeFile(path.join(f.repo, "file.ts"), "transient contents\n");
+        let current = true;
+        const writer = phase === "snapshot" ? (() => {
+            const writeSnapshot = f.store.writeSnapshot.bind(f.store);
+            return t.mock.method(f.store, "writeSnapshot", async (...args: Parameters<typeof writeSnapshot>) => {
+                await writeSnapshot(...args);
+                current = false;
+            });
+        })() : undefined;
+        const metadata = f.store.reviewFile(f.id);
+        const result = await f.service.refresh(f.id, () => {
+            if (phase === "metadata" && readdirSync(path.dirname(metadata)).some((name) =>
+                name.startsWith(`${path.basename(metadata)}.`) && name.endsWith(".tmp"))) current = false;
+            return current;
+        });
+        assert.equal(result, null);
+        assert.equal(current, false, "the capture was invalidated at the intended persistence boundary");
+        assert.deepEqual(await f.service.getReview(f.id), before);
+        assert.equal(await f.store.readSnapshot(f.id, "r2"), null);
+        assert.equal(readdirSync(path.dirname(metadata)).some((name) => name.endsWith(".tmp")), false);
+        writer?.mock.restore();
+        await writeFile(path.join(f.repo, "file.ts"), "settled contents\n");
+        const settled = await f.service.refresh(f.id, () => true);
+        assert.equal(settled?.revisionId, "r2", "the cancelled revision was not published");
+    });
+}
+
+test("repeated dist rebuilds never publish transient uncommitted counts", async (t) => {
+    const f = await fixture(t);
+    const file = path.join(f.repo, "file.ts");
+    const dist = path.join(f.repo, "dist");
+    const output = Array.from({ length: 15 }, (_, i) => path.join(dist, `output-${i}.js`));
+    const restoreDist = async () => {
+        await mkdir(dist, { recursive: true });
+        await Promise.all(output.map((name) => writeFile(name, "generated\n")));
+    };
+    await restoreDist();
+    await f.git("add", "dist");
+    await f.git("commit", "-qm", "track generated output");
+    await writeFile(file, "initial local edit\n");
+    await writeFile(path.join(f.repo, "other.ts"), "second local edit\n");
+    await f.service.refresh(f.id);
+
+    let checkout: ((file: string) => void) | undefined;
+    let rebuild = 0;
+    const capturedCounts: number[] = [];
+    const service = new ReviewService({
+        store: f.service.store,
+        git: {
+            ...f.service.git,
+            captureSnapshot: async (options) => {
+                const snapshot = await f.service.git.captureSnapshot(options);
+                capturedCounts.push(snapshot.uncommittedFiles.length);
+                if (snapshot.files.some((entry) => entry.path.startsWith("dist/") && entry.status === "deleted")) {
+                    // Finish the destructive rebuild while the real Git snapshot is in flight.
+                    await restoreDist();
+                    await writeFile(file, `local edit after rebuild ${rebuild}\n`);
+                    checkout?.("dist");
+                }
+                return snapshot;
+            },
+        },
+    });
+    let lastRevision = (await service.getReview(f.id)).currentRevisionId;
+    const publishedCounts = [2];
+    let finishedRebuilds = 0;
+    const watcher = new ReviewWatcher({
+        getReview: (id) => service.getReview(id),
+        refresh: async (id, current) => {
+            const result = await service.refresh(id, current);
+            const review = await service.getReview(id);
+            if (review.currentRevisionId !== lastRevision) {
+                lastRevision = review.currentRevisionId;
+                publishedCounts.push(review.git!.uncommittedFiles);
+                if (!(await service.getSnapshot(id)).files.some((entry) => entry.path.startsWith("dist/"))) {
+                    finishedRebuilds++;
+                }
+            }
+            return result;
+        },
+    }, (text) => f.logs.push(text), 10, (root, change) => {
+        if (root === f.repo) checkout = change;
+        return { close() {} };
+    });
+    t.after(() => watcher.close());
+    await watcher.setReview(f.id);
+    assert.ok(checkout);
+    for (rebuild = 1; rebuild <= 2; rebuild++) {
+        await rm(dist, { recursive: true });
+        checkout("dist");
+        await until(() => finishedRebuilds === rebuild);
+    }
+    t.diagnostic(`Uncommitted counts: captured ${capturedCounts.join(" -> ")}; published ${publishedCounts.join(" -> ")}`);
+    assert.deepEqual(capturedCounts, [2, 17, 2, 17, 2], "Git sees the real deletion during each rebuild");
+    assert.deepEqual(publishedCounts, [2, 2, 2], "only settled snapshots reach the canvas count");
+    assert.deepEqual(f.logs, []);
 });
 
 test("checkout edits preserve review options and ignore output and Git noise", async (t) => {
@@ -167,6 +446,32 @@ test("deletion refreshes when a captured untracked file was never inventoried", 
     assert.deepEqual(f.logs, []);
 });
 
+test("the uncommitted count honors Git's submodule status without adding untracked-only diff entries", async (t) => {
+    const f = await fixture(t);
+    const source = path.join(f.tmp, "nested");
+    const submodule = "vendor/lib";
+    await runGit(f.tmp, ["init", "-q", "-b", "main", source]);
+    await writeFile(path.join(source, ".gitignore"), "ignored.txt\n");
+    await runGit(source, ["add", "."]);
+    await runGit(source, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "base"]);
+    await f.git("-c", "protocol.file.allow=always", "submodule", "add", "-q", source, submodule);
+    await f.git("commit", "-qam", "submodule");
+    await writeFile(path.join(f.repo, submodule, "ignored.txt"), "ignored\n");
+    const options = { repoRoot: f.repo, base: null, scope: "pending" as const };
+    assert.deepEqual((await captureSnapshot(options)).uncommittedFiles, []);
+
+    await writeFile(path.join(f.repo, submodule, "new.txt"), "untracked\n");
+    assert.equal((await f.git("status", "--porcelain=v1", "--untracked-files=all")).stdout.trimEnd(), " M vendor/lib");
+    assert.equal((await f.git("diff", "--name-only", "HEAD")).stdout, "");
+    const snapshot = await captureSnapshot(options);
+    assert.deepEqual(snapshot.uncommittedFiles, [submodule]);
+    assert.deepEqual(snapshot.files, []);
+    assert.deepEqual((await captureSnapshot({ ...options, includeUntracked: false })).uncommittedFiles, []);
+    assert.deepEqual((await captureSnapshot({ ...options, exclude: ["vendor"] })).uncommittedFiles, []);
+    await f.git("config", `submodule.${submodule}.ignore`, "untracked");
+    assert.deepEqual((await captureSnapshot(options)).uncommittedFiles, []);
+});
+
 test("ignored submodule events do not refresh even with a subsequent tracked event", async (t) => {
     const f = await fixture(t);
     const source = path.join(f.tmp, "submodule-source");
@@ -217,11 +522,14 @@ test("submodule working files and stored HEAD metadata trigger superproject refr
     await runGit(source, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "base"]);
     await f.git("-c", "protocol.file.allow=always", "submodule", "add", "-q", source, "vendor/lib");
     await f.git("commit", "-qam", "submodule");
-    await f.watcher.setReview(f.id);
+    // Excluding a nested file does not exclude its owning gitlink from Git's diff.
+    const id = await f.service.ensureReview({ repoPath: f.repo, scope: "pending", exclude: ["vendor/lib/nested.ts"] });
+    await f.watcher.setReview(id);
     const submodule = path.join(f.repo, "vendor", "lib");
     const beforeTracked = f.count();
     await writeFile(path.join(submodule, "nested.ts"), "dirty\n");
-    await until(async () => (await f.service.getSnapshot(f.id)).files.some((file) => file.path === "vendor/lib"));
+    await until(async () => (await f.service.getSnapshot(id)).files.some((file) => file.path === "vendor/lib"));
+    assert.equal((await f.service.getReview(id)).git?.uncommittedFiles, 1);
     await until(() => f.count() > beforeTracked);
     await mkdir(path.join(submodule, "node_modules"));
     await writeFile(path.join(submodule, "node_modules", "output.js"), "ignored\n");

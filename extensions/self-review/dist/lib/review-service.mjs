@@ -467,10 +467,13 @@ export class ReviewService extends EventEmitter {
         const error = this.refreshErrors.get(reviewId);
         return error === undefined ? { status: "idle" } : { status: "error", error };
     }
-    // Coalesces overlapping refreshes; a refresh requested mid-capture triggers one more pass.
-    refresh(reviewId) {
+    refresh(reviewId, isCurrent) {
         const running = this.refreshes.get(reviewId);
         if (running?.promise) {
+            if (isCurrent) {
+                const resume = () => isCurrent() ? this.refresh(reviewId, isCurrent) : null;
+                return running.promise.then(resume, resume);
+            }
             running.again = true;
             return running.promise;
         }
@@ -479,11 +482,11 @@ export class ReviewService extends EventEmitter {
         this.refreshErrors.delete(reviewId);
         entry.promise = (async () => {
             try {
-                let result;
-                do {
+                let result = isCurrent ? await this.captureRevision(reviewId, isCurrent) : await this.refreshOnce(reviewId);
+                while (entry.again) {
                     entry.again = false;
                     result = await this.refreshOnce(reviewId);
-                } while (entry.again);
+                }
                 return result;
             }
             catch (error) {
@@ -498,7 +501,12 @@ export class ReviewService extends EventEmitter {
         this.changed(reviewId, "refresh");
         return entry.promise;
     }
-    async refreshOnce(reviewId) {
+    refreshOnce(reviewId) {
+        return this.captureRevision(reviewId);
+    }
+    async captureRevision(reviewId, isCurrent) {
+        if (isCurrent && !isCurrent())
+            return null;
         const before = await this.getReview(reviewId);
         if (isRetiredCommitReview(before))
             throw retiredCommitError(before);
@@ -515,9 +523,15 @@ export class ReviewService extends EventEmitter {
             });
         }
         catch (err) {
+            if (isCurrent && !isCurrent())
+                return null;
             throw new ReviewError("git_error", errorMessage(err));
         }
+        if (isCurrent && !isCurrent())
+            return null;
         const result = await this.store.updateReview(reviewId, async (review) => {
+            if (isCurrent && !isCurrent())
+                return { write: false, value: null };
             if (!review)
                 throw notFound(`Review ${reviewId} not found.`);
             const git = {
@@ -534,7 +548,6 @@ export class ReviewService extends EventEmitter {
             if (!latest || latest.fingerprint !== snapshot.fingerprint) {
                 revisionId = `r${review.revisions.length + 1}`;
                 const stats = snapshot.files.reduce((a, f) => ({ additions: a.additions + f.additions, deletions: a.deletions + f.deletions }), { additions: 0, deletions: 0 });
-                await this.store.writeSnapshot(reviewId, revisionId, { revisionId, ...snapshot });
                 review.revisions.push({
                     revisionId,
                     fingerprint: snapshot.fingerprint,
@@ -550,8 +563,22 @@ export class ReviewService extends EventEmitter {
             review.git = git;
             review.branch = snapshot.branch;
             const moved = await this.relocateThreads(review, revisionId, snapshot.baseCommit);
-            return { review, value: { revisionId: revisionId, created, moved } };
+            if (isCurrent && !isCurrent())
+                return { write: false, value: null };
+            if (created)
+                await this.store.writeSnapshot(reviewId, revisionId, { revisionId, ...snapshot });
+            return {
+                review,
+                value: { revisionId: revisionId, created, moved },
+                publication: isCurrent ? {
+                    isCurrent,
+                    discardedValue: null,
+                    discard: created ? () => this.store.discardSnapshot(reviewId, revisionId) : undefined,
+                } : undefined,
+            };
         });
+        if (!result)
+            return null;
         if (result.created || result.moved)
             this.changed(reviewId, "revision");
         else

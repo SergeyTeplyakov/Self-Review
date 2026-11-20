@@ -7,6 +7,7 @@ import { test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseExtensionVersion } from "../src/lib/extension-version.mjs";
 import { distributionBuildId, normalizeDistributionLineEndings } from "../scripts/distribution-fingerprint.mjs";
+import { publishDirectory } from "../scripts/publish-distribution.mjs";
 
 const extensionRoot = fileURLToPath(new URL("..", import.meta.url));
 
@@ -42,6 +43,32 @@ test("distribution files and build IDs are stable across line endings and enumer
     assert.equal(await readFile(path.join(windowsRoot, relativeFiles[0]), "utf8"), "first\nsecond\n");
     assert.equal(await readFile(path.join(windowsRoot, relativeFiles[1]), "utf8"), "nested\ncontent\n");
 });
+
+for (const newType of ["directory", "file"] as const) {
+    test(`publishing replaces an incompatible output with a ${newType}`, async (t) => {
+        const root = await mkdtemp(path.join(os.tmpdir(), "self-review-publish-"));
+        t.after(() => rm(root, { recursive: true, force: true }));
+        const staged = path.join(root, "staged");
+        const dist = path.join(root, "dist");
+        const target = path.join(dist, "artifact");
+        const source = path.join(staged, "artifact");
+        await mkdir(staged);
+        await mkdir(dist);
+        const newContents = "replacement\n";
+        const oldContents = "obsolete\n";
+        const directory = newType === "directory" ? source : target;
+        const file = newType === "file" ? source : target;
+        await mkdir(directory);
+        await writeFile(path.join(directory, "child"), newType === "directory" ? newContents : oldContents);
+        await writeFile(file, newType === "file" ? newContents : oldContents);
+
+        publishDirectory(staged, dist);
+
+        assert.deepEqual(await readdir(dist), ["artifact"]);
+        if (newType === "directory") assert.deepEqual(await readdir(target), ["child"]);
+        assert.equal(await readFile(newType === "directory" ? path.join(target, "child") : target, "utf8"), newContents);
+    });
+}
 
 test("the installation-shaped distribution contains executable modules and all browser assets", async (t) => {
     const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), "self-review-package-"));

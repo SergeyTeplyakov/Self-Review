@@ -1,6 +1,7 @@
 // Durable review storage under ~/.copilot/extension-data/self-review.
 // Writes are atomic (temp file + rename) and serialized per key so concurrent
 // UI posts and agent replies cannot lose each other's updates.
+import { renameSync } from "node:fs";
 import { cp, mkdir, open, readFile, rename, rm, stat, writeFile, appendFile, unlink } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import os from "node:os";
@@ -82,16 +83,29 @@ async function withRetry(fn) {
         }
     }
 }
-async function writeJsonAtomic(file, value) {
+async function writeJsonAtomic(file, value, isCurrent) {
     await mkdir(path.dirname(file), { recursive: true });
     const tmp = `${file}.${process.pid}.${randomUUID()}.tmp`;
-    await writeFile(tmp, JSON.stringify(value, null, 2), "utf8");
+    let published = false;
     try {
-        await withRetry(() => rename(tmp, file));
+        await writeFile(tmp, JSON.stringify(value, null, 2), "utf8");
+        published = await withRetry(async () => {
+            if (isCurrent) {
+                if (!isCurrent())
+                    return false;
+                // Do not yield to watcher callbacks between the check and the commit.
+                renameSync(tmp, file);
+            }
+            else {
+                await rename(tmp, file);
+            }
+            return true;
+        });
+        return published;
     }
-    catch (err) {
-        await unlink(tmp).catch(() => { });
-        throw err;
+    finally {
+        if (!published)
+            await rm(tmp, { force: true });
     }
 }
 async function readJson(file) {
@@ -178,10 +192,13 @@ export class Store {
     async updateReview(reviewId, mutate) {
         return this.lock(`review:${reviewId}`, async () => {
             const current = await this.readReview(reviewId);
-            const { review, value, write = true, journalLessons = [] } = (await mutate(current)) ?? {};
+            const { review, value, write = true, journalLessons = [], publication } = (await mutate(current)) ?? {};
             if (write && review) {
                 review.updatedAt = new Date().toISOString();
-                await writeJsonAtomic(this.reviewFile(reviewId), review);
+                if (!await writeJsonAtomic(this.reviewFile(reviewId), review, publication?.isCurrent) && publication) {
+                    await publication.discard?.();
+                    return publication.discardedValue;
+                }
             }
             // Keep journal entries in the same order as committed versions of this review.
             for (const lesson of journalLessons)
@@ -191,6 +208,9 @@ export class Store {
     }
     async writeSnapshot(reviewId, revisionId, snapshot) {
         await writeJsonAtomic(this.snapshotFile(reviewId, revisionId), snapshot);
+    }
+    async discardSnapshot(reviewId, revisionId) {
+        await withRetry(() => rm(this.snapshotFile(reviewId, revisionId), { force: true }));
     }
     async readSnapshot(reviewId, revisionId) {
         return await readJson(this.snapshotFile(reviewId, revisionId));

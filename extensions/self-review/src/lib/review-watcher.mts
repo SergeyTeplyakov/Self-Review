@@ -7,12 +7,15 @@ import type { Log } from "../../types/contracts.js";
 import type { ReviewService } from "./review-service.mjs";
 
 const DEBOUNCE_MS = 350;
-const MAX_DEBOUNCE_MS = 1500;
 const gitInput = (name: string) => !name.endsWith(".lock")
     && (/^(HEAD|index|packed-refs|config|shallow|info\/exclude)$/.test(name) || name.startsWith("refs/")
         || (name.startsWith("modules/") && (/\/(HEAD|index|packed-refs|config|shallow|info\/exclude)$/.test(name) || name.includes("/refs/"))));
 const message = (error: unknown) => error instanceof Error ? error.message : String(error);
-type WatchDirectory = (root: string, changed: (file: string | null) => void, failed: (error: Error) => void) => Pick<FSWatcher, "close">;
+// Only shortcut plain repo-relative pathspecs. Let Git handle globs and magic.
+const plainPath = (spec: string) => /^(?:[\w .@+-]+\/)*[\w .@+-]+\/?$/.test(spec)
+    && !spec.split("/").some((part) => part === "." || part === "..");
+const within = (file: string, root: string) => file === root || file.startsWith(`${root}/`);
+type WatchDirectory = (root: string, changed: (file: string | null, event?: "rename" | "change") => void, failed: (error: Error) => void) => Pick<FSWatcher, "close">;
 type FileInventory = { files: Set<string>; directories: Set<string> };
 type GitInventory = FileInventory & { submodules: Set<string>; submoduleFiles: Map<string, FileInventory> };
 function fileInventory(files: Iterable<string>): FileInventory {
@@ -30,7 +33,7 @@ function matchesPaths(inventories: FileInventory[], paths: string[]): boolean {
     return paths.some((file) => inventories.some((inventory) => inventory.files.has(file) || inventory.directories.has(file)));
 }
 const createDirectoryWatcher: WatchDirectory = (root, changed, failed) => {
-    const watcher = watch(root, { recursive: true, persistent: false }, (_event, file) => changed(file?.toString() ?? null));
+    const watcher = watch(root, { recursive: true, persistent: false }, (event, file) => changed(file?.toString() ?? null, event));
     watcher.on("error", failed);
     return watcher;
 };
@@ -39,7 +42,6 @@ const createDirectoryWatcher: WatchDirectory = (root, changed, failed) => {
 export class ReviewWatcher {
     private watchers: Array<Pick<FSWatcher, "close">> = [];
     private timer: ReturnType<typeof setTimeout> | undefined;
-    private maxTimer: ReturnType<typeof setTimeout> | undefined;
     private generation = 0;
     private reviewId: string | null = null;
     private candidates = new Map<string, { file: string; git: boolean }>();
@@ -47,10 +49,13 @@ export class ReviewWatcher {
     private running: Promise<void> = Promise.resolve();
 
     constructor(
-        private readonly service: Pick<ReviewService, "getReview" | "refresh">,
+        private readonly service: Pick<ReviewService, "getReview"> & {
+            refresh(reviewId: string, isCurrent: () => boolean): Promise<unknown>;
+        },
         private readonly log: Log,
         private readonly debounceMs = DEBOUNCE_MS,
         private readonly watchDirectory: WatchDirectory = createDirectoryWatcher,
+        private readonly git: typeof runGit = runGit,
     ) {}
 
     async setReview(reviewId: string): Promise<void> {
@@ -61,6 +66,17 @@ export class ReviewWatcher {
         const signatures = new Map<string, string>();
         try {
             const review = await this.service.getReview(reviewId);
+            const excluded = (review.exclude ?? []).filter(plainPath).map((spec) => spec.replace(/\/$/, ""));
+            const paths = review.paths ?? [];
+            const included = paths.length && paths.every(plainPath)
+                ? paths.map((spec) => spec.replace(/\/$/, "").toLowerCase())
+                : [];
+            const outsideReview = (file: string) => {
+                if ([".gitignore", ".gitattributes"].includes(path.posix.basename(file).toLowerCase())) return false;
+                const lower = file.toLowerCase();
+                return excluded.some((root) => within(file, root))
+                    || (included.length > 0 && !included.some((root) => within(lower, root) || within(root, lower)));
+            };
             const submoduleInventory = async (submodule: string) => {
                 const result = await runGit(path.join(review.repoRoot, submodule), ["ls-files", "--cached", "--others", "--exclude-standard", "-z"]);
                 return fileInventory(result.stdout.split("\0").filter(Boolean));
@@ -87,12 +103,35 @@ export class ReviewWatcher {
             }
             let known = initialFiles;
             if (generation !== this.generation || this.closed) return;
+            let eventVersion = 0;
+            let needsRefresh = true;
+            let ignoreEpoch = 0;
+            const ignoredPaths = new Set<string>();
+            const unchecked = new Map<string, number>();
+            let pathVersion = 0;
+            let classifying = false;
+            const refresh = async (version: number) => {
+                const isCurrent = () => generation === this.generation && !this.closed && eventVersion === version
+                    && !classifying && !unchecked.size;
+                if (!needsRefresh || !isCurrent()) return;
+                const result = await this.service.refresh(reviewId, isCurrent);
+                if (result !== null && isCurrent()) needsRefresh = false;
+            };
+            const submoduleFor = (file: string) => {
+                let parent = path.posix.dirname(file);
+                while (parent !== "." && !known.submodules.has(parent)) parent = path.posix.dirname(parent);
+                return parent;
+            };
+            const ignoreLocation = (file: string, parent: string) => {
+                if (matchesPaths([known], [file])) return null;
+                const relative = parent === "." ? file : path.posix.relative(parent, file);
+                const nested = known.submoduleFiles.get(parent);
+                return nested && matchesPaths([nested], [relative]) ? null : { parent, relative };
+            };
             const add = (root: string, metadata: boolean) => {
                 const flush = () => {
-                    clearTimeout(this.timer);
-                    clearTimeout(this.maxTimer);
                     this.timer = undefined;
-                    this.maxTimer = undefined;
+                    const version = eventVersion;
                     const candidates = this.candidates;
                     this.candidates = new Map();
                     // Serialize checks as well as refreshes: read notifications must not race signature updates.
@@ -191,20 +230,94 @@ export class ReviewWatcher {
                             }
                             known = next;
                         }
-                        if (relevant && generation === this.generation && !this.closed) await this.service.refresh(reviewId);
+                        needsRefresh ||= relevant;
+                        await refresh(version);
                     }).catch((error: unknown) => this.warn(error));
                 };
-                const watcher = this.watchDirectory(root, (filename) => {
+                const schedule = () => {
+                    clearTimeout(this.timer);
+                    this.timer = setTimeout(flush, this.debounceMs);
+                    this.timer.unref();
+                };
+                const admit = (file: string) => {
+                    eventVersion++;
+                    this.candidates.set(path.join(root, file), { file, git: metadata });
+                    schedule();
+                };
+                const classify = async () => {
+                    classifying = true;
+                    try {
+                        while (unchecked.size && generation === this.generation && !this.closed) {
+                            const epoch = ignoreEpoch;
+                            const groups = new Map<string, Map<string, { file: string; version: number }>>();
+                            for (const [file, version] of unchecked) {
+                                const location = ignoreLocation(file, submoduleFor(file));
+                                if (!location) {
+                                    unchecked.delete(file);
+                                    admit(file);
+                                    continue;
+                                }
+                                const group = groups.get(location.parent) ?? new Map();
+                                group.set(location.relative, { file, version });
+                                groups.set(location.parent, group);
+                            }
+                            const results = await Promise.all([...groups].map(async ([parent, files]) => {
+                                try {
+                                    const result = await this.git(path.join(root, parent), ["check-ignore", "-z", "--stdin"], {
+                                        allowFail: true, input: [...files.keys()].join("\0") + "\0",
+                                    });
+                                    if (result.exitCode !== 0 && result.exitCode !== 1) {
+                                        throw new Error(`git check-ignore failed: ${result.stderr.trim() || `exit code ${result.exitCode}`}`);
+                                    }
+                                    return [files, new Set(result.stdout.split("\0"))] as const;
+                                } catch (error) {
+                                    this.warn(error);
+                                    return [files, new Set<string>()] as const;
+                                }
+                            }));
+                            if (generation !== this.generation || this.closed) return;
+                            if (epoch !== ignoreEpoch) continue;
+                            for (const [files, ignored] of results) {
+                                for (const [relative, { file, version }] of files) {
+                                    if (unchecked.get(file) !== version) continue;
+                                    unchecked.delete(file);
+                                    if (ignored.has(relative)) {
+                                        if (ignoredPaths.size >= 4096) ignoredPaths.delete(ignoredPaths.values().next().value!);
+                                        ignoredPaths.add(file);
+                                    } else admit(file);
+                                }
+                            }
+                        }
+                    } finally {
+                        classifying = false;
+                        // If the quiet timer already elapsed, classification was the only
+                        // remaining publication barrier. Resume without another quiet period.
+                        if (generation === this.generation && !this.closed && needsRefresh && !this.timer) flush();
+                    }
+                };
+                const watcher = this.watchDirectory(root, (filename, event) => {
                     if (generation !== this.generation || this.closed) return;
                     const file = filename?.replace(/\\/g, "/") ?? "";
                     if (metadata ? file && !gitInput(file) : file.split("/").includes(".git")) return;
-                    const absolute = path.join(root, file);
-                    this.candidates.set(absolute, { file, git: metadata });
-                    clearTimeout(this.timer);
-                    this.timer = setTimeout(flush, this.debounceMs);
-                    if (this.maxTimer === undefined) this.maxTimer = setTimeout(flush, Math.max(MAX_DEBOUNCE_MS, this.debounceMs));
-                    this.timer.unref();
-                    this.maxTimer.unref();
+                    const submodule = !metadata && file ? submoduleFor(file) : ".";
+                    if (!metadata && file && outsideReview(submodule === "." ? file : submodule)) return;
+                    if (metadata || !file || path.posix.basename(file) === ".gitignore") {
+                        ignoreEpoch++;
+                        ignoredPaths.clear();
+                    } else if (event === "rename") {
+                        const affected = (candidate: string) => candidate === file || candidate.startsWith(`${file}/`);
+                        for (const candidate of ignoredPaths) if (affected(candidate)) ignoredPaths.delete(candidate);
+                        for (const candidate of unchecked.keys()) if (affected(candidate)) unchecked.set(candidate, ++pathVersion);
+                    }
+                    if (metadata || !file || !ignoreLocation(file, submodule)) {
+                        admit(file);
+                    } else if (!ignoredPaths.has(file)) {
+                        if (!unchecked.has(file)) unchecked.set(file, ++pathVersion);
+                        if (!classifying) {
+                            classifying = true;
+                            queueMicrotask(() => { void classify(); });
+                        }
+                    }
                 }, (error) => {
                     this.warn(error);
                     watcher.close();
@@ -214,7 +327,7 @@ export class ReviewWatcher {
             add(review.repoRoot, false);
             for (const dir of new Set(dirs.stdout.trim().split(/\r?\n/))) add(dir, true);
             // Close the capture-to-watch gap, using the existing coalesced refresh.
-            await this.service.refresh(reviewId);
+            await refresh(eventVersion);
         } catch (error) {
             if (generation === this.generation) {
                 this.release();
@@ -230,9 +343,7 @@ export class ReviewWatcher {
     private release(): void {
         this.generation++;
         clearTimeout(this.timer);
-        clearTimeout(this.maxTimer);
         this.timer = undefined;
-        this.maxTimer = undefined;
         for (const watcher of this.watchers) watcher.close();
         this.watchers = [];
         this.candidates.clear();

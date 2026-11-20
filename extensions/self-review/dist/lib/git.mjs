@@ -139,10 +139,44 @@ export async function captureSnapshot({ repoRoot, base, paths, exclude, includeU
         }
     }
     files.sort((a, b) => a.path.localeCompare(b.path));
-    const uncommitted = await runGit(repoRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ...pathspec], { allowFail: true });
-    const uncommittedFiles = uncommitted.ok
-        ? uncommitted.stdout.split("\0").filter((e) => /^.. /.test(e)).map((e) => e.slice(3))
-        : [];
+    const status = await runGit(repoRoot, ["status", "--porcelain=v1", "-z",
+        `--untracked-files=${includeUntracked ? "all" : "no"}`, "--", ...pathspec]);
+    const pending = status.stdout.split("\0");
+    // Status can report an unstaged modification for a stale index stat entry
+    // even when Git's content-aware diff is empty. Do not refresh the user's index.
+    const uncommittedFiles = [];
+    const checkContent = [];
+    for (let i = 0; i < pending.length; i++) {
+        const entry = pending[i];
+        if (!entry)
+            continue;
+        const [index, worktree] = entry;
+        const file = entry.slice(3);
+        if (index === " " && worktree === "M")
+            checkContent.push(file);
+        else
+            uncommittedFiles.push(file);
+        if (/[RC]/.test(entry.slice(0, 2)))
+            i++; // NUL porcelain includes the original path as an extra field.
+    }
+    if (checkContent.length) {
+        const diffPaths = baseCommit === head
+            ? new Set(files.map((file) => file.path))
+            : new Set((await runGit(repoRoot, [
+                "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", head, "--", ...pathspec,
+            ])).stdout.split("\0"));
+        const gitlinks = new Set();
+        if (checkContent.some((file) => !diffPaths.has(file))) {
+            // Porcelain can report a dirty submodule even when diff has no patch
+            // for it. Preserve Git's status decision for gitlinks.
+            const index = await runGit(repoRoot, ["ls-files", "--stage", "-z", "--", ...pathspec]);
+            for (const entry of index.stdout.split("\0")) {
+                if (entry.startsWith("160000 "))
+                    gitlinks.add(entry.slice(entry.indexOf("\t") + 1));
+            }
+        }
+        uncommittedFiles.push(...checkContent.filter((file) => diffPaths.has(file) || gitlinks.has(file)));
+    }
     let upstream = null;
     const up = await runGit(repoRoot, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], { allowFail: true });
     if (up.ok && up.stdout.trim()) {
