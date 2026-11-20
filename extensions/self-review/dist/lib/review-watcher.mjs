@@ -7,6 +7,10 @@ const gitInput = (name) => !name.endsWith(".lock")
     && (/^(HEAD|index|packed-refs|config|shallow|info\/exclude)$/.test(name) || name.startsWith("refs/")
         || (name.startsWith("modules/") && (/\/(HEAD|index|packed-refs|config|shallow|info\/exclude)$/.test(name) || name.includes("/refs/"))));
 const message = (error) => error instanceof Error ? error.message : String(error);
+// Only shortcut plain repo-relative pathspecs. Let Git handle globs and magic.
+const plainPath = (spec) => /^(?:[\w .@+-]+\/)*[\w .@+-]+\/?$/.test(spec)
+    && !spec.split("/").some((part) => part === "." || part === "..");
+const within = (file, root) => file === root || file.startsWith(`${root}/`);
 function fileInventory(files) {
     const inventory = { files: new Set(files), directories: new Set() };
     for (const file of inventory.files) {
@@ -56,6 +60,18 @@ export class ReviewWatcher {
         const signatures = new Map();
         try {
             const review = await this.service.getReview(reviewId);
+            const excluded = (review.exclude ?? []).filter(plainPath).map((spec) => spec.replace(/\/$/, ""));
+            const paths = review.paths ?? [];
+            const included = paths.length && paths.every(plainPath)
+                ? paths.map((spec) => spec.replace(/\/$/, "").toLowerCase())
+                : [];
+            const outsideReview = (file) => {
+                if ([".gitignore", ".gitattributes"].includes(path.posix.basename(file).toLowerCase()))
+                    return false;
+                const lower = file.toLowerCase();
+                return excluded.some((root) => within(file, root))
+                    || (included.length > 0 && !included.some((root) => within(lower, root) || within(root, lower)));
+            };
             const submoduleInventory = async (submodule) => {
                 const result = await runGit(path.join(review.repoRoot, submodule), ["ls-files", "--cached", "--others", "--exclude-standard", "-z"]);
                 return fileInventory(result.stdout.split("\0").filter(Boolean));
@@ -297,6 +313,8 @@ export class ReviewWatcher {
                         return;
                     const file = filename?.replace(/\\/g, "/") ?? "";
                     if (metadata ? file && !gitInput(file) : file.split("/").includes(".git"))
+                        return;
+                    if (!metadata && file && outsideReview(file))
                         return;
                     if (metadata || !file || path.posix.basename(file) === ".gitignore") {
                         ignoreEpoch++;

@@ -214,6 +214,37 @@ test("a cancelled refresh retries when ignored-event classification finishes dur
     assert.deepEqual(f.logs, []);
 });
 
+test("tracked output excluded from the review does not delay a source refresh", async (t) => {
+    const f = await fixture(t);
+    await mkdir(path.join(f.repo, "dist"));
+    const artifact = path.join(f.repo, "dist", "build.js");
+    await writeFile(artifact, "original output\n");
+    await f.git("add", "dist");
+    await f.git("commit", "-qm", "track output");
+    const id = await f.service.ensureReview({ repoPath: f.repo, scope: "pending", exclude: ["dist"] });
+    let change: (file: string) => void = () => assert.fail("checkout watcher not registered");
+    const watcher = new ReviewWatcher({
+        getReview: (id) => f.service.getReview(id),
+        refresh: (id, current) => f.service.refresh(id, current),
+    }, (text) => f.logs.push(text), 100, (root, callback) => {
+        if (root === f.repo) change = callback;
+        return { close() {} };
+    });
+    t.after(() => watcher.close());
+    await watcher.setReview(id);
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    await writeFile(path.join(f.repo, "file.ts"), "source edit\n");
+    change("file.ts");
+    for (let i = 0; i < 10; i++) {
+        await appendFile(artifact, "generated output\n");
+        change("dist/build.js");
+        t.mock.timers.tick(20);
+    }
+    const deadline = Date.now() + 5000;
+    while ((await f.service.getReview(id)).git?.uncommittedFiles === 0 && Date.now() < deadline) await realDelay(25);
+    assert.deepEqual((await f.service.getSnapshot(id)).files.map((file) => file.path), ["file.ts"]);
+});
+
 test("a settled watcher refresh survives rejection of the preceding manual capture", async (t) => {
     const f = await fixture(t);
     await writeFile(path.join(f.repo, "file.ts"), "settled edit\n");
