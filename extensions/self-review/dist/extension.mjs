@@ -36,7 +36,7 @@ const log = (message, level = "info") => {
 const store = new Store();
 const settings = new SettingsService({ store, log });
 const autoSaveLearnedRules = async (repoRoot) => (await settings.get(repoRoot)).autoSaveLearnedRules;
-const service = new ReviewService({ store, log, autoSaveLearnedRules });
+const service = new ReviewService({ store, settings, log, autoSaveLearnedRules });
 // instanceId -> { reviewId, server, ready }
 const instances = new Map();
 const openReviewIds = () => new Set([...instances.values()].map((entry) => entry.reviewId));
@@ -441,6 +441,19 @@ const actions = [
                             scope: { type: "string", enum: ["repo", "personal"] },
                             rule: { type: "string", description: "The guideline text. Required unless lessonId is given." },
                             status: { type: "string", enum: LESSON_STATUSES, description: "proposed (default), or declined if the reviewer rejects a proposal." },
+                            destination: {
+                                type: "object",
+                                description: "Suggested repository instruction destination; the reviewer confirms or edits it before saving.",
+                                properties: {
+                                    kind: { type: "string", enum: ["general", "language"] },
+                                    pathPrefix: { type: "string" },
+                                    instructionRoot: { type: "string" },
+                                    language: { type: "string" },
+                                    applyTo: { type: "string" },
+                                },
+                                required: ["kind"],
+                                additionalProperties: false,
+                            },
                         },
                         additionalProperties: false,
                     },

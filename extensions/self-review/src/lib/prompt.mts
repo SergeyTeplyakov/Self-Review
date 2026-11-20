@@ -95,7 +95,7 @@ function batchDisplayPrompt(groups: PromptGroup[]) {
     return `Review submitted · ${count} comments in ${groups.length} ${groups.length === 1 ? "thread" : "threads"}: ${short}`;
 }
 
-const REPO_INSTRUCTION_FILE = "`.github/copilot-instructions.md`";
+const REPO_INSTRUCTION_FILE = "the configured repository instruction destination for the reviewed file";
 
 // Step 2 of the agent contract: how review feedback becomes (or does not become) a standing guideline.
 function guidelineSteps(autoSave: boolean, personalInstructions: string) {
@@ -103,12 +103,13 @@ function guidelineSteps(autoSave: boolean, personalInstructions: string) {
         `2. Auto-save learned rules is ${autoSave ? "on" : "off"}. If feedback reveals a settled reusable rule, state the rule and its scope in the reply and include it in lessons.`,
         "   Read existing instructions first. State applicability in the wording; do not infer a preference from a question or tentative suggestion, or duplicate existing guidance.",
         `   Use repo scope for ${REPO_INSTRUCTION_FILE}; use personal scope (\`${personalInstructions}\`) only for a clearly intended cross-repository preference.`,
-        "   Do not write instruction files or claim a save. Self-Review handles saving and verification; with auto-save off, the reviewer can click Save guideline.",
+        "   For repository rules, include a destination suggestion with kind general or language plus pathPrefix and instructionRoot inferred from the reviewed file and existing instructions; for language rules also suggest a language name and applyTo glob. The reviewer confirms or edits the destination in the proposal card.",
+        "   Do not write instruction files or claim a save. Self-Review routes the rule through the user's path-prefix mapping and handles persistence and read-back verification. If no mapping exists, keep it proposed until the reviewer configures the destination.",
         "   When the reviewer refines a proposal, update its lessonId with the revised rule and scope. Do not treat discussion of wording as a request to edit code. If the reviewer rejects a proposal, report that lessonId with status declined. With auto-save off, discussion alone does not save a proposal.",
     ];
 }
 
-const LESSONS_SHAPE = ", lessons?: [{ lessonId?, sourceMessageId?, scope: repo|personal, rule?, status?: proposed|declined }]";
+const LESSONS_SHAPE = ", lessons?: [{ lessonId?, sourceMessageId?, scope: repo|personal, rule?, status?: proposed|declined, destination?: { kind: general|language, pathPrefix?, instructionRoot?, language?, applyTo? } }]";
 
 function reviewLines(review: Review, revision: string | null | undefined) {
     const head = (review.headCommit ?? "").slice(0, 10);

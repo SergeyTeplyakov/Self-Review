@@ -39,6 +39,7 @@ interface DialogState {
     error?: string;
     autoSaveLearnedRules?: boolean;
     delivery?: string;
+    instructionMappings?: Array<{ pathPrefix: string; instructionRoot: string; splitLanguageSpecific: boolean }>;
     revisionId?: string;
     model?: string;
 }
@@ -149,7 +150,7 @@ const reviewFixture = (overrides: Record<string, unknown> = {}) => ({
     threads: [], lessons: [],
     ...overrides,
 });
-const settingsFixture = (overrides: Record<string, unknown> = {}) => ({ repoName: "repo", autoSaveLearnedRules: false, delivery: "immediate", configured: false, dismissed: false, ...overrides });
+const settingsFixture = (overrides: Record<string, unknown> = {}) => ({ repoName: "repo", autoSaveLearnedRules: false, delivery: "immediate", instructionMappings: [], configured: false, dismissed: false, ...overrides });
 
 test("agent reply renders Markdown issue links as external anchors", async () => {
     const app = await loadApp();
@@ -159,6 +160,17 @@ test("agent reply renders Markdown issue links as external anchors", async () =>
     const html = app.run(`messageHtml(${JSON.stringify(message)})`);
     assert.ok(html.includes('<a href="https://github.com/SergeyTeplyakov/Self-Review/issues/31" target="_blank" rel="noopener noreferrer" data-markdown-link>#31</a>'));
     assert.ok(html.includes('<a href="http://example.test/a(b)?x=1&amp;y=2" target="_blank" rel="noopener noreferrer" data-markdown-link><strong>docs &amp; notes</strong></a>'));
+});
+
+test("state and lessons from an older server need no learned-rule destination fields", async () => {
+    const app = await loadApp();
+    const legacyLesson = {
+        lessonId: "lesson", messageId: "message", scope: "repo", rule: "Keep pull requests focused.",
+        savedTo: null, threadId: "thread", createdAt: "2026-01-01T00:00:00Z",
+    };
+    const legacyReview = reviewFixture({ lessons: [legacyLesson] });
+    assert.equal(app.run(`isLesson(${JSON.stringify(legacyLesson)})`), true);
+    assert.equal(app.run(`isStateResponse(${JSON.stringify({ review: legacyReview })})`), true);
 });
 
 test("reply Markdown respects matching code delimiters and escaped URL punctuation", async () => {
@@ -371,9 +383,10 @@ test("a reload queued during failed state or snapshot requests is retried automa
 
 test("refresh progress and load failure preserve the current view and composer DOM until a successful retry", async () => {
     let failed = false;
+    let failureMessage = "offline <now>";
     let refresh: { status: string; error?: string } = { status: "refreshing" };
     const app = await loadApp({ fetch: async (url) => {
-        if (failed) throw new Error("offline <now>");
+        if (failed) throw new Error(failureMessage);
         if (url === "/api/state") return jsonResponse({ review: reviewFixture(), refresh });
         throw new Error(`Unexpected request ${url}`);
     } });
@@ -395,6 +408,11 @@ test("refresh progress and load failure preserve the current view and composer D
     failed = true;
     await assert.rejects(app.run<Promise<void>>("loadState()"), /offline/);
     assert.match(app.node("#review-status").innerHTML, /Could not load the current review.*offline &lt;now&gt;.*Retry/);
+    failureMessage = "Invalid repository settings response.";
+    await assert.rejects(app.run<Promise<void>>("loadState()"), /Invalid repository settings response/);
+    const status = app.node("#review-status").innerHTML;
+    assert.match(status, /Invalid repository settings response\. Showing the last loaded data/);
+    assert.doesNotMatch(status, /response\.\./);
     assert.equal(app.node("#review-status").hidden, false);
     assert.equal(app.document.activeElement, composer);
     assert.equal(app.localStorage.getItem("sr:r:draft:overview:new"), "Keep this draft");
@@ -1664,13 +1682,20 @@ test("the Configure dialog is an accessible modal with auto-save off by default 
     const app = await loadApp();
     assert.equal(app.run("dialogHtml()"), "", "closed by default");
     app.state.settings = settingsFixture({ repoName: "Org/Repo <x>", configured: true });
-    app.state.dialog = { autoSaveLearnedRules: false, delivery: "batch", saving: false, error: "" };
+    app.state.dialog = {
+        autoSaveLearnedRules: false, delivery: "batch",
+        instructionMappings: [{ pathPrefix: "src/Area", instructionRoot: "src/Area", splitLanguageSpecific: true }],
+        saving: false, error: "",
+    };
     const html = app.run("dialogHtml()");
     assert.match(html, /role="dialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby="dialog-desc"/);
     assert.match(html, /<h2 id="dialog-title">Review settings<\/h2>/);
     assert.match(html, /<p id="dialog-desc" class="muted">Settings for Org\/Repo &lt;x&gt;\. /);
     assert.match(html, /<legend>Guidelines<\/legend><label><input type="checkbox" name="autoSaveLearnedRules"> Auto-save learned rules<\/label>/);
     assert.match(html, /When off, review and save proposed guidelines yourself\./);
+    assert.match(html, /Repository instruction destinations/);
+    assert.match(html, /name="mapping-prefix" data-index="0" value="src\/Area"/);
+    assert.match(html, /name="mapping-split" data-index="0" checked/);
     assert.deepEqual(
         [...html.matchAll(/<input type="radio" name="delivery" value="(\w+)"( checked)?>/g)].map((m) => [m[1], Boolean(m[2])]),
         [["immediate", false], ["batch", true], ["ask", false]],
@@ -1679,7 +1704,7 @@ test("the Configure dialog is an accessible modal with auto-save off by default 
     assert.doesNotMatch(html, /role="alert"|\sdisabled[\s>]/);
     assert.match(html, /data-action="dialog-save">Save<\/button>/);
 
-    app.state.dialog = { autoSaveLearnedRules: true, saving: true, error: "Could not save <b>" };
+    app.state.dialog = { autoSaveLearnedRules: true, instructionMappings: [], saving: true, error: "Could not save <b>" };
     const busy = app.run("dialogHtml()");
     assert.match(busy, /<div class="modal-error" role="alert">Could not save &lt;b&gt;<\/div>/);
     assert.match(busy, /data-action="dialog-cancel" disabled>/);
@@ -1688,6 +1713,27 @@ test("the Configure dialog is an accessible modal with auto-save off by default 
 
     app.state.settings = settingsFixture({ repoName: undefined });
     assert.match(app.run("dialogHtml()"), /Settings for this repository\./);
+});
+
+test("repository guideline proposals show an editable mapping and destination preview", async () => {
+    const app = await loadApp();
+    app.state.settings = settingsFixture({
+        instructionMappings: [{ pathPrefix: "src/Area", instructionRoot: "src/Area", splitLanguageSpecific: true }],
+    });
+    app.state.review = reviewFixture({
+        lessons: [{
+            lessonId: "lesson/route", threadId: "t1", scope: "repo", rule: "Use typed guards.",
+            status: "proposed", reviewedPath: "src/Area/Rules.cs",
+            destination: { kind: "language", language: "csharp", applyTo: "**/*.cs" }, createdAt: "2026-01-01T00:00:00Z",
+        }],
+    });
+    const html = app.run("messageHtml({ messageId: 'm', author: 'agent', body: 'Done', createdAt: '2026-01-02T00:00:00Z', lessonIds: ['lesson/route'] })");
+    assert.match(html, /Reviewed file: <code>src\/Area\/Rules\.cs<\/code>/);
+    assert.match(html, /name="pathPrefix" value="src\/Area"/);
+    assert.match(html, /name="instructionRoot" value="src\/Area"/);
+    assert.match(html, /name="destinationKind"><option value="language" selected>/);
+    assert.match(html, /Proposed destination: <code data-destination-preview>src\/Area\/.github\/instructions\/csharp\.instructions\.md<\/code>/);
+    assert.match(html, /Confirm destination and save guideline/);
 });
 
 test("the Configure dialog opens on the saved mode, keeps the page inert behind it, traps Tab, and closes on Escape", async () => {
@@ -1733,7 +1779,9 @@ test("the Configure dialog opens on the saved mode, keeps the page inert behind 
     ];
     const querySelector = app.document.querySelector;
     app.document.querySelector = (selector: string) => (selector.includes("autoSaveLearnedRules") ? autoSaveCheckbox : querySelector(selector));
-    app.document.querySelectorAll = (selector: string) => (selector === '#dialog input[name="delivery"]' ? deliveryRadios : buttons);
+    app.document.querySelectorAll = (selector: string) => selector === '#dialog input[name="delivery"]'
+        ? deliveryRadios
+        : selector.includes("#dialog input:not([disabled])") ? [autoSaveCheckbox, ...deliveryRadios.slice(0, 1), ...buttons] : buttons;
     app.document.activeElement = buttons[1];
     press({ key: "Tab", shiftKey: false });
     app.document.activeElement = autoSaveCheckbox;
@@ -1805,7 +1853,7 @@ test("the banner, Configure checkbox, and dismissal persist auto-save settings a
     app.node('[data-action="configure"]').closest = (selector) => selector === "details:not([open])" ? settingsMenu : null;
     settingsMenu.querySelector = (selector) => selector === "summary" ? settingsSummary : null;
     await click("dialog-save");
-    assert.deepEqual(posts.at(-1), ["POST", "/api/settings", { autoSaveLearnedRules: true, delivery: "batch" }]);
+    assert.deepEqual(posts.at(-1), ["POST", "/api/settings", { autoSaveLearnedRules: true, delivery: "batch", instructionMappings: [] }]);
     assert.equal(app.state.dialog, null);
     assert.equal(app.state.settings.autoSaveLearnedRules, true);
     assert.equal(app.state.settings.delivery, "batch");
@@ -1893,7 +1941,7 @@ test("Save guideline posts the exact rendered lesson and leaves the proposal vis
     } });
     const rule = "Prefer <safe> & focused";
     app.state.review = reviewFixture({
-        lessons: [{ lessonId: "lesson/one", threadId: "t1", scope: "repo", rule, status: "proposed", createdAt: "2026-01-01T00:00:00Z" }],
+        lessons: [{ lessonId: "lesson/one", threadId: "t1", scope: "personal", rule, status: "proposed", createdAt: "2026-01-01T00:00:00Z" }],
     });
     const message = () => app.run("messageHtml({ messageId: 'm', author: 'agent', body: 'Done', createdAt: '2026-01-02T00:00:00Z', lessonIds: ['lesson/one'] })");
     const html = message();
@@ -1901,10 +1949,10 @@ test("Save guideline posts the exact rendered lesson and leaves the proposal vis
     const encodedProposal = required(html.match(/data-proposal="([^"]*)"/))[1];
     const renderedProposal = JSON.parse(encodedProposal
         .replaceAll("&quot;", '"').replaceAll("&#39;", "'").replaceAll("&gt;", ">").replaceAll("&lt;", "<").replaceAll("&amp;", "&")) as { rule: string; scope: string };
-    assert.deepEqual(renderedProposal, { rule, scope: "repo" });
+    assert.deepEqual(renderedProposal, { rule, scope: "personal" });
 
     await clicker(app)("save-lesson", { lesson: "lesson/one", proposal: JSON.stringify(renderedProposal) });
-    assert.deepEqual(calls, [["POST", "/api/lessons/lesson%2Fone/save", { rule, scope: "repo" }]]);
+    assert.deepEqual(calls, [["POST", "/api/lessons/lesson%2Fone/save", { rule, scope: "personal" }]]);
     assert.equal(app.node("#toast").textContent, "automatic save unavailable");
     assert.match(message(), /<span class="badge lesson-proposed"[^>]*>proposed<\/span> Prefer &lt;safe&gt; &amp; focused <button data-action="save-lesson"[^>]*>Save guideline<\/button>/);
 });

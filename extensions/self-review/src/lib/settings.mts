@@ -3,8 +3,8 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as gitDefault from "./git-process.mjs";
-import { agentReviewDefaults, settingsPatch, isDeliveryMode, ReviewError } from "../web/contracts.mjs";
-import type { AgentReviewDefaults, DeliveryChoice, DeliveryMode, GitRunner, Log, RepoSettings, SettingsStore, StoredRepoSettings } from "../../types/contracts.js";
+import { agentReviewDefaults, settingsPatch, isDeliveryMode, isRecord, ReviewError } from "../web/contracts.mjs";
+import type { AgentReviewDefaults, DeliveryChoice, DeliveryMode, GitRunner, InstructionMapping, Log, RepoSettings, SettingsStore, StoredRepoSettings } from "../../types/contracts.js";
 export { DELIVERY_MODES } from "../web/contracts.mjs";
 
 function storedAutoSave(entry: StoredRepoSettings | null): boolean | undefined {
@@ -12,6 +12,17 @@ function storedAutoSave(entry: StoredRepoSettings | null): boolean | undefined {
     if (entry?.learning === "auto") return true;
     if (entry?.learning === "off" || entry?.learning === "suggest") return false;
     return undefined;
+}
+
+function storedInstructionMappings(entry: StoredRepoSettings | null): InstructionMapping[] {
+    const value = entry?.instructionMappings;
+    if (value === undefined) return [];
+    if (!Array.isArray(value) || !value.every((mapping: unknown) => isRecord(mapping)
+        && typeof mapping.pathPrefix === "string" && typeof mapping.instructionRoot === "string"
+        && typeof mapping.splitLanguageSpecific === "boolean")) {
+        throw new ReviewError("invalid_input", "Stored instruction mappings are invalid.");
+    }
+    return value;
 }
 
 // When the agent receives the reviewer's comments:
@@ -66,6 +77,16 @@ export function normalizeRemoteUrl(url: unknown): string {
 /** @param {string} p @param {string} [platform] */
 export function pathKey(p: string, platform = process.platform): string {
     return platform === "win32" || platform === "darwin" ? p.toLowerCase() : p;
+}
+
+export function selectInstructionMapping(mappings: InstructionMapping[], reviewedPath: string): InstructionMapping | null {
+    const file = pathKey(reviewedPath.replace(/\\/g, "/").replace(/^\.\/+/, ""));
+    return [...mappings]
+        .filter((mapping) => {
+            const prefix = pathKey(mapping.pathPrefix);
+            return !prefix || file === prefix || file.startsWith(`${prefix}/`);
+        })
+        .sort((a, b) => b.pathPrefix.length - a.pathPrefix.length)[0] ?? null;
 }
 
 // Git treats a URL without a scheme or an scp-style host as a local path, relative to the repository.
@@ -167,6 +188,7 @@ export class SettingsService {
             repoName: identity.name,
             autoSaveLearnedRules: autoSave ?? false,
             delivery: isDeliveryMode(entry?.delivery) ? entry.delivery : DEFAULT_DELIVERY,
+            instructionMappings: storedInstructionMappings(entry),
             configured: autoSave !== undefined,
             dismissed: entry?.promptDismissed === true,
         };
@@ -185,6 +207,7 @@ export class SettingsService {
             }
             if (patch.delivery !== undefined) entry.delivery = patch.delivery;
             if (patch.dismissed !== undefined) entry.promptDismissed = patch.dismissed;
+            if (patch.instructionMappings !== undefined) entry.instructionMappings = patch.instructionMappings;
             settings.repos[identity.key] = { ...entry, name: identity.name, updatedAt: new Date().toISOString() };
         });
         return this.get(repoRoot);

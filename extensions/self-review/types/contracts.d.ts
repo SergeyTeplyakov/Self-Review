@@ -4,6 +4,12 @@ export type DeliveryChoice = Exclude<DeliveryMode, "ask"> | null;
 export type ReviewScope = "all" | "pending";
 export type ReviewFocus = "review" | "simplify" | "both";
 
+export interface InstructionMapping {
+    pathPrefix: string;
+    instructionRoot: string;
+    splitLanguageSpecific: boolean;
+}
+
 export interface AgentReviewOptions {
     models: string[];
     focus: ReviewFocus;
@@ -19,6 +25,7 @@ export interface RepoSettings {
     repoName: string;
     autoSaveLearnedRules: boolean;
     delivery: DeliveryMode;
+    instructionMappings: InstructionMapping[];
     configured: boolean;
     dismissed: boolean;
 }
@@ -27,6 +34,7 @@ export interface SettingsPatch {
     autoSaveLearnedRules?: boolean;
     delivery?: DeliveryMode;
     dismissed?: boolean;
+    instructionMappings?: InstructionMapping[];
 }
 
 // Historical files may lack delivery, and invalid mode strings are ignored when read.
@@ -35,6 +43,7 @@ export interface StoredRepoSettings {
     learning?: unknown;
     delivery?: unknown;
     promptDismissed?: unknown;
+    instructionMappings?: unknown;
     name?: string;
     updatedAt?: string;
     [key: string]: unknown;

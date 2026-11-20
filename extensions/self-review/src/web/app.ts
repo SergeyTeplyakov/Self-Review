@@ -2,6 +2,7 @@
 // per-instance loopback server with the token from the URL.
 import { createSettingsApi } from "./settings-api.mjs";
 import { REVIEW_COMMANDS, reviewCommandSuggestions } from "./review-commands.mjs";
+import type { InstructionMapping } from "../../types/contracts.js";
 
 type Scope = "all" | "pending";
 type DiffSide = "old" | "new";
@@ -109,6 +110,8 @@ type Lesson = {
     scope: string;
     status?: string;
     rule: string;
+    reviewedPath?: string;
+    destination?: { kind: "general" | "language"; language?: string; applyTo?: string; pathPrefix?: string; instructionRoot?: string };
     savedTo?: string | null;
     saveError?: string;
     threadId: string;
@@ -214,7 +217,7 @@ type ContentEntry =
 type PendingComment = { clientRequestId: string; sending?: boolean; error?: string | null };
 type Selection = { path: string; hunk: number; anchor: number; from: number; to: number; full: boolean };
 type RowPosition = { path: string; h: number; i: number; full: boolean };
-type ConfigureDialog = { type: "configure"; autoSaveLearnedRules: boolean; delivery: DeliveryMode; saving: boolean; error: string };
+type ConfigureDialog = { type: "configure"; autoSaveLearnedRules: boolean; delivery: DeliveryMode; instructionMappings: InstructionMapping[]; saving: boolean; error: string };
 type AgentReviewDialog = {
     type: "agent-review";
     reviewId: string;
@@ -1082,11 +1085,13 @@ function renderLoadStatus(): void {
     const pending = Boolean(loading) || reloadPending || refreshing || (!loadError && !refreshFailure && serverRefresh?.status === "refreshing");
     const error = loadError || refreshFailure;
     const failureLabel = loadError ? "Could not load the current review" : "Could not refresh from the working tree";
+    const errorText = error.trim();
+    const punctuation = /[.!?…]$/u.test(errorText) ? "" : ".";
     status.hidden = !pending && !error;
     status.className = error && !pending ? "review-status del" : "review-status muted";
     const message = pending
         ? state.review ? "Refreshing review and Overview... Showing the last loaded data." : "Loading review and Overview..."
-        : error ? `${failureLabel}: ${esc(error)}. ${state.review ? "Showing the last loaded data." : ""}` : "";
+        : error ? `${failureLabel}: ${esc(errorText)}${punctuation} ${state.review ? "Showing the last loaded data." : ""}` : "";
     const retry = error && !pending ? `<button type="button" data-action="refresh">Retry</button>` : "";
     const html = message ? `<span class="review-status-message">${message}</span>${retry}` : "";
     if (renderedStatusHtml !== html) {
@@ -1603,6 +1608,15 @@ function dialogHtml(): string {
         + `<h2 id="dialog-title">Review settings</h2>`
         + `<p id="dialog-desc" class="muted">Settings for ${esc(state.settings?.repoName ?? "this repository")}. They are stored on this machine only and never committed.</p>`
         + `<fieldset class="choices"><legend>Guidelines</legend><label><input type="checkbox" name="autoSaveLearnedRules"${d.autoSaveLearnedRules ? " checked" : ""}> Auto-save learned rules</label><p>When off, review and save proposed guidelines yourself.</p></fieldset>`
+        + `<fieldset class="choices instruction-mappings"><legend>Repository instruction destinations</legend>`
+        + `<p class="muted">Map a repository-relative path prefix to the folder that contains its .github instructions. The longest matching prefix wins; an empty prefix is the repository-root default. These mappings are per-user and shared across clones and worktrees.</p>`
+        + (d.instructionMappings.length ? d.instructionMappings.map((mapping, index) => `<div class="instruction-mapping" data-mapping-index="${index}">`
+            + `<label>Path prefix <input name="mapping-prefix" data-index="${index}" value="${esc(mapping.pathPrefix)}" placeholder="(repository root)"></label>`
+            + `<label>Instruction root <input name="mapping-root" data-index="${index}" value="${esc(mapping.instructionRoot)}" placeholder="(repository root)"></label>`
+            + `<label><input type="checkbox" name="mapping-split" data-index="${index}"${mapping.splitLanguageSpecific ? " checked" : ""}> Split language-specific rules into scoped files</label>`
+            + `<button data-action="mapping-remove" data-index="${index}">Remove mapping</button></div>`).join("")
+            : `<p class="muted">No mappings yet. Repository rules remain proposals until a destination is configured.</p>`)
+        + `<button data-action="mapping-add">Add destination mapping</button></fieldset>`
         + `<fieldset class="choices"><legend>Send comments to Copilot</legend>${choicesHtml("delivery", DELIVERY_MODES, DELIVERY, d.delivery)}</fieldset>`
         + (d.error ? `<div class="modal-error" role="alert">${esc(d.error)}</div>` : "")
         + `<div class="modal-actions"><button data-action="dialog-cancel"${d.saving ? " disabled" : ""}>Cancel</button>`
@@ -1644,7 +1658,11 @@ function renderDialog() {
 
 function openConfigure() {
     if (!state.settings || state.dialog) return;
-    state.dialog = { type: "configure", autoSaveLearnedRules: autoSaveLearnedRules(), delivery: deliveryRepoMode(), saving: false, error: "" };
+    state.dialog = {
+        type: "configure", autoSaveLearnedRules: autoSaveLearnedRules(), delivery: deliveryRepoMode(),
+        instructionMappings: state.settings.instructionMappings.map((mapping) => ({ ...mapping })),
+        saving: false, error: "",
+    };
     renderDialog();
     focusIn('#dialog input[name="autoSaveLearnedRules"]');
 }
@@ -1944,8 +1962,10 @@ function agentReviewsHtml(): string {
 // A delivery change alters every composer's buttons, so it needs a full render once a diff is shown.
 async function updateSettings(patch: import("../../types/contracts.js").SettingsPatch): Promise<void> {
     const before = deliveryMode();
+    const previousMappings = JSON.stringify(state.settings?.instructionMappings ?? []);
     state.settings = await settingsApi.update(patch);
-    if (deliveryMode() !== before && state.snapshot) {
+    const mappingsChanged = previousMappings !== JSON.stringify(state.settings.instructionMappings);
+    if ((deliveryMode() !== before && state.snapshot) || mappingsChanged) {
         render();
     } else {
         renderTop();
@@ -1961,7 +1981,10 @@ async function saveConfigure(): Promise<void> {
     d.error = "";
     renderDialog();
     try {
-        await updateSettings({ autoSaveLearnedRules: d.autoSaveLearnedRules, delivery: d.delivery });
+        await updateSettings({
+            autoSaveLearnedRules: d.autoSaveLearnedRules, delivery: d.delivery,
+            instructionMappings: d.instructionMappings,
+        });
         state.dialog = null;
         renderDialog();
         focusIn('[data-action="configure"]');
@@ -1980,10 +2003,11 @@ function trapTab(e: KeyboardEvent): void {
         const radios = Array.from(document.querySelectorAll<HTMLInputElement>(`#dialog input[name="${name}"]`));
         return radios.find((x) => x.checked) ?? radios[0];
     };
-    const stops: HTMLElement[] = state.dialog?.type === "agent-review"
+    const trapAllFocusable = state.dialog?.type === "agent-review" || state.dialog?.type === "configure";
+    const deliveryStop = trapAllFocusable ? undefined : groupStop("delivery");
+    const stops: HTMLElement[] = trapAllFocusable
         ? Array.from(document.querySelectorAll<HTMLElement>("#dialog input:not([disabled]), #dialog select:not([disabled]), #dialog textarea:not([disabled]), #dialog a[href], #dialog button:not([disabled])"))
-        : [document.querySelector<HTMLInputElement>('#dialog input[name="autoSaveLearnedRules"]'), groupStop("delivery"), ...Array.from(document.querySelectorAll<HTMLButtonElement>("#dialog button:not([disabled])"))]
-            .filter((el): el is HTMLInputElement | HTMLButtonElement => el instanceof HTMLInputElement || el instanceof HTMLButtonElement);
+        : [...(deliveryStop ? [deliveryStop] : []), ...Array.from(document.querySelectorAll<HTMLButtonElement>("#dialog button:not([disabled])"))];
     if (!stops.length) return;
     const first = stops[0];
     const last = stops[stops.length - 1];
@@ -2287,8 +2311,65 @@ function deliveryHtml(m: ReviewMessage): string {
     }
 }
 
+function mappingForPath(reviewedPath: string): InstructionMapping | undefined {
+    const file = reviewedPath.replace(/\\/g, "/").replace(/^\.\/+/, "").toLowerCase();
+    return [...(state.settings?.instructionMappings ?? [])]
+        .filter((mapping) => {
+            const prefix = mapping.pathPrefix.toLowerCase();
+            return !prefix || file === prefix || file.startsWith(`${prefix}/`);
+        })
+        .sort((a, b) => b.pathPrefix.length - a.pathPrefix.length)[0];
+}
+
+function suggestedDestination(lesson: Lesson): NonNullable<Lesson["destination"]> {
+    if (lesson.destination) return lesson.destination;
+    const extension = lesson.reviewedPath?.replace(/\\/g, "/").split(".").at(-1)?.toLowerCase() ?? "";
+    const names: Record<string, string> = { cs: "csharp", ts: "typescript", tsx: "typescript", js: "javascript", jsx: "javascript", py: "python", ps1: "powershell" };
+    const language = names[extension];
+    return language
+        ? { kind: "language", language, applyTo: `**/*.${extension}` }
+        : { kind: "general" };
+}
+
+function proposalDestinationPreview(form: HTMLElement): string {
+    const input = (name: string) => form.querySelector<HTMLInputElement | HTMLSelectElement>(`[name="${name}"]`);
+    const root = input("instructionRoot")?.value.replace(/\/+$/, "") ?? "";
+    const kind = input("destinationKind")?.value === "language" ? "language" : "general";
+    const language = input("language")?.value.trim() || "language";
+    const splitInput = input("splitLanguageSpecific");
+    const split = splitInput instanceof HTMLInputElement ? splitInput.checked : true;
+    const base = root ? `${root}/.github` : ".github";
+    return kind === "language" && split
+        ? `${base}/instructions/${language}.instructions.md`
+        : `${base}/copilot-instructions.md`;
+}
+
+function lessonDestinationForm(lesson: Lesson): string {
+    const mapping = lesson.reviewedPath ? mappingForPath(lesson.reviewedPath) : undefined;
+    const parent = lesson.reviewedPath?.replace(/\\/g, "/").split("/").slice(0, -1).join("/") ?? "";
+    const destination = suggestedDestination(lesson);
+    const prefix = mapping?.pathPrefix ?? destination.pathPrefix ?? parent;
+    const root = mapping?.instructionRoot ?? destination.instructionRoot ?? parent;
+    const previewRoot = root ? `${root}/.github` : ".github";
+    const preview = destination.kind === "language" && (mapping?.splitLanguageSpecific ?? true)
+        ? `${previewRoot}/instructions/${destination.language ?? "language"}.instructions.md`
+        : `${previewRoot}/copilot-instructions.md`;
+    return `<details class="lesson-destination"><summary>Confirm repository destination</summary>`
+        + `<p class="muted">Reviewed file: <code>${esc(lesson.reviewedPath ?? "path unavailable")}</code>. This per-user mapping is shared by clones and worktrees of the same repository.</p>`
+        + `<label>Path prefix <input name="pathPrefix" value="${esc(prefix)}" placeholder="(repository root)"></label>`
+        + `<label>Instruction root <input name="instructionRoot" value="${esc(root)}" placeholder="(repository root)"></label>`
+        + `<label><input type="checkbox" name="splitLanguageSpecific"${mapping?.splitLanguageSpecific ?? true ? " checked" : ""}> Split language-specific rules into scoped files</label>`
+        + `<label>Rule type <select name="destinationKind"><option value="language"${destination.kind === "language" ? " selected" : ""}>Language-specific</option><option value="general"${destination.kind === "general" ? " selected" : ""}>Repository-wide</option></select></label>`
+        + `<label>Language <input name="language" value="${esc(destination.language ?? "")}" placeholder="csharp"></label>`
+        + `<label>applyTo <input name="applyTo" value="${esc(destination.applyTo ?? "")}" placeholder="**/*.cs"></label>`
+        + `<p class="muted">Proposed destination: <code data-destination-preview>${esc(preview)}</code></p>`
+        + `<button data-action="save-lesson" data-lesson="${esc(lesson.lessonId)}">Confirm destination and save guideline</button>`
+        + `</details>`;
+}
+
 function saveLessonButton(l: Lesson): string {
     if (l.status !== "proposed" || (l.scope !== "repo" && l.scope !== "personal")) return "";
+    if (l.scope === "repo") return ` <span data-lesson-form="${esc(l.lessonId)}">${lessonDestinationForm(l)}${l.saveError ? ` <span role="status">${esc(l.saveError)}</span>` : ""}</span>`;
     return ` <button data-action="save-lesson" data-lesson="${esc(l.lessonId)}" data-proposal="${esc(JSON.stringify({ rule: l.rule, scope: l.scope }))}">Save guideline</button>`
         + (l.saveError ? ` <span role="status">${esc(l.saveError)}</span>` : "");
 }
@@ -2970,6 +3051,23 @@ async function onClick(e: MouseEvent): Promise<void> {
             case "dialog-save":
                 await saveConfigure();
                 break;
+            case "mapping-add":
+                if (state.dialog?.type === "configure") {
+                    state.dialog.instructionMappings.push({ pathPrefix: "", instructionRoot: "", splitLanguageSpecific: true });
+                    renderDialog();
+                    focusIn(`#dialog input[name="mapping-prefix"][data-index="${state.dialog.instructionMappings.length - 1}"]`);
+                }
+                break;
+            case "mapping-remove":
+                if (state.dialog?.type === "configure") {
+                    const index = Number(value("index"));
+                    if (Number.isInteger(index) && index >= 0 && index < state.dialog.instructionMappings.length) {
+                        state.dialog.instructionMappings.splice(index, 1);
+                        renderDialog();
+                        focusIn('#dialog [data-action="mapping-add"]');
+                    }
+                }
+                break;
             case "learning-set":
                 if (value("enabled") === "true" || value("enabled") === "false") {
                     await updateSettings({ autoSaveLearnedRules: value("enabled") === "true" });
@@ -2977,9 +3075,32 @@ async function onClick(e: MouseEvent): Promise<void> {
                 }
                 break;
             case "save-lesson":
-                await api("POST", `lessons/${encodeURIComponent(value("lesson"))}/save`, JSON.parse(value("proposal")));
-                await loadState();
-                toast("Guideline saved.");
+                {
+                    const lessonId = value("lesson");
+                    const candidate = target.closest<HTMLElement>("[data-lesson-form]");
+                    const form = candidate?.dataset?.lessonForm ? candidate : null;
+                    let proposal: unknown;
+                    if (form) {
+                        const field = (name: string) => form.querySelector<HTMLInputElement | HTMLSelectElement>(`[name="${name}"]`);
+                        const split = field("splitLanguageSpecific");
+                        const mapping = {
+                            pathPrefix: field("pathPrefix")?.value ?? "",
+                            instructionRoot: field("instructionRoot")?.value ?? "",
+                            splitLanguageSpecific: split instanceof HTMLInputElement ? split.checked : true,
+                        };
+                        const kind = field("destinationKind")?.value;
+                        const destination = kind === "language"
+                            ? { kind, language: field("language")?.value.trim(), applyTo: field("applyTo")?.value.trim() }
+                            : { kind: "general" };
+                        const lesson = state.review?.lessons.find((item) => item.lessonId === lessonId);
+                        proposal = { rule: lesson?.rule, scope: lesson?.scope, mapping, destination };
+                    } else {
+                        proposal = JSON.parse(value("proposal"));
+                    }
+                    const result: unknown = await api("POST", `lessons/${encodeURIComponent(lessonId)}/save`, proposal);
+                    await loadState();
+                    toast(isRecord(result) && result.status === "saved" ? "Guideline saved." : "Guideline remains proposed; review its destination and try again.", !(isRecord(result) && result.status === "saved"));
+                }
                 break;
             case "learning-dismiss":
                 await updateSettings({ dismissed: true });
@@ -2996,6 +3117,22 @@ async function onClick(e: MouseEvent): Promise<void> {
 async function onChange(e: Event): Promise<void> {
     const el = e.target;
     if (!(el instanceof HTMLInputElement || el instanceof HTMLSelectElement)) return;
+    if (state.dialog?.type === "configure" && el.dataset?.index !== undefined) {
+        const index = Number(el.dataset.index);
+        const mapping = state.dialog.instructionMappings[index];
+        if (mapping) {
+            if (el.name === "mapping-prefix") mapping.pathPrefix = el.value;
+            else if (el.name === "mapping-root") mapping.instructionRoot = el.value;
+            else if (el.name === "mapping-split" && el instanceof HTMLInputElement) mapping.splitLanguageSpecific = el.checked;
+            return;
+        }
+    }
+    if (el.closest?.("[data-lesson-form]")) {
+        const candidate = el.closest<HTMLElement>("[data-lesson-form]");
+        const form = candidate?.dataset?.lessonForm ? candidate : null;
+        const preview = form?.querySelector<HTMLElement>("[data-destination-preview]");
+        if (form && preview) preview.textContent = proposalDestinationPreview(form);
+    }
     if (el instanceof HTMLInputElement && el.name === "review-skill-defaults" && state.dialog?.type === "agent-review") {
         state.dialog.saveSkillDefaults = el.checked;
         renderDialog();
@@ -3050,6 +3187,19 @@ function updateReviewCommands(textarea: HTMLTextAreaElement): void {
 function onInput(e: Event): void {
     const el = e.target;
     if (!(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)) return;
+    if (state.dialog?.type === "configure" && el.dataset?.index !== undefined) {
+        const index = Number(el.dataset.index);
+        const mapping = state.dialog.instructionMappings[index];
+        if (mapping) {
+            if (el.name === "mapping-prefix") mapping.pathPrefix = el.value;
+            else if (el.name === "mapping-root") mapping.instructionRoot = el.value;
+            return;
+        }
+    }
+    const candidate = el.closest?.<HTMLElement>("[data-lesson-form]");
+    const form = candidate?.dataset?.lessonForm ? candidate : null;
+    const preview = form?.querySelector<HTMLElement>("[data-destination-preview]");
+    if (form && preview) preview.textContent = proposalDestinationPreview(form);
     if ((el.name === "review-models" || el.name === "review-intent") && state.dialog?.type === "agent-review") {
         state.dialog[el.name === "review-models" ? "models" : "intent"] = el.value;
         return;

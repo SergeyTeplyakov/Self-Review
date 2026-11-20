@@ -3,7 +3,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as gitDefault from "./git-process.mjs";
-import { agentReviewDefaults, settingsPatch, isDeliveryMode, ReviewError } from "../web/contracts.mjs";
+import { agentReviewDefaults, settingsPatch, isDeliveryMode, isRecord, ReviewError } from "../web/contracts.mjs";
 export { DELIVERY_MODES } from "../web/contracts.mjs";
 function storedAutoSave(entry) {
     if (typeof entry?.autoSaveLearnedRules === "boolean")
@@ -13,6 +13,17 @@ function storedAutoSave(entry) {
     if (entry?.learning === "off" || entry?.learning === "suggest")
         return false;
     return undefined;
+}
+function storedInstructionMappings(entry) {
+    const value = entry?.instructionMappings;
+    if (value === undefined)
+        return [];
+    if (!Array.isArray(value) || !value.every((mapping) => isRecord(mapping)
+        && typeof mapping.pathPrefix === "string" && typeof mapping.instructionRoot === "string"
+        && typeof mapping.splitLanguageSpecific === "boolean")) {
+        throw new ReviewError("invalid_input", "Stored instruction mappings are invalid.");
+    }
+    return value;
 }
 // When the agent receives the reviewer's comments:
 //   immediate - each comment is sent as soon as it is posted
@@ -63,6 +74,15 @@ export function normalizeRemoteUrl(url) {
 /** @param {string} p @param {string} [platform] */
 export function pathKey(p, platform = process.platform) {
     return platform === "win32" || platform === "darwin" ? p.toLowerCase() : p;
+}
+export function selectInstructionMapping(mappings, reviewedPath) {
+    const file = pathKey(reviewedPath.replace(/\\/g, "/").replace(/^\.\/+/, ""));
+    return [...mappings]
+        .filter((mapping) => {
+        const prefix = pathKey(mapping.pathPrefix);
+        return !prefix || file === prefix || file.startsWith(`${prefix}/`);
+    })
+        .sort((a, b) => b.pathPrefix.length - a.pathPrefix.length)[0] ?? null;
 }
 // Git treats a URL without a scheme or an scp-style host as a local path, relative to the repository.
 /** @param {string} url @param {string} repoRoot */
@@ -166,6 +186,7 @@ export class SettingsService {
             repoName: identity.name,
             autoSaveLearnedRules: autoSave ?? false,
             delivery: isDeliveryMode(entry?.delivery) ? entry.delivery : DEFAULT_DELIVERY,
+            instructionMappings: storedInstructionMappings(entry),
             configured: autoSave !== undefined,
             dismissed: entry?.promptDismissed === true,
         };
@@ -185,6 +206,8 @@ export class SettingsService {
                 entry.delivery = patch.delivery;
             if (patch.dismissed !== undefined)
                 entry.promptDismissed = patch.dismissed;
+            if (patch.instructionMappings !== undefined)
+                entry.instructionMappings = patch.instructionMappings;
             settings.repos[identity.key] = { ...entry, name: identity.name, updatedAt: new Date().toISOString() };
         });
         return this.get(repoRoot);

@@ -8,9 +8,11 @@ import path from "node:path";
 import * as gitDefault from "./git.mjs";
 import { relocate } from "./anchors.mjs";
 import { hunkExcerpt, selectedLines } from "./diff.mjs";
-import { ReviewError, isRecord } from "../web/contracts.mjs";
+import { ReviewError, isRecord, settingsPatch } from "../web/contracts.mjs";
 import { parseReviewCommand } from "../web/review-commands.mjs";
 import { checkBatchImageBudget, commentImageIds } from "./comment-images.mjs";
+import { inferRuleDestination, saveRepositoryRule, type RuleDestination } from "./learned-rules.mjs";
+import { selectInstructionMapping, type SettingsService } from "./settings.mjs";
 export { ReviewError } from "../web/contracts.mjs";
 import type { Log, ReviewScope, DeliveryChoice } from "../../types/contracts.js";
 import type { Store } from "./store.mjs";
@@ -95,6 +97,8 @@ export interface Lesson {
     sourceMessageId?: string;
     scope: string;
     rule: string;
+    reviewedPath?: string;
+    destination?: RuleDestination;
     status?: string;
     savedTo: string | null;
     createdAt: string;
@@ -166,6 +170,7 @@ export interface LessonInput {
     scope?: string;
     rule?: string;
     status?: string;
+    destination?: RuleDestination;
 }
 
 export interface MessageInput {
@@ -341,12 +346,32 @@ function lessonInput(value: unknown): LessonInput {
     if (fields.status != null && (typeof fields.status !== "string" || !LESSON_STATUSES.includes(fields.status))) {
         throw invalid(`lesson.status must be one of ${LESSON_STATUSES.join(", ")}.`);
     }
+    let destination: RuleDestination | undefined;
+    if (fields.destination !== undefined) {
+        if (!isRecord(fields.destination) || (fields.destination.kind !== "general" && fields.destination.kind !== "language")) {
+            throw invalid("lesson.destination must identify a general or language-specific instruction.");
+        }
+        destination = fields.destination.kind === "general"
+            ? {
+                kind: "general",
+                ...(typeof fields.destination.pathPrefix === "string" ? { pathPrefix: fields.destination.pathPrefix } : {}),
+                ...(typeof fields.destination.instructionRoot === "string" ? { instructionRoot: fields.destination.instructionRoot } : {}),
+            }
+            : {
+                kind: "language",
+                ...(typeof fields.destination.language === "string" ? { language: fields.destination.language } : {}),
+                ...(typeof fields.destination.applyTo === "string" ? { applyTo: fields.destination.applyTo } : {}),
+                ...(typeof fields.destination.pathPrefix === "string" ? { pathPrefix: fields.destination.pathPrefix } : {}),
+                ...(typeof fields.destination.instructionRoot === "string" ? { instructionRoot: fields.destination.instructionRoot } : {}),
+            };
+    }
     return {
         lessonId: optionalString(fields.lessonId, "lesson.lessonId"),
         sourceMessageId: optionalString(fields.sourceMessageId, "lesson.sourceMessageId"),
         rule: typeof fields.rule === "string" ? fields.rule : undefined,
         scope: optionalString(fields.scope, "lesson.scope"),
         status: optionalString(fields.status, "lesson.status"),
+        destination,
     };
 }
 
@@ -371,13 +396,39 @@ function findThread(review: Review, threadId: string) {
 
 const normalizeRule = (rule: string) => rule.toLowerCase().replace(/\s+/g, " ").replace(/[\s.;:!,]+$/, "").trim();
 
-async function saveRule(store: Store, repoRoot: string, lesson: Lesson) {
+async function saveRule(store: Store, repoRoot: string, lesson: Lesson, settings: SettingsService | undefined, confirmedNewFile = false): Promise<boolean> {
     const personal = lesson.scope === "personal";
     if ((!personal && lesson.scope !== "repo") || !lesson.rule.trim() || RULE_CONTROL_CHARACTERS.test(lesson.rule)) {
         throw invalid("The guideline needs a valid scope and single-line rule.");
     }
-    const root = await realpath(personal ? os.homedir() : repoRoot);
-    const folder = path.join(root, personal ? ".copilot" : ".github");
+    if (!personal) {
+        if (!settings || lesson.reviewedPath === undefined) {
+            lesson.saveError = "Choose an instruction destination before saving this repository guideline.";
+            return false;
+        }
+        const repositorySettings = await settings.get(repoRoot);
+        const mapping = selectInstructionMapping(repositorySettings.instructionMappings, lesson.reviewedPath);
+        if (!mapping) {
+            lesson.saveError = "Choose an instruction destination before saving this repository guideline.";
+            return false;
+        }
+        const destination = lesson.destination ?? inferRuleDestination(lesson.reviewedPath);
+        const result = await saveRepositoryRule(
+            repoRoot, mapping, lesson.reviewedPath, destination, lesson.rule, confirmedNewFile,
+            (key, action) => store.lock(key, action),
+        );
+        if (result.needsConfirmation) {
+            lesson.saveError = `Confirm creating ${result.savedTo} before saving this guideline.`;
+            return false;
+        }
+        lesson.status = "saved";
+        lesson.savedTo = result.savedTo;
+        lesson.updatedAt = nowIso();
+        delete lesson.saveError;
+        return true;
+    }
+    const root = await realpath(os.homedir());
+    const folder = path.join(root, ".copilot");
     const file = path.join(folder, "copilot-instructions.md");
     const containsRule = (text: string) => text.split(/\r?\n/).some((line) => line.trim().replace(/^(?:[-*+]|\d+\.)\s+/, "") === lesson.rule);
     await store.lock(`guideline-file:${file}`, async () => {
@@ -400,13 +451,14 @@ async function saveRule(store: Store, repoRoot: string, lesson: Lesson) {
         if (!containsRule(await readFile(file, "utf8"))) throw new ReviewError("conflict", "Could not verify the saved guideline.");
     });
     lesson.status = "saved";
-    lesson.savedTo = personal ? file : ".github/copilot-instructions.md";
+    lesson.savedTo = file;
     lesson.updatedAt = nowIso();
     delete lesson.saveError;
+    return true;
 }
 
 // Update a proposal in place so discussion retains its link to the originating comment.
-function applyLesson(review: Review, { reviewId, threadId, messageId }: Pick<Lesson, "reviewId" | "threadId" | "messageId">, input: LessonInput) {
+function applyLesson(review: Review, { reviewId, threadId, messageId, reviewedPath }: Pick<Lesson, "reviewId" | "threadId" | "messageId"> & { reviewedPath?: string }, input: LessonInput) {
     const status = input.status ?? "proposed";
     const rule = typeof input.rule === "string" ? input.rule.trim() : "";
     let lesson;
@@ -431,6 +483,7 @@ function applyLesson(review: Review, { reviewId, threadId, messageId }: Pick<Les
             ...(sourceMessageId ? { sourceMessageId } : {}),
             scope: input.scope ?? "repo",
             rule,
+            ...(reviewedPath !== undefined ? { reviewedPath, destination: input.destination ?? inferRuleDestination(reviewedPath) } : {}),
             status,
             savedTo: null,
             createdAt: nowIso(),
@@ -441,6 +494,11 @@ function applyLesson(review: Review, { reviewId, threadId, messageId }: Pick<Les
     if (rule) lesson.rule = rule;
     if (sourceMessageId) lesson.sourceMessageId = sourceMessageId;
     if (input.scope) lesson.scope = input.scope;
+    if (reviewedPath !== undefined) {
+        lesson.reviewedPath = reviewedPath;
+        if (input.destination) lesson.destination = input.destination;
+        else lesson.destination ??= inferRuleDestination(reviewedPath);
+    }
     lesson.status = status;
     lesson.savedTo = null;
     delete lesson.saveError;
@@ -505,12 +563,14 @@ export class ReviewService extends EventEmitter {
      * @param {number} [p.pid] process recorded on delivery claims
      * @param {(pid: number) => boolean} [p.isProcessAlive] whether a claiming process is still running
      */
-    constructor({ store, git = gitDefault, log = () => {}, pid = process.pid, isProcessAlive = processAlive, autoSaveLearnedRules = async () => false }: {
+    constructor({ store, settings, git = gitDefault, log = () => {}, pid = process.pid, isProcessAlive = processAlive, autoSaveLearnedRules = async () => false }: {
         store: Store; git?: typeof gitDefault; log?: Log; pid?: number; isProcessAlive?: (pid: number) => boolean;
+        settings?: SettingsService;
         autoSaveLearnedRules?: (repoRoot: string) => Promise<boolean>;
     }) {
         super();
         this.store = store;
+        this.settings = settings;
         this.git = git;
         this.log = log;
         this.pid = pid;
@@ -520,6 +580,7 @@ export class ReviewService extends EventEmitter {
     }
 
     private readonly autoSaveLearnedRules: (repoRoot: string) => Promise<boolean>;
+    private readonly settings: SettingsService | undefined;
 
     changed(reviewId: string, reason: string) {
         this.emit("changed", { reviewId, reason });
@@ -1010,7 +1071,11 @@ export class ReviewService extends EventEmitter {
                     }
                     const attributed = !l.lessonId && !l.sourceMessageId && sourceComment
                         ? { ...l, sourceMessageId: sourceComment.messageId } : l;
-                    const lesson = applyLesson(review, { reviewId, threadId, messageId: message.messageId }, attributed);
+                    const sourceLocation = thread.location ?? thread.anchor;
+                    const lesson = applyLesson(review, {
+                        reviewId, threadId, messageId: message.messageId,
+                        ...(sourceLocation?.path ? { reviewedPath: sourceLocation.path } : thread.kind === "overview" ? { reviewedPath: "" } : {}),
+                    }, attributed);
                     if (!message.lessonIds.includes(lesson.lessonId)) message.lessonIds.push(lesson.lessonId);
                     touchedLessons.set(lesson.lessonId, lesson);
                 }
@@ -1026,7 +1091,7 @@ export class ReviewService extends EventEmitter {
                     for (const lesson of touchedLessons.values()) {
                         if (lesson.status !== "proposed") continue;
                         try {
-                            await saveRule(this.store, review.repoRoot, lesson);
+                            await saveRule(this.store, review.repoRoot, lesson, this.settings);
                         } catch (error) {
                             this.log(`self-review: could not auto-save guideline: ${error instanceof Error ? error.message : String(error)}`, "warning");
                             lesson.saveError = "Could not save guideline automatically. It is still a proposal.";
@@ -1041,7 +1106,9 @@ export class ReviewService extends EventEmitter {
         return result;
     }
 
-    async saveLesson(reviewId: string, lessonId: string, { rule, scope }: { rule?: unknown; scope?: unknown }) {
+    async saveLesson(reviewId: string, lessonId: string, { rule, scope, mapping, destination }: {
+        rule?: unknown; scope?: unknown; mapping?: unknown; destination?: unknown;
+    }) {
         if (typeof rule !== "string" || (scope !== "repo" && scope !== "personal")) throw invalid("Provide the displayed rule and scope.");
         const { lesson, saved } = await this.store.updateReview(reviewId, async (review) => {
             if (!review) throw notFound(`Review ${reviewId} not found.`);
@@ -1054,8 +1121,27 @@ export class ReviewService extends EventEmitter {
             if (proposal.status === "saved") {
                 return { write: false, value: { lesson: proposal, saved: false }, journalLessons: [proposal] };
             }
-            await saveRule(this.store, review.repoRoot, proposal);
-            return { review, value: { lesson: proposal, saved: true }, journalLessons: [proposal] };
+            if (destination !== undefined) {
+                if (!isRecord(destination) || (destination.kind !== "general" && destination.kind !== "language")) {
+                    throw invalid("Provide a general or language-specific destination.");
+                }
+                proposal.destination = destination.kind === "general" ? { kind: "general" } : {
+                    kind: "language",
+                    ...(typeof destination.language === "string" ? { language: destination.language } : {}),
+                    ...(typeof destination.applyTo === "string" ? { applyTo: destination.applyTo } : {}),
+                };
+            }
+            if (mapping !== undefined) {
+                if (!this.settings) throw new ReviewError("unsupported", "Instruction mapping settings are unavailable.");
+                const validated = settingsPatch({ instructionMappings: [mapping] }).instructionMappings;
+                if (!validated?.[0]) throw invalid("Provide one valid instruction mapping.");
+                const current = await this.settings.get(review.repoRoot);
+                const next = current.instructionMappings.filter((item) => item.pathPrefix !== validated[0].pathPrefix);
+                next.push(validated[0]);
+                await this.settings.update(review.repoRoot, { instructionMappings: next });
+            }
+            const didSave = await saveRule(this.store, review.repoRoot, proposal, this.settings, true);
+            return { review, value: { lesson: proposal, saved: didSave }, journalLessons: [proposal] };
         });
         if (saved) this.changed(reviewId, "message");
         return lesson;

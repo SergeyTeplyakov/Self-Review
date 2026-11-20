@@ -208,7 +208,7 @@ test("command delivery uses read-only explanation and mode-specific persistence 
     const auto = buildPrompt({ ...fixture, message, autoSaveLearnedRules: true }).prompt;
     assert.match(off, /Always post the reusable rule and its scope as a proposal/);
     assert.match(off, /Save guideline/);
-    assert.match(auto, /Self-Review saves new rules automatically and verifies the write/);
+    assert.match(auto, /Self-Review saves only when a configured path mapping and a safe destination exist/);
     for (const prompt of [off, auto]) {
         assert.match(prompt, /narrowest reusable scope/);
         assert.match(prompt, /ask in-thread; do not invent a preference/);
@@ -264,7 +264,7 @@ test("ordinary feedback can propose or refine guidelines while auto-save is off"
     assert.match(prompt, /Auto-save learned rules is off/);
     assert.match(prompt, /state the rule and its scope in the reply and include it in lessons/);
     assert.match(prompt, /update its lessonId with the revised rule and scope/);
-    assert.match(prompt, /the reviewer can click Save guideline/);
+    assert.match(prompt, /Self-Review routes the rule through the user's path-prefix mapping/);
     assert.match(prompt, /When resolution is delegated, use set_thread_status/);
 });
 
