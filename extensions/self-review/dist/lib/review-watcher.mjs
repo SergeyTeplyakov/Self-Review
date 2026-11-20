@@ -95,8 +95,8 @@ export class ReviewWatcher {
                     && !classifying && !unchecked.size;
                 if (!needsRefresh || !isCurrent())
                     return;
-                await this.service.refresh(reviewId, isCurrent);
-                if (isCurrent())
+                const result = await this.service.refresh(reviewId, isCurrent);
+                if (result !== null && isCurrent())
                     needsRefresh = false;
             };
             const ignoreLocation = (file) => {

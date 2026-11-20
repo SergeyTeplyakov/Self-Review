@@ -185,6 +185,35 @@ test("ignored writes do not delay publication of a settled tracked edit", async 
     assert.deepEqual(checks, ["build/noise.log\0build/other.log\0"], "ignored events share one async Git check");
 });
 
+test("a cancelled refresh retries when ignored-event classification finishes during cleanup", async (t) => {
+    const f = await fixture(t);
+    await mkdir(path.join(f.repo, "build"));
+    let change: (file: string) => void = () => assert.fail("checkout watcher not registered");
+    let calls = 0;
+    const watcher = new ReviewWatcher({
+        getReview: (id) => f.service.getReview(id),
+        refresh: async (id, current) => {
+            if (++calls === 2) {
+                change("build/noise.log");
+                assert.equal(current(), false, "pending classification cancels publication");
+                await until(current);
+                return null;
+            }
+            return f.service.refresh(id, current);
+        },
+    }, (text) => f.logs.push(text), 50, (root, callback) => {
+        if (root === f.repo) change = callback;
+        return { close() {} };
+    });
+    t.after(() => watcher.close());
+    await watcher.setReview(f.id);
+    await writeFile(path.join(f.repo, "file.ts"), "settled edit\n");
+    change("file.ts");
+    await until(async () => (await f.service.getReview(f.id)).git?.uncommittedFiles === 1);
+    assert.equal(calls, 3);
+    assert.deepEqual(f.logs, []);
+});
+
 test("a settled watcher refresh survives rejection of the preceding manual capture", async (t) => {
     const f = await fixture(t);
     await writeFile(path.join(f.repo, "file.ts"), "settled edit\n");

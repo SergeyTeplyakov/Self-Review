@@ -99,8 +99,8 @@ export class ReviewWatcher {
                 const isCurrent = () => generation === this.generation && !this.closed && eventVersion === version
                     && !classifying && !unchecked.size;
                 if (!needsRefresh || !isCurrent()) return;
-                await this.service.refresh(reviewId, isCurrent);
-                if (isCurrent()) needsRefresh = false;
+                const result = await this.service.refresh(reviewId, isCurrent);
+                if (result !== null && isCurrent()) needsRefresh = false;
             };
             const ignoreLocation = (file: string) => {
                 if (matchesPaths([known], [file])) return null;
