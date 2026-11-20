@@ -65,8 +65,10 @@ approval, do not bypass it; report the conflict and wait for that approval.
 For each pushed commit, verify the PR's remote head is exactly that SHA, and
 check validation for that exact head. If further changes are needed, make the
 smallest in-scope fix, rerun relevant local validation, push normally, and
-start a new verification cycle for the new SHA. Re-request Copilot review when
-the new changes warrant it.
+start a new verification cycle for the new SHA. A new PR head invalidates prior
+Copilot review evidence. Request a review for each changed head and verify that
+the completed review is associated with that exact SHA before treating the
+review gate as satisfied.
 
 Before any merge, verify all of the following against the same current PR head
 and verified target:
@@ -111,3 +113,27 @@ restart verification for the new state. In manual/no-merge mode, or when any
 gate is blocked, leave the PR open and report its exact status, completed
 validation, review state, and the reason it was not merged. Never claim a PR is
 merged based only on a command exit or a queued merge.
+
+After GitHub confirms the PR is merged:
+
+1. Record the PR's merge commit, run `git fetch origin`, and verify that merge
+   commit is an ancestor of `origin/main` (for example,
+   `git merge-base --is-ancestor <merge-commit> origin/main`). If it is not
+   present yet, fetch again and wait; do not switch to a stale `origin/main`.
+2. Before changing the checkout, inspect the worktree and the PR branch's
+   upstream and compare the local branch with its last verified remote PR head.
+   If there is uncommitted or unpushed work, stop and report it; never discard
+   it to reset the checkout. If no remote head or upstream is available to
+   verify whether commits are unpushed, keep the branch and report the blocker.
+3. Switch this worktree to the fetched `origin/main`, preferably with
+   `git switch --detach origin/main` so this does not conflict with another
+   worktree that has the local `main` branch checked out.
+4. Delete the local PR branch only after confirming its worktree was clean and
+   it has no commits ahead of its last verified remote PR head or upstream. A
+   squash merge may not make the PR branch an ancestor of `origin/main`; if
+   `git branch -d` refuses for that reason, force-delete only after the PR
+   merge, clean worktree, and no-unpushed-commits checks are verified. If any
+   check is unavailable or fails, keep the branch and report why.
+5. Reopen or refresh this worktree's Self-Review canvas with the explicit
+   repository path, scope `all`, and base `origin/main`. Verify it shows the
+   fresh `origin/main` HEAD and no leftover PR changes, then report that HEAD.

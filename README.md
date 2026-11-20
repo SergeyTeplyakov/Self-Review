@@ -177,6 +177,13 @@ The built-in review approach draws on [Addy's evidence-based review and simplifi
 Canvases are a GitHub Copilot app feature. The skill loads in Copilot CLI too, but without the canvas there is nothing to comment on.
 Ask Copilot **"create PR"** to run the workflow; it merges only when its review and CI gates pass and no unusual signals remain. Say **"manual mode"** or **"no merge"** to leave the PR open.
 
+After a verified merge, the workflow fetches and verifies `origin/main`, then
+switches the PR worktree to that fresh tip (detached if another worktree owns
+`main`) and refreshes the All changes canvas so the merged PR diff is no longer
+shown. It removes the local PR branch only when the worktree is clean and the
+branch has no unpushed commits; otherwise it stops and reports without
+discarding work.
+
 ## Updating
 
 ```bash
