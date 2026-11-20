@@ -670,7 +670,10 @@ export class ReviewService extends EventEmitter {
     refresh(reviewId: string, isCurrent?: () => boolean): Promise<RefreshResult | null> {
         const running = this.refreshes.get(reviewId);
         if (running?.promise) {
-            if (isCurrent) return running.promise.then(() => isCurrent() ? this.refresh(reviewId, isCurrent) : null);
+            if (isCurrent) {
+                const resume = () => isCurrent() ? this.refresh(reviewId, isCurrent) : null;
+                return running.promise.then(resume, resume);
+            }
             running.again = true;
             return running.promise;
         }

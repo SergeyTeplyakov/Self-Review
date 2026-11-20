@@ -1,4 +1,3 @@
-import { spawnSync } from "node:child_process";
 import { watch } from "node:fs";
 import type { FSWatcher } from "node:fs";
 import { lstat } from "node:fs/promises";
@@ -12,7 +11,7 @@ const gitInput = (name: string) => !name.endsWith(".lock")
     && (/^(HEAD|index|packed-refs|config|shallow|info\/exclude)$/.test(name) || name.startsWith("refs/")
         || (name.startsWith("modules/") && (/\/(HEAD|index|packed-refs|config|shallow|info\/exclude)$/.test(name) || name.includes("/refs/"))));
 const message = (error: unknown) => error instanceof Error ? error.message : String(error);
-type WatchDirectory = (root: string, changed: (file: string | null) => void, failed: (error: Error) => void) => Pick<FSWatcher, "close">;
+type WatchDirectory = (root: string, changed: (file: string | null, event?: "rename" | "change") => void, failed: (error: Error) => void) => Pick<FSWatcher, "close">;
 type FileInventory = { files: Set<string>; directories: Set<string> };
 type GitInventory = FileInventory & { submodules: Set<string>; submoduleFiles: Map<string, FileInventory> };
 function fileInventory(files: Iterable<string>): FileInventory {
@@ -30,7 +29,7 @@ function matchesPaths(inventories: FileInventory[], paths: string[]): boolean {
     return paths.some((file) => inventories.some((inventory) => inventory.files.has(file) || inventory.directories.has(file)));
 }
 const createDirectoryWatcher: WatchDirectory = (root, changed, failed) => {
-    const watcher = watch(root, { recursive: true, persistent: false }, (_event, file) => changed(file?.toString() ?? null));
+    const watcher = watch(root, { recursive: true, persistent: false }, (event, file) => changed(file?.toString() ?? null, event));
     watcher.on("error", failed);
     return watcher;
 };
@@ -52,6 +51,7 @@ export class ReviewWatcher {
         private readonly log: Log,
         private readonly debounceMs = DEBOUNCE_MS,
         private readonly watchDirectory: WatchDirectory = createDirectoryWatcher,
+        private readonly git: typeof runGit = runGit,
     ) {}
 
     async setReview(reviewId: string): Promise<void> {
@@ -90,29 +90,25 @@ export class ReviewWatcher {
             if (generation !== this.generation || this.closed) return;
             let eventVersion = 0;
             let needsRefresh = true;
+            let ignoreEpoch = 0;
+            const ignoredPaths = new Set<string>();
+            const unchecked = new Map<string, number>();
+            let pathVersion = 0;
+            let classifying = false;
             const refresh = async (version: number) => {
-                const isCurrent = () => generation === this.generation && !this.closed && eventVersion === version;
+                const isCurrent = () => generation === this.generation && !this.closed && eventVersion === version
+                    && !classifying && !unchecked.size;
                 if (!needsRefresh || !isCurrent()) return;
                 await this.service.refresh(reviewId, isCurrent);
                 if (isCurrent()) needsRefresh = false;
             };
-            const isIgnored = (file: string): boolean => {
-                if (matchesPaths([known], [file])) return false;
+            const ignoreLocation = (file: string) => {
+                if (matchesPaths([known], [file])) return null;
                 let parent = path.posix.dirname(file);
                 while (parent !== "." && !known.submodules.has(parent)) parent = path.posix.dirname(parent);
                 const relative = parent === "." ? file : path.posix.relative(parent, file);
                 const nested = known.submoduleFiles.get(parent);
-                if (nested && matchesPaths([nested], [relative])) return false;
-                // Classify unknown paths before they can invalidate a capture. Use the
-                // current index and ignore rules, not a cache that could miss rule changes.
-                const result = spawnSync("git", ["check-ignore", "-z", "--stdin"], {
-                    cwd: path.join(review.repoRoot, parent),
-                    input: `${relative}\0`,
-                    env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
-                    windowsHide: true,
-                });
-                // Only discard an event if Git confirms it is ignored.
-                return result.status === 0;
+                return nested && matchesPaths([nested], [relative]) ? null : { parent, relative };
             };
             const add = (root: string, metadata: boolean) => {
                 const flush = () => {
@@ -220,17 +216,88 @@ export class ReviewWatcher {
                         await refresh(version);
                     }).catch((error: unknown) => this.warn(error));
                 };
-                const watcher = this.watchDirectory(root, (filename) => {
-                    if (generation !== this.generation || this.closed) return;
-                    const file = filename?.replace(/\\/g, "/") ?? "";
-                    if (metadata ? file && !gitInput(file) : file.split("/").includes(".git")) return;
-                    if (!metadata && file && isIgnored(file)) return;
-                    eventVersion++;
-                    const absolute = path.join(root, file);
-                    this.candidates.set(absolute, { file, git: metadata });
+                const schedule = () => {
                     clearTimeout(this.timer);
                     this.timer = setTimeout(flush, this.debounceMs);
                     this.timer.unref();
+                };
+                const admit = (file: string) => {
+                    eventVersion++;
+                    this.candidates.set(path.join(root, file), { file, git: metadata });
+                    schedule();
+                };
+                const classify = async () => {
+                    classifying = true;
+                    try {
+                        while (unchecked.size && generation === this.generation && !this.closed) {
+                            const epoch = ignoreEpoch;
+                            const groups = new Map<string, Map<string, { file: string; version: number }>>();
+                            for (const [file, version] of unchecked) {
+                                const location = ignoreLocation(file);
+                                if (!location) {
+                                    unchecked.delete(file);
+                                    admit(file);
+                                    continue;
+                                }
+                                const group = groups.get(location.parent) ?? new Map();
+                                group.set(location.relative, { file, version });
+                                groups.set(location.parent, group);
+                            }
+                            const results = await Promise.all([...groups].map(async ([parent, files]) => {
+                                try {
+                                    const result = await this.git(path.join(root, parent), ["check-ignore", "-z", "--stdin"], {
+                                        allowFail: true, input: [...files.keys()].join("\0") + "\0",
+                                    });
+                                    if (result.exitCode !== 0 && result.exitCode !== 1) {
+                                        throw new Error(`git check-ignore failed: ${result.stderr.trim() || `exit code ${result.exitCode}`}`);
+                                    }
+                                    return [files, new Set(result.stdout.split("\0"))] as const;
+                                } catch (error) {
+                                    this.warn(error);
+                                    return [files, new Set<string>()] as const;
+                                }
+                            }));
+                            if (generation !== this.generation || this.closed) return;
+                            if (epoch !== ignoreEpoch) continue;
+                            for (const [files, ignored] of results) {
+                                for (const [relative, { file, version }] of files) {
+                                    if (unchecked.get(file) !== version) continue;
+                                    unchecked.delete(file);
+                                    if (ignored.has(relative)) {
+                                        if (ignoredPaths.size >= 4096) ignoredPaths.delete(ignoredPaths.values().next().value!);
+                                        ignoredPaths.add(file);
+                                    } else admit(file);
+                                }
+                            }
+                        }
+                    } finally {
+                        classifying = false;
+                        // If the quiet timer already elapsed, classification was the only
+                        // remaining publication barrier. Resume without another quiet period.
+                        if (generation === this.generation && !this.closed && needsRefresh && !this.timer) flush();
+                    }
+                };
+                const watcher = this.watchDirectory(root, (filename, event) => {
+                    if (generation !== this.generation || this.closed) return;
+                    const file = filename?.replace(/\\/g, "/") ?? "";
+                    if (metadata ? file && !gitInput(file) : file.split("/").includes(".git")) return;
+                    if (metadata || !file || path.posix.basename(file) === ".gitignore") {
+                        ignoreEpoch++;
+                        ignoredPaths.clear();
+                    } else if (event === "rename") {
+                        const affected = (candidate: string) => candidate === file || candidate.startsWith(`${file}/`);
+                        for (const candidate of ignoredPaths) if (affected(candidate)) ignoredPaths.delete(candidate);
+                        for (const candidate of unchecked.keys()) if (affected(candidate)) unchecked.set(candidate, ++pathVersion);
+                    }
+                    if (metadata || !file || !ignoreLocation(file)) {
+                        admit(file);
+                    } else if (!ignoredPaths.has(file)) {
+                        if (!unchecked.has(file)) unchecked.set(file, ++pathVersion);
+                        if (!classifying) {
+                            classifying = true;
+                            queueMicrotask(() => { void classify(); });
+                        }
+                    }
                 }, (error) => {
                     this.warn(error);
                     watcher.close();

@@ -151,6 +151,7 @@ test("ignored writes do not delay publication of a settled tracked edit", async 
     await mkdir(path.join(f.repo, "build"));
     let change: (file: string) => void = () => assert.fail("checkout watcher not registered");
     const published: number[] = [];
+    const checks: string[] = [];
     const watcher = new ReviewWatcher({
         getReview: (id) => f.service.getReview(id),
         refresh: async (id, current) => {
@@ -162,6 +163,9 @@ test("ignored writes do not delay publication of a settled tracked edit", async 
     }, (text) => f.logs.push(text), 100, (root, callback) => {
         if (root === f.repo) change = callback;
         return { close() {} };
+    }, (root, args, options) => {
+        checks.push(options?.input ?? "");
+        return runGit(root, args, options);
     });
     t.after(() => watcher.close());
     await watcher.setReview(f.id);
@@ -171,12 +175,29 @@ test("ignored writes do not delay publication of a settled tracked edit", async 
     for (let i = 0; i < 10; i++) {
         await appendFile(path.join(f.repo, "build", "noise.log"), "ignored write\n");
         change("build/noise.log");
+        change("build/other.log");
         t.mock.timers.tick(20);
     }
     // Let Git finish without advancing the mocked clock past the last noise event.
     const deadline = Date.now() + 5000;
     while (published.length < 2 && Date.now() < deadline) await realDelay(25);
     assert.deepEqual(published, [0, 1]);
+    assert.deepEqual(checks, ["build/noise.log\0build/other.log\0"], "ignored events share one async Git check");
+});
+
+test("a settled watcher refresh survives rejection of the preceding manual capture", async (t) => {
+    const f = await fixture(t);
+    await writeFile(path.join(f.repo, "file.ts"), "settled edit\n");
+    let reject!: (error: Error) => void;
+    const promise = new Promise<never>((_resolve, fail) => { reject = fail; });
+    t.mock.method(f.service, "refreshOnce", () => promise);
+    const manual = f.service.refresh(f.id);
+    const rejected = assert.rejects(manual, /capture failed/);
+    const queued = f.service.refresh(f.id, () => true);
+    reject(new Error("capture failed"));
+    await rejected;
+    assert.equal((await queued)?.revisionId, "r2");
+    assert.equal((await f.service.getReview(f.id)).git?.uncommittedFiles, 1);
 });
 
 for (const phase of ["snapshot", "metadata"] as const) {
