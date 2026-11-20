@@ -3,6 +3,7 @@ import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync,
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { distributionBuildId, normalizeDistributionLineEndings } from "./distribution-fingerprint.mjs";
+import { publishDirectory } from "./publish-distribution.mjs";
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../../");
 const extensionRoot = path.join(repositoryRoot, "extensions", "self-review");
@@ -19,28 +20,6 @@ function distributionFiles(directory: string): string[] {
         const file = path.join(directory, entry.name);
         return entry.isDirectory() ? distributionFiles(file) : [file];
     });
-}
-
-function publishDirectory(staged: string, destination: string) {
-    const obsolete: string[] = [];
-    function install(source: string, target: string) {
-        mkdirSync(target, { recursive: true });
-        const previous = new Map(readdirSync(target, { withFileTypes: true }).map((entry) => [entry.name, entry]));
-        // Publish the build identity last, while keeping existing directories watched.
-        const entries = readdirSync(source, { withFileTypes: true }).sort((a, b) =>
-            Number(a.name === "version.json") - Number(b.name === "version.json"));
-        for (const entry of entries) {
-            const from = path.join(source, entry.name);
-            const to = path.join(target, entry.name);
-            const old = previous.get(entry.name);
-            previous.delete(entry.name);
-            if (entry.isDirectory()) install(from, to);
-            else if (!old?.isFile() || !readFileSync(from).equals(readFileSync(to))) renameSync(from, to);
-        }
-        obsolete.push(...[...previous.keys()].map((name) => path.join(target, name)));
-    }
-    install(staged, destination);
-    for (const entry of obsolete) rmSync(entry, { recursive: true, force: true });
 }
 
 function build(staged: string) {
