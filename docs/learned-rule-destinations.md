@@ -22,6 +22,7 @@ With **Auto-save learned rules** on, a proposal is still held if no mapping appl
 Each mapping has **Split language-specific rules into scoped files**, on by default:
 
 - **On:** For a language-specific rule, Self-Review uses only the exact `<language>.instructions.md` file under the mapped root's `.github/instructions`. If that file exists and its `applyTo` covers the reviewed file, Self-Review appends there. If it is missing, the proposal card asks you to confirm creating it with the suggested `applyTo`; topical files are not reused just because their `applyTo` matches. It does not write to ancestor or repository-root instruction files.
+- If the exact language file exists but its `applyTo` does not cover a different file extension, Self-Review proposes a separate extension-specific file (for example, `typescript-tsx.instructions.md`) rather than silently broadening the existing file's scope.
 - **Off:** Self-Review does not require the split. It appends to a matching applicable instruction file under the mapped root when one exists, or uses that root's general instruction file.
 - **Repository-wide rules:** These always go to the mapped root's general instruction file, regardless of the split setting.
 

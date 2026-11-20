@@ -13,7 +13,7 @@ export interface RuleDestination {
 
 const LANGUAGE_BY_EXTENSION: Record<string, string> = {
     cs: "csharp", js: "javascript", jsx: "javascript", mjs: "javascript", cjs: "javascript",
-    ts: "typescript", tsx: "typescript", py: "python", ps1: "powershell", go: "go",
+    ts: "typescript", tsx: "typescript", mts: "typescript", cts: "typescript", py: "python", ps1: "powershell", go: "go",
     rs: "rust", java: "java", rb: "ruby", php: "php", sh: "shell", sql: "sql",
 };
 
@@ -150,6 +150,7 @@ interface ResolvedRuleDestination {
     file: string;
     savedTo: string;
     createScopedFile: boolean;
+    validateScopedFile: boolean;
 }
 
 async function resolveRepositoryRuleDestination(
@@ -175,24 +176,36 @@ async function resolveRepositoryRuleDestination(
     let createScopedFile = false;
 
     if (destination.kind === "language" && mapping.splitLanguageSpecific) {
-        const name = `${destination.language}.instructions.md`;
-        const relativeFile = `${scopedDirectoryRelative}/${name}`;
-        const file = path.join(repoRoot, ...safeRelativePath(relativeFile));
-        const contents = scopedDirectory ? await readInstructionFile(file) : null;
+        let relativeFile = `${scopedDirectoryRelative}/${destination.language}.instructions.md`;
+        let file = path.join(repoRoot, ...safeRelativePath(relativeFile));
+        let contents = scopedDirectory ? await readInstructionFile(file) : null;
         if (contents === null) {
             createScopedFile = true;
         } else {
             const pattern = applyToFrom(contents);
             if (!pattern || (reviewedPath && !appliesTo(pattern, reviewedPath))) {
-                throw new ReviewError("conflict", `The existing ${relativeFile} does not apply to ${reviewedPath}.`);
+                const extension = path.posix.extname(reviewedPath.replace(/\\/g, "/")).slice(1).toLowerCase();
+                const suffix = /^[a-z0-9][a-z0-9-]{0,39}$/.test(extension) ? extension : "scoped";
+                relativeFile = `${scopedDirectoryRelative}/${destination.language}-${suffix}.instructions.md`;
+                file = path.join(repoRoot, ...safeRelativePath(relativeFile));
+                contents = scopedDirectory ? await readInstructionFile(file) : null;
+                if (contents === null) {
+                    createScopedFile = true;
+                } else {
+                    const variantPattern = applyToFrom(contents);
+                    if (!variantPattern || (reviewedPath && !appliesTo(variantPattern, reviewedPath))) {
+                        throw new ReviewError("conflict", `The existing ${relativeFile} does not apply to ${reviewedPath}.`);
+                    }
+                }
             }
         }
-        return { file, savedTo: relativeFile, createScopedFile };
+        return { file, savedTo: relativeFile, createScopedFile, validateScopedFile: true };
     } else if (destination.kind === "language" && scoped) {
         return {
             file: scoped.file,
             savedTo: `${scopedDirectoryRelative}/${path.basename(scoped.file)}`,
             createScopedFile: false,
+            validateScopedFile: true,
         };
     }
 
@@ -200,7 +213,7 @@ async function resolveRepositoryRuleDestination(
     const generalDirectory = await ensureSafeDirectory(repoRoot, `${rootLabel}.github`, createDirectories);
     const file = path.join(repoRoot, ...safeRelativePath(generalRelative));
     if (generalDirectory) await readInstructionFile(file);
-    return { file, savedTo: generalRelative, createScopedFile: false };
+    return { file, savedTo: generalRelative, createScopedFile: false, validateScopedFile: false };
 }
 
 export async function previewRepositoryRuleDestination(
@@ -232,7 +245,7 @@ export async function saveRepositoryRule(
     await lock(`guideline-file:${file}`, async () => {
         await ensureSafeDirectory(repoRoot, path.posix.dirname(resolved.savedTo));
         const current = await readInstructionFile(file);
-        if (destination.kind === "language" && mapping.splitLanguageSpecific) {
+        if (resolved.validateScopedFile) {
             if (current === null && !resolved.createScopedFile) {
                 throw new ReviewError("conflict", `The instruction destination changed to ${resolved.savedTo}. Review and confirm the updated destination.`);
             }

@@ -1855,6 +1855,19 @@ test("destination edits and expanded state survive a main-content rerender", asy
     assert.doesNotMatch(html, /name="splitLanguageSpecific" checked/);
 });
 
+test("browser destination suggestions recognize TypeScript module extensions", async () => {
+    const app = await loadApp();
+    for (const extension of ["mts", "cts"]) {
+        const destination = app.run<{ kind: string; language?: string; applyTo?: string }>(
+            `suggestedDestination({ reviewedPath: "src/Rules.${extension}" })`,
+        );
+        assert.deepEqual(
+            { kind: destination.kind, language: destination.language, applyTo: destination.applyTo },
+            { kind: "language", language: "typescript", applyTo: `**/*.${extension}` },
+        );
+    }
+});
+
 test("untouched proposal destinations follow Configure mapping updates", async () => {
     const app = await loadApp();
     const oldMapping = { pathPrefix: "src/Area", instructionRoot: "old/Area", splitLanguageSpecific: true };

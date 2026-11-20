@@ -2367,7 +2367,7 @@ function suggestedDestination(lesson: Lesson, reviewedPath = lesson.reviewedPath
     const extension = reviewedPath?.replace(/\\/g, "/").split(".").at(-1)?.toLowerCase() ?? "";
     const names: Record<string, string> = {
         cs: "csharp", js: "javascript", jsx: "javascript", mjs: "javascript", cjs: "javascript",
-        ts: "typescript", tsx: "typescript", py: "python", ps1: "powershell", go: "go",
+        ts: "typescript", tsx: "typescript", mts: "typescript", cts: "typescript", py: "python", ps1: "powershell", go: "go",
         rs: "rust", java: "java", rb: "ruby", php: "php", sh: "shell", sql: "sql",
     };
     const language = names[extension];
