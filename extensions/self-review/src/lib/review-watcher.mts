@@ -117,10 +117,13 @@ export class ReviewWatcher {
                 const result = await this.service.refresh(reviewId, isCurrent);
                 if (result !== null && isCurrent()) needsRefresh = false;
             };
-            const ignoreLocation = (file: string) => {
-                if (matchesPaths([known], [file])) return null;
+            const submoduleFor = (file: string) => {
                 let parent = path.posix.dirname(file);
                 while (parent !== "." && !known.submodules.has(parent)) parent = path.posix.dirname(parent);
+                return parent;
+            };
+            const ignoreLocation = (file: string, parent: string) => {
+                if (matchesPaths([known], [file])) return null;
                 const relative = parent === "." ? file : path.posix.relative(parent, file);
                 const nested = known.submoduleFiles.get(parent);
                 return nested && matchesPaths([nested], [relative]) ? null : { parent, relative };
@@ -248,7 +251,7 @@ export class ReviewWatcher {
                             const epoch = ignoreEpoch;
                             const groups = new Map<string, Map<string, { file: string; version: number }>>();
                             for (const [file, version] of unchecked) {
-                                const location = ignoreLocation(file);
+                                const location = ignoreLocation(file, submoduleFor(file));
                                 if (!location) {
                                     unchecked.delete(file);
                                     admit(file);
@@ -296,7 +299,8 @@ export class ReviewWatcher {
                     if (generation !== this.generation || this.closed) return;
                     const file = filename?.replace(/\\/g, "/") ?? "";
                     if (metadata ? file && !gitInput(file) : file.split("/").includes(".git")) return;
-                    if (!metadata && file && outsideReview(file)) return;
+                    const submodule = !metadata && file ? submoduleFor(file) : ".";
+                    if (!metadata && file && outsideReview(submodule === "." ? file : submodule)) return;
                     if (metadata || !file || path.posix.basename(file) === ".gitignore") {
                         ignoreEpoch++;
                         ignoredPaths.clear();
@@ -305,7 +309,7 @@ export class ReviewWatcher {
                         for (const candidate of ignoredPaths) if (affected(candidate)) ignoredPaths.delete(candidate);
                         for (const candidate of unchecked.keys()) if (affected(candidate)) unchecked.set(candidate, ++pathVersion);
                     }
-                    if (metadata || !file || !ignoreLocation(file)) {
+                    if (metadata || !file || !ignoreLocation(file, submodule)) {
                         admit(file);
                     } else if (!ignoredPaths.has(file)) {
                         if (!unchecked.has(file)) unchecked.set(file, ++pathVersion);

@@ -115,12 +115,15 @@ export class ReviewWatcher {
                 if (result !== null && isCurrent())
                     needsRefresh = false;
             };
-            const ignoreLocation = (file) => {
-                if (matchesPaths([known], [file]))
-                    return null;
+            const submoduleFor = (file) => {
                 let parent = path.posix.dirname(file);
                 while (parent !== "." && !known.submodules.has(parent))
                     parent = path.posix.dirname(parent);
+                return parent;
+            };
+            const ignoreLocation = (file, parent) => {
+                if (matchesPaths([known], [file]))
+                    return null;
                 const relative = parent === "." ? file : path.posix.relative(parent, file);
                 const nested = known.submoduleFiles.get(parent);
                 return nested && matchesPaths([nested], [relative]) ? null : { parent, relative };
@@ -255,7 +258,7 @@ export class ReviewWatcher {
                             const epoch = ignoreEpoch;
                             const groups = new Map();
                             for (const [file, version] of unchecked) {
-                                const location = ignoreLocation(file);
+                                const location = ignoreLocation(file, submoduleFor(file));
                                 if (!location) {
                                     unchecked.delete(file);
                                     admit(file);
@@ -314,7 +317,8 @@ export class ReviewWatcher {
                     const file = filename?.replace(/\\/g, "/") ?? "";
                     if (metadata ? file && !gitInput(file) : file.split("/").includes(".git"))
                         return;
-                    if (!metadata && file && outsideReview(file))
+                    const submodule = !metadata && file ? submoduleFor(file) : ".";
+                    if (!metadata && file && outsideReview(submodule === "." ? file : submodule))
                         return;
                     if (metadata || !file || path.posix.basename(file) === ".gitignore") {
                         ignoreEpoch++;
@@ -329,7 +333,7 @@ export class ReviewWatcher {
                             if (affected(candidate))
                                 unchecked.set(candidate, ++pathVersion);
                     }
-                    if (metadata || !file || !ignoreLocation(file)) {
+                    if (metadata || !file || !ignoreLocation(file, submodule)) {
                         admit(file);
                     }
                     else if (!ignoredPaths.has(file)) {

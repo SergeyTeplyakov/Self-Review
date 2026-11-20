@@ -522,11 +522,14 @@ test("submodule working files and stored HEAD metadata trigger superproject refr
     await runGit(source, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "base"]);
     await f.git("-c", "protocol.file.allow=always", "submodule", "add", "-q", source, "vendor/lib");
     await f.git("commit", "-qam", "submodule");
-    await f.watcher.setReview(f.id);
+    // Excluding a nested file does not exclude its owning gitlink from Git's diff.
+    const id = await f.service.ensureReview({ repoPath: f.repo, scope: "pending", exclude: ["vendor/lib/nested.ts"] });
+    await f.watcher.setReview(id);
     const submodule = path.join(f.repo, "vendor", "lib");
     const beforeTracked = f.count();
     await writeFile(path.join(submodule, "nested.ts"), "dirty\n");
-    await until(async () => (await f.service.getSnapshot(f.id)).files.some((file) => file.path === "vendor/lib"));
+    await until(async () => (await f.service.getSnapshot(id)).files.some((file) => file.path === "vendor/lib"));
+    assert.equal((await f.service.getReview(id)).git?.uncommittedFiles, 1);
     await until(() => f.count() > beforeTracked);
     await mkdir(path.join(submodule, "node_modules"));
     await writeFile(path.join(submodule, "node_modules", "output.js"), "ignored\n");
