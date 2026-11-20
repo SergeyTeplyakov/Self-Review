@@ -43,6 +43,17 @@ approval, do not bypass it; report the conflict and wait for that approval.
 
 ## 2. Create or update the PR
 
+Immediately after every successful push and every PR creation, check whether a
+matching Self-Review canvas is open. Verify its explicit checkout, scope `all`,
+and comparison against the verified PR target before reusing it; open one
+automatically only if no matching panel is open. Preserve the user's selected
+review, base, path filters, exclusions, threads, and settings. If the active
+panel is Pending or narrower than the whole PR, use a separate full-PR panel
+without changing it. Never retarget a panel another session owns; coordinate
+with its owner. Confirm the canvas captured the pushed head and intended diff.
+If the canvas cannot be opened or verified, report the limitation rather than
+claiming success. This checkpoint does not itself authorize a paid review.
+
 1. Commit only the intended changes, following repository conventions. Before
    pushing, verify the commit and working tree. Push the feature branch normally;
    never force-push or push to the target branch.

@@ -176,6 +176,9 @@ The built-in review approach draws on [Addy's evidence-based review and simplifi
 
 Canvases are a GitHub Copilot app feature. The skill loads in Copilot CLI too, but without the canvas there is nothing to comment on.
 Ask Copilot **"create PR"** to run the workflow; it merges only when its review and CI gates pass and no unusual signals remain. Say **"manual mode"** or **"no merge"** to leave the PR open.
+After every push or PR creation, the workflow reuses a verified matching
+Self-Review canvas or opens one automatically, preserving the user's existing
+review and filters while showing the whole PR on the correct checkout and base.
 
 After a verified merge, the workflow fetches and verifies `origin/main`, then
 switches the PR worktree to that fresh tip (detached if another worktree owns
