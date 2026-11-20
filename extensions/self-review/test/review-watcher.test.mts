@@ -446,6 +446,32 @@ test("deletion refreshes when a captured untracked file was never inventoried", 
     assert.deepEqual(f.logs, []);
 });
 
+test("the uncommitted count honors Git's submodule status without adding untracked-only diff entries", async (t) => {
+    const f = await fixture(t);
+    const source = path.join(f.tmp, "nested");
+    const submodule = "vendor/lib";
+    await runGit(f.tmp, ["init", "-q", "-b", "main", source]);
+    await writeFile(path.join(source, ".gitignore"), "ignored.txt\n");
+    await runGit(source, ["add", "."]);
+    await runGit(source, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-qm", "base"]);
+    await f.git("-c", "protocol.file.allow=always", "submodule", "add", "-q", source, submodule);
+    await f.git("commit", "-qam", "submodule");
+    await writeFile(path.join(f.repo, submodule, "ignored.txt"), "ignored\n");
+    const options = { repoRoot: f.repo, base: null, scope: "pending" as const };
+    assert.deepEqual((await captureSnapshot(options)).uncommittedFiles, []);
+
+    await writeFile(path.join(f.repo, submodule, "new.txt"), "untracked\n");
+    assert.equal((await f.git("status", "--porcelain=v1", "--untracked-files=all")).stdout.trimEnd(), " M vendor/lib");
+    assert.equal((await f.git("diff", "--name-only", "HEAD")).stdout, "");
+    const snapshot = await captureSnapshot(options);
+    assert.deepEqual(snapshot.uncommittedFiles, [submodule]);
+    assert.deepEqual(snapshot.files, []);
+    assert.deepEqual((await captureSnapshot({ ...options, includeUntracked: false })).uncommittedFiles, []);
+    assert.deepEqual((await captureSnapshot({ ...options, exclude: ["vendor"] })).uncommittedFiles, []);
+    await f.git("config", `submodule.${submodule}.ignore`, "untracked");
+    assert.deepEqual((await captureSnapshot(options)).uncommittedFiles, []);
+});
+
 test("ignored submodule events do not refresh even with a subsequent tracked event", async (t) => {
     const f = await fixture(t);
     const source = path.join(f.tmp, "submodule-source");

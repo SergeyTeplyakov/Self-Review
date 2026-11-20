@@ -183,7 +183,16 @@ export async function captureSnapshot({ repoRoot, base, paths, exclude, includeU
             : new Set((await runGit(repoRoot, [
                 "diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", head, "--", ...pathspec,
             ])).stdout.split("\0"));
-        uncommittedFiles.push(...checkContent.filter((file) => diffPaths.has(file)));
+        const gitlinks = new Set<string>();
+        if (checkContent.some((file) => !diffPaths.has(file))) {
+            // Porcelain can report a dirty submodule even when diff has no patch
+            // for it. Preserve Git's status decision for gitlinks.
+            const index = await runGit(repoRoot, ["ls-files", "--stage", "-z", "--", ...pathspec]);
+            for (const entry of index.stdout.split("\0")) {
+                if (entry.startsWith("160000 ")) gitlinks.add(entry.slice(entry.indexOf("\t") + 1));
+            }
+        }
+        uncommittedFiles.push(...checkContent.filter((file) => diffPaths.has(file) || gitlinks.has(file)));
     }
 
     let upstream: Snapshot["upstream"] = null;
