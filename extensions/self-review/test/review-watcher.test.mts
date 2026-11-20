@@ -143,38 +143,74 @@ test("debounce waits for the last event and releases every watcher and pending t
     assert.ok([...sources.values()].every((entry) => entry.closed));
 });
 
-test("a write during capture discards the transient revision and publishes the settled checkout", async (t) => {
+test("repeated dist rebuilds never publish transient uncommitted counts", async (t) => {
     const f = await fixture(t);
     const file = path.join(f.repo, "file.ts");
+    const dist = path.join(f.repo, "dist");
+    const output = Array.from({ length: 15 }, (_, i) => path.join(dist, `output-${i}.js`));
+    const restoreDist = async () => {
+        await mkdir(dist, { recursive: true });
+        await Promise.all(output.map((name) => writeFile(name, "generated\n")));
+    };
+    await restoreDist();
+    await f.git("add", "dist");
+    await f.git("commit", "-qm", "track generated output");
+    await writeFile(file, "initial local edit\n");
+    await writeFile(path.join(f.repo, "other.ts"), "second local edit\n");
+    await f.service.refresh(f.id);
+
     let checkout: ((file: string) => void) | undefined;
-    let mutateDuringCapture = false;
+    let rebuild = 0;
+    const capturedCounts: number[] = [];
     const service = new ReviewService({
         store: f.service.store,
         git: {
             ...f.service.git,
             captureSnapshot: async (options) => {
                 const snapshot = await f.service.git.captureSnapshot(options);
-                if (mutateDuringCapture && snapshot.files.some((entry) => entry.status === "deleted")) {
-                    mutateDuringCapture = false;
-                    await writeFile(file, "replacement\n");
-                    checkout?.("file.ts");
+                capturedCounts.push(snapshot.uncommittedFiles.length);
+                if (snapshot.files.some((entry) => entry.path.startsWith("dist/") && entry.status === "deleted")) {
+                    // Finish the destructive rebuild while the real Git snapshot is in flight.
+                    await restoreDist();
+                    await writeFile(file, `local edit after rebuild ${rebuild}\n`);
+                    checkout?.("dist");
                 }
                 return snapshot;
             },
         },
     });
-    const watcher = new ReviewWatcher(service, (text) => f.logs.push(text), 10, (root, change) => {
+    let lastRevision = (await service.getReview(f.id)).currentRevisionId;
+    const publishedCounts = [2];
+    let finishedRebuilds = 0;
+    const watcher = new ReviewWatcher({
+        getReview: (id) => service.getReview(id),
+        refresh: async (id, current) => {
+            const result = await service.refresh(id, current);
+            const review = await service.getReview(id);
+            if (review.currentRevisionId !== lastRevision) {
+                lastRevision = review.currentRevisionId;
+                publishedCounts.push(review.git!.uncommittedFiles);
+                if (!(await service.getSnapshot(id)).files.some((entry) => entry.path.startsWith("dist/"))) {
+                    finishedRebuilds++;
+                }
+            }
+            return result;
+        },
+    }, (text) => f.logs.push(text), 10, (root, change) => {
         if (root === f.repo) checkout = change;
         return { close() {} };
     });
     t.after(() => watcher.close());
     await watcher.setReview(f.id);
     assert.ok(checkout);
-    mutateDuringCapture = true;
-    await rm(file);
-    checkout("file.ts");
-    await until(async () => (await service.getSnapshot(f.id)).files[0]?.status === "modified");
-    assert.equal((await service.getReview(f.id)).currentRevisionId, "r2", "the deletion never became a revision");
+    for (rebuild = 1; rebuild <= 2; rebuild++) {
+        await rm(dist, { recursive: true });
+        checkout("dist");
+        await until(() => finishedRebuilds === rebuild);
+    }
+    t.diagnostic(`Uncommitted counts: captured ${capturedCounts.join(" -> ")}; published ${publishedCounts.join(" -> ")}`);
+    assert.deepEqual(capturedCounts, [2, 17, 2, 17, 2], "Git sees the real deletion during each rebuild");
+    assert.deepEqual(publishedCounts, [2, 2, 2], "only settled snapshots reach the canvas count");
     assert.deepEqual(f.logs, []);
 });
 
