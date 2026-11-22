@@ -2419,12 +2419,14 @@ function currentMappingsSnapshot(): string {
     return JSON.stringify(state.settings?.instructionMappings ?? []);
 }
 
+// A failed save may follow a concurrent mapping change, so reload the stored mappings for the card and its next save.
 // An edited card keeps the mappings it was edited against; if they changed since, show the stored destination again.
-async function discardStaleDestinationDraft(form: HTMLElement): Promise<void> {
+async function refreshDestinationAfterFailedSave(form: HTMLElement): Promise<void> {
     const lessonId = form.dataset.lessonForm;
     const messageId = form.dataset.lessonMessage;
-    if (!lessonId || !messageId || form.dataset.destinationEdited !== "true") return;
+    if (!lessonId || !messageId) return;
     await loadState();
+    if (form.dataset.destinationEdited !== "true") return;
     const key = destinationFormDraftKey(lessonId, messageId);
     const draft = destinationFormDrafts.get(key);
     if (draft && draft.expectedMappings === currentMappingsSnapshot()) return;
@@ -3302,7 +3304,7 @@ async function onClick(e: MouseEvent): Promise<void> {
                 if (candidate?.dataset?.lessonForm) {
                     destinationPreviewRequests.delete(candidate);
                     await updateDestinationPreview(candidate);
-                    await discardStaleDestinationDraft(candidate).catch(() => undefined);
+                    await refreshDestinationAfterFailedSave(candidate).catch(() => undefined);
                 }
             }
             toast(errorMessage(err), true);

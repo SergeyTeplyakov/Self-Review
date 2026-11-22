@@ -428,6 +428,8 @@ function mappingsWithConfirmedChoice(
         confirmed = selected;
         next = mappings.filter((item) => item.pathPrefix !== selected.pathPrefix);
         next.push(selected);
+        // Validate the list that will be stored before any rule is written, e.g. the mapping count limit.
+        next = settingsPatch({ instructionMappings: next }).instructionMappings!;
     }
     const mapping = selectInstructionMapping(next, reviewedPath);
     if (!mapping) throw invalid("Choose an instruction destination before saving this repository guideline.");
