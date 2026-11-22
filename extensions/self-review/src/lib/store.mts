@@ -82,7 +82,9 @@ export function assertRevisionId(revisionId: unknown): string {
     return revisionId;
 }
 
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+// Storage retries wait in real time, even while node:test mocks the global timers.
+const { setTimeout: wallClockTimeout } = globalThis;
+const sleep = (ms: number) => new Promise<void>((r) => wallClockTimeout(r, ms));
 
 async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
     for (let attempt = 0; ; attempt++) {
@@ -153,6 +155,8 @@ export class Store {
 
     // The exclusive file covers the entire transaction across provider processes.
     // Never steal an old lock: a slow or suspended owner may still be writing.
+    // Windows can briefly refuse to create a lock that another process is still deleting
+    // (EPERM/EBUSY/EACCES), so those wait like contention; a persistent error surfaces at the deadline.
     async fileLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
         const directory = path.join(this.root, "locks");
         await mkdir(directory, { recursive: true });
@@ -163,8 +167,11 @@ export class Store {
             try {
                 handle = await open(file, "wx", 0o600);
             } catch (err) {
-                if (errorCode(err) !== "EEXIST") throw err;
+                const code = errorCode(err);
+                const contended = code === "EEXIST";
+                if (!contended && (typeof code !== "string" || !RETRYABLE.has(code))) throw err;
                 if (Date.now() >= deadline) {
+                    if (!contended) throw err;
                     throw new Error(`Timed out waiting for store lock ${file}. If a provider crashed, stop all self-review providers before removing this lock.`);
                 }
                 await sleep(25);
