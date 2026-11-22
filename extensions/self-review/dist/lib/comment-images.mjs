@@ -41,6 +41,7 @@ export async function readCommentImage(store, reviewId, id) {
         throw error;
     }
 }
+export const commentImagePath = (store, reviewId, id) => imageLocation(store, reviewId, id).file;
 export async function commentImageIds(store, reviewId, input) {
     if (input === undefined)
         return [];

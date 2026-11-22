@@ -826,12 +826,19 @@ export class ReviewService extends EventEmitter {
                 if (target?.delivery?.state === "draft") {
                     throw new ReviewError("conflict", `Message ${input.inReplyTo} is a draft the reviewer has not sent yet; reply after it is delivered.`);
                 }
+                if (input.parallelAttemptId && (target?.delivery?.attemptId !== input.parallelAttemptId
+                    || !target.delivery.parallel || target.delivery.state !== "processing")) {
+                    throw new ReviewError("conflict", "This parallel comment attempt is no longer processing.");
+                }
+                if (target?.delivery?.parallel && !input.parallelAttemptId && ["queued", "processing"].includes(target.delivery.state)) {
+                    throw new ReviewError("conflict", "Use the parallel worker result to reply to this comment.");
+                }
                 const requestedBatch = optionalString(input.batchId, "batchId");
                 const originalBatch = target?.delivery?.submittedBatchId ?? target?.delivery?.batchId;
                 if (requestedBatch && (!input.inReplyTo || requestedBatch !== originalBatch)) {
                     throw invalid("batchId must identify the submission that included the reply target.");
                 }
-                const batchId = requestedBatch ?? target?.delivery?.batchId;
+                const batchId = input.parallelAttemptId ? undefined : requestedBatch ?? target?.delivery?.batchId;
                 const answered = batchId ? thread.messages.filter((m) => m.author === "user" && (m.delivery?.submittedBatchId ?? m.delivery?.batchId) === batchId)
                     : target?.author === "user" ? [target] : [];
                 if (target?.delivery) {
@@ -1073,7 +1080,7 @@ export class ReviewService extends EventEmitter {
         const ids = await this.store.updateReview(reviewId, (review) => {
             if (!review)
                 return { write: false, value: [] };
-            const hits = allMessages(review).filter(({ message }) => message.delivery?.state === "processing"
+            const hits = allMessages(review).filter(({ message }) => message.delivery?.state === "processing" && !message.delivery.parallel
                 && (!sessionId || !message.delivery.processedBy || message.delivery.processedBy === sessionId));
             for (const { message } of hits)
                 message.delivery = { ...message.delivery, state: "no-reply", updatedAt: nowIso() };
@@ -1091,10 +1098,20 @@ export class ReviewService extends EventEmitter {
                 return { write: false, value: [] };
             const hits = allMessages(review).filter(({ message }) => {
                 const d = message.delivery;
-                return d?.state === "saving" && Number.isInteger(d.claimPid) && d.claimPid !== this.pid && !this.isProcessAlive(d.claimPid);
+                return d && (d.state === "saving" || d.parallel && ["queued", "processing"].includes(d.state))
+                    && Number.isInteger(d.claimPid) && d.claimPid !== this.pid && !this.isProcessAlive(d.claimPid);
             });
             for (const { message } of hits) {
-                message.delivery = { ...message.delivery, state: "failed", error: "The extension stopped before this comment was sent. Resend it.", updatedAt: nowIso() };
+                const delivery = message.delivery;
+                message.delivery = {
+                    ...delivery, state: "failed",
+                    error: !delivery?.parallel
+                        ? "The extension stopped before this comment was sent. Resend it."
+                        : delivery.state === "queued"
+                            ? "The extension restarted before parallel analysis started. Nothing was changed; resend it."
+                            : "Parallel processing was interrupted. Check the reviewed checkout for any applied changes before resending.",
+                    updatedAt: nowIso(),
+                };
             }
             return hits.length ? { review, value: hits.map((h) => h.message.messageId) } : { write: false, value: [] };
         });
