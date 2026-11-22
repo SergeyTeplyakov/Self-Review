@@ -39,6 +39,7 @@ type DiffFile = {
     additions: number;
     deletions: number;
     binary: boolean;
+    imageSides?: Partial<Record<DiffSide, string>>;
     note?: string | null;
     untracked?: boolean;
     oldMode?: string | null;
@@ -327,6 +328,8 @@ function isDiffFile(value: unknown): value is DiffFile {
         && (value.status === "modified" || value.status === "added" || value.status === "deleted" || value.status === "renamed")
         && typeof value.additions === "number" && typeof value.deletions === "number"
         && typeof value.binary === "boolean" && isOptionalString(value.note)
+        && (value.imageSides === undefined || (isRecord(value.imageSides)
+            && isOptionalString(value.imageSides.old) && isOptionalString(value.imageSides.new)))
         && (value.untracked === undefined || typeof value.untracked === "boolean")
         && isOptionalString(value.oldMode) && isOptionalString(value.newMode)
         && (value.typeChanged === undefined || typeof value.typeChanged === "boolean")
@@ -2453,6 +2456,19 @@ function lessonsView(): string {
     return `<h2>Lessons learned (${lessons.length})</h2><table class="lessons-table"><thead><tr><th>Scope</th><th>Status</th><th>Rule</th><th>Saved to</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
+function imageDiffHtml(file: DiffFile): string {
+    const rev = state.snapshot?.revisionId;
+    const reviewId = state.review?.reviewId;
+    if (!rev || !reviewId || !file.imageSides) return "";
+    const figures = (["old", "new"] as const).filter(side => file.imageSides?.[side]).map(side => {
+        const label = side === "old" ? "Before" : "After";
+        const name = side === "old" ? file.oldPath ?? file.path : file.path;
+        const url = `/api/diff-image/${encodeURIComponent(rev)}?review=${encodeURIComponent(reviewId)}&path=${encodeURIComponent(file.path)}&side=${side}&t=${encodeURIComponent(TOKEN)}`;
+        return `<figure><figcaption class="${side}">${label}</figcaption><div class="image-stage"><img loading="lazy" decoding="async" src="${esc(url)}" alt="${esc(`${label}: ${name}`)}"></div></figure>`;
+    });
+    return figures.length ? `<div class="image-diff">${figures.join("")}</div>` : "";
+}
+
 function fileView(file: DiffFile, { stacked = false, folded = false }: { stacked?: boolean; folded?: boolean } = {}): string {
     const threads = (state.review?.threads ?? []).filter((t) => t.kind !== "overview" && t.location?.path === file.path);
     const placed = new Map<string, ReviewThread[]>();
@@ -2498,7 +2514,7 @@ function fileView(file: DiffFile, { stacked = false, folded = false }: { stacked
     if (state.open.has(fileKey) || getDraft(fileKey) || state.pending.has(fileKey)) {
         html.push(`<div class="thread">${composerHtml(fileKey, { kind: "file", path: file.path, label: `Comment on ${file.path}`, alwaysOpen: true })}</div>`);
     }
-    if (file.binary) html.push(`<div class="card muted">${esc(file.note ?? "Binary file not shown.")}</div>`);
+    if (file.binary) html.push(imageDiffHtml(file) || `<div class="card muted">${esc(file.note ?? "Binary file not shown.")}</div>`);
     if (!file.binary && !file.hunks.length) html.push(`<div class="card muted">No textual changes (mode or rename only).</div>`);
     if (!stacked && !file.full && needsContent(file)) {
         const entry = contentEntry(file);
@@ -3300,6 +3316,15 @@ function onMouseUp(): void {
 
 // ---------- Boot ----------
 
+document.addEventListener("error", (event) => {
+    const image = event.target;
+    if (image instanceof HTMLImageElement && image.closest(".image-diff")) {
+        const message = document.createElement("p");
+        message.className = "muted";
+        message.textContent = "Preview unavailable. The image may have changed since this revision, be unsupported, or exceed 2 MB. Refresh to compare the latest version.";
+        image.replaceWith(message);
+    }
+}, true);
 document.addEventListener("click", onClick);
 document.addEventListener("auxclick", (e) => {
     if (e.button === 1) void onClick(e);

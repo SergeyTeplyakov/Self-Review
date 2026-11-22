@@ -3,24 +3,16 @@ import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { ReviewError } from "../web/contracts.mjs";
 import type { Store } from "./store.mjs";
+import { IMAGE_TYPES, imageType, MAX_IMAGE_BYTES, type ImageExtension } from "./image-format.mjs";
 
-export const MAX_IMAGE_BYTES = 2 * 1024 * 1024;
+export { MAX_IMAGE_BYTES };
 const MAX_BATCH_IMAGE_BYTES = 16 * 1024 * 1024;
 const MAX_IMAGES = 4;
-const TYPES = { png: "image/png", jpg: "image/jpeg", gif: "image/gif", webp: "image/webp" } as const;
-type Extension = keyof typeof TYPES;
-
-function imageType(bytes: Buffer): Extension | undefined {
-    if (bytes.subarray(0, 8).toString("hex") === "89504e470d0a1a0a") return "png";
-    if (bytes.subarray(0, 3).toString("hex") === "ffd8ff") return "jpg";
-    if (["GIF87a", "GIF89a"].includes(bytes.toString("ascii", 0, 6))) return "gif";
-    if (bytes.toString("ascii", 0, 4) === "RIFF" && bytes.toString("ascii", 8, 12) === "WEBP") return "webp";
-}
 
 function imageLocation(store: Store, reviewId: string, id: string) {
-    const extension = /^([a-f0-9]{64})\.(png|jpg|gif|webp)$/.exec(id)?.[2] as Extension | undefined;
+    const extension = /^([a-f0-9]{64})\.(png|jpg|gif|webp)$/.exec(id)?.[2] as ImageExtension | undefined;
     if (!extension) throw new ReviewError("invalid_input", "Invalid comment image reference.");
-    return { file: path.join(store.reviewDir(reviewId), "comment-images", id), mimeType: TYPES[extension] };
+    return { file: path.join(store.reviewDir(reviewId), "comment-images", id), mimeType: IMAGE_TYPES[extension] };
 }
 
 export async function saveCommentImage(store: Store, reviewId: string, bytes: Buffer) {

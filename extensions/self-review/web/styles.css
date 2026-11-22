@@ -550,6 +550,13 @@ pre {
 .review-commands button.selected { border-color: var(--mr-accent); }
 .review-commands button span { color: var(--mr-muted); }
 .comment-images { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0; }
+.image-diff { display: flex; flex-wrap: wrap; gap: 12px; padding: 12px 0; }
+.image-diff figure { flex: 1 1 200px; min-width: 0; margin: 0; border: 1px solid var(--mr-border); border-radius: var(--mr-radius); overflow: hidden; }
+.image-diff figcaption { padding: 6px 10px; font-weight: 600; }
+.image-diff .old { background: var(--mr-del-bg); }
+.image-diff .new { background: var(--mr-add-bg); }
+.image-stage { display: grid; place-items: center; padding: 12px; min-height: 72px; background: repeating-conic-gradient(var(--mr-subtle) 0 25%, transparent 0 50%) 0 0 / 16px 16px; }
+.image-stage img { max-width: 100%; max-height: 50vh; object-fit: contain; }
 .comment-images > div { position: relative; }
 .comment-images img { display: block; width: auto; height: auto; max-width: 144px; max-height: 100px; border-radius: 4px; }
 .comment-images button { position: absolute; top: 2px; right: 2px; padding: 0 5px; }

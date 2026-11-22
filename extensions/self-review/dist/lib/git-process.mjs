@@ -1,5 +1,22 @@
 // Read-only Git process boundary shared by repository capture and settings identity.
 import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+export async function readGitBlob(cwd, oid, maxBytes) {
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(oid))
+        throw new Error("Expected a full Git object ID.");
+    try {
+        const { stdout } = await promisify(execFile)("git", ["cat-file", "blob", oid], {
+            cwd, encoding: "buffer", maxBuffer: maxBytes, windowsHide: true,
+            env: { ...process.env, GIT_NO_LAZY_FETCH: "1", GIT_TERMINAL_PROMPT: "0" },
+        });
+        return stdout;
+    }
+    catch (error) {
+        if (error instanceof Error && "code" in error && (error.code === 128 || error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER"))
+            return null;
+        throw error;
+    }
+}
 /**
  * @param {string} cwd
  * @param {string[]} args

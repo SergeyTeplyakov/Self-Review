@@ -1,5 +1,6 @@
 // Unified diff parsing into a compact, render-friendly structure.
 // Row shape: { t: "ctx" | "add" | "del", o: oldLine | null, n: newLine | null, s: text }
+import { imagePath } from "./image-format.mjs";
 
 const HUNK_HEADER = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/;
 
@@ -35,6 +36,8 @@ export interface DiffFile {
     newMode?: string;
     typeChanged?: boolean;
     contentHash?: string;
+    // Full Git blob IDs for tracked images; the new side of an untracked file uses its raw SHA-256.
+    imageSides?: Partial<Record<DiffSide, string>>;
     note?: string;
 }
 
@@ -84,6 +87,7 @@ function newFile(): ParsedFile {
 
 export function parseUnifiedDiff(text: string): DiffFile[] {
     const files: ParsedFile[] = [];
+    const blobs = new WeakMap<ParsedFile, [string, string]>();
     let file: ParsedFile | null = null;
     let hunk: DiffHunk | null = null;
     let oldRemaining = 0;
@@ -164,9 +168,13 @@ export function parseUnifiedDiff(text: string): DiffFile[] {
             file.oldMode = line.slice("deleted file mode ".length);
         } else if (line.startsWith("old mode ")) file.oldMode = line.slice("old mode ".length);
         else if (line.startsWith("new mode ")) file.newMode = line.slice("new mode ".length);
-        else if (/^index \S+ \d{6}$/.test(line)) {
-            if (file.status !== "added") file.oldMode = line.slice(-6);
-            if (file.status !== "deleted") file.newMode = line.slice(-6);
+        else if (line.startsWith("index ")) {
+            const index = /^index ([a-f0-9]+)\.\.([a-f0-9]+)(?: (\d{6}))?$/.exec(line);
+            if (index) {
+                blobs.set(file, [index[1], index[2]]);
+                if (index[3] && file.status !== "added") file.oldMode = index[3];
+                if (index[3] && file.status !== "deleted") file.newMode = index[3];
+            }
         } else if (line.startsWith("rename from ")) {
             file.status = "renamed";
             file.oldPath = unquotePath(line.slice("rename from ".length));
@@ -187,6 +195,13 @@ export function parseUnifiedDiff(text: string): DiffFile[] {
     for (const f of files) {
         if (!f.path) f.path = f.oldPath;
         if (f.status === "added") f.oldPath = null;
+        const ids = blobs.get(f);
+        if (f.binary && ids && (imagePath(f.path) || imagePath(f.oldPath))) {
+            f.imageSides = {
+                ...(f.status !== "added" && { old: ids[0] }),
+                ...(f.status !== "deleted" && { new: ids[1] }),
+            };
+        }
     }
     // Git splits a type change (regular file <-> symlink) into a deletion and addition.
     // Consumers identify files by path, so expose the complete replacement as one change.
@@ -201,6 +216,7 @@ export function parseUnifiedDiff(text: string): DiffFile[] {
             Object.assign(previous, {
                 status: "modified", typeChanged: true, newMode: f.newMode,
                 binary: previous.binary || f.binary, additions: newLines,
+                ...((previous.imageSides || f.imageSides) && { imageSides: { ...previous.imageSides, ...f.imageSides } }),
                 hunks: rows.length ? [{
                     header: `@@ -${oldLines ? 1 : 0},${oldLines} +${newLines ? 1 : 0},${newLines} @@`,
                     section: "", oldStart: oldLines ? 1 : 0, oldLines, newStart: newLines ? 1 : 0, newLines, rows,

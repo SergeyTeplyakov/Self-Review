@@ -9,6 +9,7 @@ import path from "node:path";
 import { parseUnifiedDiff, synthesizeAddedFile } from "./diff.mjs";
 import type { DiffFile } from "./diff.mjs";
 import type { ReviewScope } from "../../types/contracts.js";
+import { imagePath, imageType, MAX_IMAGE_BYTES } from "./image-format.mjs";
 
 export interface CaptureOptions {
     repoRoot: string;
@@ -82,15 +83,17 @@ async function readUntracked(repoRoot: string, relPath: string): Promise<DiffFil
         return { path: relPath, oldPath: null, status: "added", binary: true, untracked: true, additions: 0, deletions: 0, hunks: [], contentHash: result.contentHash, note: "File too large to display" };
     }
     const { buffer } = result;
-    if (isBinary(buffer)) {
-        return { path: relPath, oldPath: null, status: "added", binary: true, untracked: true, additions: 0, deletions: 0, hunks: [], contentHash: result.contentHash };
+    const image = imagePath(relPath) && imageType(buffer);
+    if (image || isBinary(buffer)) {
+        return { path: relPath, oldPath: null, status: "added", binary: true, untracked: true, additions: 0, deletions: 0, hunks: [], contentHash: result.contentHash,
+            ...(image && { imageSides: { new: result.contentHash } }) };
     }
     return { ...synthesizeAddedFile(relPath, buffer.toString("utf8")), contentHash: result.contentHash };
 }
 
 // Read symlinks as Git does (their target text), never as the target's contents.
 // Resolve and check the parent too, so junctions/directory symlinks cannot escape.
-async function readRepoFile(repoRoot: string, relPath: string, maxBytes = Infinity): Promise<RepoFile | null> {
+async function readRepoFile(repoRoot: string, relPath: string, maxBytes = Infinity, hashOversized = true): Promise<RepoFile | null> {
     const full = safeJoin(repoRoot, relPath);
     const root = await realpath(repoRoot);
     const parent = await realpath(path.dirname(full));
@@ -105,6 +108,7 @@ async function readRepoFile(repoRoot: string, relPath: string, maxBytes = Infini
     safeJoin(root, path.relative(root, resolved));
     const handle = await open(resolved, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
     try {
+        if (!hashOversized && (await handle.stat()).size > maxBytes) return null;
         if (!Number.isFinite(maxBytes)) return { buffer: await handle.readFile() };
         const hash = createHash("sha256");
         const chunks: Buffer[] = [];
@@ -113,6 +117,7 @@ async function readRepoFile(repoRoot: string, relPath: string, maxBytes = Infini
         for await (const chunk of handle.createReadStream({ autoClose: false })) {
             hash.update(chunk);
             size += chunk.length;
+            if (!hashOversized && size > maxBytes) return null;
             if (size <= maxBytes) chunks.push(chunk);
             else chunks.length = 0;
         }
@@ -140,7 +145,7 @@ export async function captureSnapshot({ repoRoot, base, paths, exclude, includeU
     // Explicit prefixes keep the a/ and b/ headers the parser expects, whatever diff.noprefix or diff.mnemonicPrefix say.
     // --no-textconv keeps hunks in the file's real content, which anchors and agent edits use.
     const diff = await runGit(repoRoot, [
-        "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--find-renames", "--src-prefix=a/", "--dst-prefix=b/", `-U${contextLines}`, baseCommit, "--", ...pathspec,
+        "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--full-index", "--find-renames", "--src-prefix=a/", "--dst-prefix=b/", `-U${contextLines}`, baseCommit, "--", ...pathspec,
     ]);
     const files = parseUnifiedDiff(diff.stdout);
     const hash = createHash("sha256").update(baseCommit).update("\0").update(diff.stdout);
@@ -229,4 +234,18 @@ export async function readCommitFile(repoRoot: string, commit: string, relPath: 
     const r = await runGit(repoRoot, ["show", `${commit}:${relPath}`], { allowFail: true });
     if (!r.ok) return null;
     return r.stdout.split("\n").map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l));
+}
+
+export async function readMatchingWorkingImage(repoRoot: string, file: DiffFile, expected: string) {
+    try {
+        const result = await readRepoFile(repoRoot, file.path, MAX_IMAGE_BYTES, false);
+        if (!result || result.tooLarge) return null;
+        const bytes = result.buffer;
+        const hash = file.untracked ? result.contentHash : createHash(expected.length === 64 ? "sha256" : "sha1")
+            .update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
+        return hash === expected ? bytes : null;
+    } catch (err) {
+        if (errorCode(err) === "ENOENT" || errorCode(err) === "ENOTDIR") return null;
+        throw err;
+    }
 }
