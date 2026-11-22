@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { buildBatchPrompt, buildCommentPrompt } from "./prompt.mjs";
 import { readCommentImage } from "./comment-images.mjs";
+import { ParallelComments } from "./parallel-comments.mjs";
 const errorMessage = (error) => String(error && typeof error === "object" && "message" in error ? error.message ?? error : error);
 // Also accepts markers written before the rename to Self Review Canvas, so in-flight replies still match.
 const MARKER_RE = /^\[(?:self-review sr|manual-review mr):([a-z0-9][a-z0-9._-]{0,100}):(m-[0-9a-f-]{36})\]$/;
@@ -16,6 +17,8 @@ export class Delivery extends EventEmitter {
     autoSaveLearnedRules;
     sessionId;
     fallbackOwner;
+    parallel;
+    commentConcurrency;
     busy;
     bySessionMessageId;
     seenSessionMessageIds;
@@ -31,7 +34,7 @@ export class Delivery extends EventEmitter {
      * @param {(repoRoot: string) => Promise<boolean>} [p.autoSaveLearnedRules]
      * @param {() => string | undefined} [p.sessionId] conversation that processes the comments this instance sends
      */
-    constructor({ service, send, log = () => { }, reviewIds = () => [], autoSaveLearnedRules = async () => false, sessionId = () => undefined }) {
+    constructor({ service, send, log = () => { }, reviewIds = () => [], autoSaveLearnedRules = async () => false, sessionId = () => undefined, commentConcurrency = async () => 1 }) {
         super();
         this.service = service;
         this.send = send;
@@ -40,6 +43,8 @@ export class Delivery extends EventEmitter {
         this.autoSaveLearnedRules = autoSaveLearnedRules;
         this.sessionId = sessionId;
         this.fallbackOwner = `delivery-${randomUUID()}`;
+        this.commentConcurrency = commentConcurrency;
+        this.parallel = new ParallelComments(service, send, () => this.owner(), root => this.repoLearning(root));
         this.busy = null;
         this.bySessionMessageId = new Map();
         // Session message ids seen before send() resolved, and whether their turn has already finished.
@@ -87,6 +92,10 @@ export class Delivery extends EventEmitter {
     async sendClaimed(reviewId, claims, instanceId) {
         let sessionMessageId;
         try {
+            const { repoRoot } = await this.service.getReview(reviewId);
+            const concurrency = await this.commentConcurrency(repoRoot);
+            if (concurrency > 1)
+                return await this.parallel.enqueue(reviewId, instanceId, claims, concurrency);
             const threadIds = [...new Set(claims.map((c) => c.threadId))];
             const contexts = [];
             for (const threadId of threadIds)
@@ -166,6 +175,7 @@ export class Delivery extends EventEmitter {
         });
     }
     onUserMessage(event) {
+        this.parallel.onUserMessage(event);
         return this.enqueueLifecycle(() => this.handleUserMessage(event));
     }
     async handleUserMessage(event) {
@@ -213,6 +223,7 @@ export class Delivery extends EventEmitter {
         return this.enqueueLifecycle(() => this.handleIdle());
     }
     async handleIdle() {
+        await this.parallel.onIdle();
         this.setBusy(false);
         for (const seen of this.seenSessionMessageIds.values())
             seen.finished = true;

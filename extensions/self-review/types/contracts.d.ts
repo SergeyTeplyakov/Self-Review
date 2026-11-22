@@ -19,6 +19,7 @@ export interface RepoSettings {
     repoName: string;
     autoSaveLearnedRules: boolean;
     delivery: DeliveryMode;
+    commentConcurrency?: number;
     configured: boolean;
     dismissed: boolean;
 }
@@ -26,6 +27,7 @@ export interface RepoSettings {
 export interface SettingsPatch {
     autoSaveLearnedRules?: boolean;
     delivery?: DeliveryMode;
+    commentConcurrency?: number;
     dismissed?: boolean;
 }
 
@@ -34,6 +36,7 @@ export interface StoredRepoSettings {
     autoSaveLearnedRules?: unknown;
     learning?: unknown;
     delivery?: unknown;
+    commentConcurrency?: unknown;
     promptDismissed?: unknown;
     name?: string;
     updatedAt?: string;
