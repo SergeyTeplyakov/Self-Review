@@ -259,8 +259,9 @@ separate live check for real-agent answers and edits.
 copies static browser assets and bundled skill snapshots into
 `extensions/self-review/dist/`.
 `npm test` performs that build first, then exercises the emitted modules and an
-installation-shaped copy. Commit generated `dist/` changes together with source
-changes; CI checks that the distribution is up to date.
+installation-shaped copy. A test (including its hooks) that runs longer than two
+minutes fails instead of stalling the run. Commit generated `dist/` changes
+together with source changes; CI checks that the distribution is up to date.
 
 The SDK package is a **development-only** source of its public canvas types, pinned
 for reproducible checking; the installed Copilot runtime still supplies the SDK at
