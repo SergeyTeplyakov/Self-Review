@@ -225,9 +225,9 @@ export class SettingsService {
     }
     async updateInstructionMappings(repoRoot, update) {
         const identity = await repoIdentity(repoRoot, this.git);
-        await this.store.updateSettings((settings) => {
+        await this.store.updateSettings(async (settings) => {
             const entry = { ...settings.repos[identity.key] };
-            const mappings = update(storedInstructionMappings(entry));
+            const mappings = await update(storedInstructionMappings(entry));
             entry.instructionMappings = settingsPatch({ instructionMappings: mappings }).instructionMappings;
             settings.repos[identity.key] = { ...entry, name: identity.name, updatedAt: new Date().toISOString() };
         });

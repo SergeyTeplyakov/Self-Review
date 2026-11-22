@@ -2298,6 +2298,77 @@ test("a failed repository save refreshes the destination before allowing another
     assert.equal(saves[1].scope, "repo");
 });
 
+test("a save conflict discards a destination edit made against mappings that changed since", async () => {
+    const oldMapping = { pathPrefix: "src/Area", instructionRoot: "old/Area", splitLanguageSpecific: true };
+    const newMapping = { pathPrefix: "src/Area", instructionRoot: "new/Area", splitLanguageSpecific: true };
+    const saves: Record<string, unknown>[] = [];
+    const review = reviewFixture({
+        lessons: [{
+            lessonId: "lesson/stale", threadId: "t1", scope: "repo", rule: "Use typed guards.",
+            status: "proposed", reviewedPath: "src/Area/Rules.cs",
+            destination: { kind: "language", language: "csharp", applyTo: "**/*.cs" }, createdAt: "2026-01-01T00:00:00Z",
+        }],
+    });
+    const app = await loadApp({ fetch: async (url, init) => {
+        if (url.endsWith("/destination")) return jsonResponse({ savedTo: "edited/Area/.github/instructions/csharp.instructions.md", needsConfirmation: false });
+        if (url.endsWith("/save")) {
+            saves.push(requestBody(init));
+            return jsonResponse({ error: { message: "Repository instruction mappings changed after this guideline was shown." } }, 409);
+        }
+        if (url === "/api/state") return jsonResponse({ review, settings: settingsFixture({ instructionMappings: [newMapping] }) });
+        if (url === "/api/snapshot/r1") return jsonResponse({ revisionId: "r1", files: [] });
+        throw new Error(`Unexpected request: ${url}`);
+    } });
+    app.state.settings = settingsFixture({ instructionMappings: [oldMapping] });
+    app.state.review = review;
+    app.run("renderRuler = () => {}");
+    const fields = new Map<string, MockElement>();
+    for (const [name, value, checked] of [
+        ["pathPrefix", "src/Area", false], ["instructionRoot", "edited/Area", false],
+        ["splitLanguageSpecific", "", true], ["destinationKind", "language", false],
+        ["language", "csharp", false], ["applyTo", "**/*.cs", false],
+    ] as const) {
+        const field = new MockElement(name === "destinationKind" ? "SELECT" : "INPUT");
+        Object.assign(field, { name, value, checked });
+        fields.set(name, field);
+    }
+    const details = Object.assign(new MockElement("DETAILS"), { open: true });
+    const preview = new MockElement();
+    const proposal = {
+        mapping: { pathPrefix: "src/Area", instructionRoot: "edited/Area", splitLanguageSpecific: true },
+        destination: { kind: "language", language: "csharp", applyTo: "**/*.cs" },
+    };
+    const signature = JSON.stringify(["Use typed guards.", "repo", "src/Area/Rules.cs"]);
+    const form = Object.assign(new MockElement(), {
+        dataset: {
+            lessonForm: "lesson/stale", lessonMessage: "m", lessonSignature: signature, destinationEdited: "true" as string | undefined,
+            expectedMappings: JSON.stringify([oldMapping]), rule: "Use typed guards.", scope: "repo",
+            destinationPreviewState: "ready", destinationPreviewKey: JSON.stringify(proposal),
+        },
+        querySelector: (selector: string) => selector === "details.lesson-destination"
+            ? details
+            : selector === "[data-destination-preview]" ? preview
+            : fields.get(selector.match(/name="([^"]+)"/)?.[1] ?? "") ?? null,
+    });
+    app.run<(main: MockElement) => void>("captureDestinationFormDrafts")(Object.assign(new MockElement(), { querySelectorAll: () => [form] }));
+    app.document.querySelectorAll = (selector: string) => selector === "#main [data-lesson-form]" ? [form] : [];
+    const button = Object.assign(new MockElement("BUTTON"), { dataset: { action: "save-lesson", lesson: "lesson/stale" } });
+    button.closest = (selector: string) => selector === "[data-lesson-form]" ? form : button;
+
+    await app.run("onClick")({ target: button });
+
+    assert.equal(saves.length, 1);
+    assert.deepEqual(saves[0].expectedInstructionMappings, [oldMapping], "the save carries the mappings the card was edited against");
+    assert.deepEqual(saves[0].mapping, proposal.mapping);
+    assert.equal(form.dataset.destinationEdited, undefined);
+    const html = app.run(`messageHtml(${JSON.stringify({
+        messageId: "m", author: "agent", body: "Learned rule", createdAt: "2026-01-02T00:00:00Z", lessonIds: ["lesson/stale"],
+    })})`);
+    assert.match(html, /name="instructionRoot" value="new\/Area"/, "the card shows the current stored mapping");
+    assert.doesNotMatch(html, /data-destination-edited="true"/);
+    assert.ok(html.includes(`data-expected-mappings="${JSON.stringify([newMapping]).replace(/"/g, "&quot;")}"`), "the next save is checked against the current mappings");
+});
+
 test("the Configure dialog opens on the saved mode, keeps the page inert behind it, traps Tab, and closes on Escape", async () => {
     const app = await loadApp();
     let prevented = 0;

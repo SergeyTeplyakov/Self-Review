@@ -2182,8 +2182,30 @@ function captureDestinationFormDrafts(main) {
             language: language.value,
             applyTo: applyTo.value,
             detailsOpen: details.open,
+            expectedMappings: form.dataset.expectedMappings ?? currentMappingsSnapshot(),
         });
     }
+}
+function currentMappingsSnapshot() {
+    return JSON.stringify(state.settings?.instructionMappings ?? []);
+}
+// An edited card keeps the mappings it was edited against; if they changed since, show the stored destination again.
+async function discardStaleDestinationDraft(form) {
+    const lessonId = form.dataset.lessonForm;
+    const messageId = form.dataset.lessonMessage;
+    if (!lessonId || !messageId || form.dataset.destinationEdited !== "true")
+        return;
+    await loadState();
+    const key = destinationFormDraftKey(lessonId, messageId);
+    const draft = destinationFormDrafts.get(key);
+    if (draft && draft.expectedMappings === currentMappingsSnapshot())
+        return;
+    destinationFormDrafts.delete(key);
+    for (const current of Array.from(document.querySelectorAll("#main [data-lesson-form]"))) {
+        if (current.dataset.lessonForm === lessonId && current.dataset.lessonMessage === messageId)
+            delete current.dataset.destinationEdited;
+    }
+    render();
 }
 function destinationFormProposal(form) {
     const input = (name) => form.querySelector(`[name="${name}"]`);
@@ -2288,7 +2310,8 @@ function saveLessonButton(l, messageId) {
         const draftKey = destinationFormDraftKey(l.lessonId, messageId);
         const draft = destinationFormDrafts.get(draftKey);
         const edited = draft?.signature === signature && draft.edited;
-        return ` <span data-lesson-form="${esc(l.lessonId)}" data-lesson-message="${esc(messageId)}" data-lesson-signature="${esc(signature)}"${edited ? ' data-destination-edited="true"' : ""} data-rule="${esc(l.rule)}" data-scope="${esc(l.scope)}">`
+        const expectedMappings = edited ? draft.expectedMappings : currentMappingsSnapshot();
+        return ` <span data-lesson-form="${esc(l.lessonId)}" data-lesson-message="${esc(messageId)}" data-lesson-signature="${esc(signature)}"${edited ? ' data-destination-edited="true"' : ""} data-expected-mappings="${esc(expectedMappings)}" data-rule="${esc(l.rule)}" data-scope="${esc(l.scope)}">`
             + `${lessonDestinationForm(l, messageId)}${l.saveError ? ` <span role="status">${esc(l.saveError)}</span>` : ""}</span>`;
     }
     return ` <button data-action="save-lesson" data-lesson="${esc(l.lessonId)}" data-proposal="${esc(JSON.stringify({ rule: l.rule, scope: l.scope }))}">Save guideline</button>`
@@ -3055,6 +3078,7 @@ async function onClick(e) {
                         proposal = {
                             ...renderedProposal, ...destinationFormProposal(form),
                             expectedSavedTo: resolved.savedTo,
+                            ...(form.dataset.expectedMappings ? { expectedInstructionMappings: JSON.parse(form.dataset.expectedMappings) } : {}),
                         };
                     }
                     else {
@@ -3081,6 +3105,7 @@ async function onClick(e) {
                 if (candidate?.dataset?.lessonForm) {
                     destinationPreviewRequests.delete(candidate);
                     await updateDestinationPreview(candidate);
+                    await discardStaleDestinationDraft(candidate).catch(() => undefined);
                 }
             }
             toast(errorMessage(err), true);

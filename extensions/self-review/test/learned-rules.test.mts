@@ -148,6 +148,56 @@ test("split-off routing matches comma-separated applyTo patterns with trailing Y
     assert.match(await readFile(file, "utf8"), /- Prefer typed props\./);
 });
 
+test("an existing scoped file is chosen only when its applyTo covers the rule's full applyTo", async (t) => {
+    const repo = await fixture(t);
+    const instructions = path.join(repo, ".github", "instructions");
+    const broad = { kind: "language", language: "typescript", applyTo: "**/*.ts,**/*.tsx" } as const;
+    await mkdir(instructions, { recursive: true });
+
+    const off: InstructionMapping = { pathPrefix: "", instructionRoot: "", splitLanguageSpecific: false };
+    const topical = path.join(instructions, "typescript-guidance.instructions.md");
+    await writeFile(topical, `---\napplyTo: "**/*.ts"\n---\n`);
+    assert.deepEqual(
+        await previewRepositoryRuleDestination(repo, off, "src/View.ts", broad),
+        { savedTo: ".github/copilot-instructions.md", needsConfirmation: false },
+        "a file that covers only part of the rule's applyTo would silently narrow it",
+    );
+    assert.deepEqual(
+        await previewRepositoryRuleDestination(repo, off, "src/View.ts", { kind: "language", language: "typescript", applyTo: "src/**/*.ts" }),
+        { savedTo: ".github/instructions/typescript-guidance.instructions.md", needsConfirmation: false },
+        "a broader file pattern covers a narrower requested one",
+    );
+    await rm(topical);
+
+    const on: InstructionMapping = { ...off, splitLanguageSpecific: true };
+    const canonical = path.join(instructions, "typescript.instructions.md");
+    await writeFile(canonical, `---\napplyTo: "**/*.ts"\n---\n`);
+    assert.deepEqual(
+        await saveRepositoryRule(repo, on, "src/View.ts", broad, "Prefer typed props.", false, noLock),
+        { savedTo: ".github/instructions/typescript-ts.instructions.md", needsConfirmation: true },
+    );
+    assert.equal(await readFile(canonical, "utf8"), `---\napplyTo: "**/*.ts"\n---\n`);
+});
+
+test("split-off save rejects a selected scoped file narrowed below the rule's applyTo while waiting for the lock", async (t) => {
+    const repo = await fixture(t);
+    const mapping: InstructionMapping = { pathPrefix: "", instructionRoot: "", splitLanguageSpecific: false };
+    const destination = { kind: "language", language: "typescript", applyTo: "**/*.ts,**/*.tsx" } as const;
+    const file = path.join(repo, ".github", "instructions", "typescript-guidance.instructions.md");
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, `---\napplyTo: "**/*.ts,**/*.tsx"\n---\n`);
+    const competingWriter = async <T,>(_key: string, action: () => Promise<T>): Promise<T> => {
+        await writeFile(file, `---\napplyTo: "**/*.ts"\n---\n`);
+        return action();
+    };
+
+    await assert.rejects(
+        saveRepositoryRule(repo, mapping, "src/View.ts", destination, "Prefer typed props.", false, competingWriter),
+        /does not apply to src\/View\.ts with applyTo "\*\*\/\*\.ts,\*\*\/\*\.tsx"/,
+    );
+    assert.equal(await readFile(file, "utf8"), `---\napplyTo: "**/*.ts"\n---\n`);
+});
+
 test("split-off save rejects a selected scoped file whose applyTo changed while waiting for the lock", async (t) => {
     const repo = await fixture(t);
     const mapping: InstructionMapping = { pathPrefix: "", instructionRoot: "", splitLanguageSpecific: false };

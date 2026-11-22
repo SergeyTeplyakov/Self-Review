@@ -419,7 +419,7 @@ function mappingsWithConfirmedChoice(
     mappings: InstructionMapping[],
     value: unknown,
     reviewedPath: string,
-): { mappings: InstructionMapping[]; mapping: InstructionMapping; changed: boolean } {
+): { mappings: InstructionMapping[]; mapping: InstructionMapping } {
     let next = mappings;
     let confirmed: InstructionMapping | undefined;
     if (value !== undefined) {
@@ -438,7 +438,12 @@ function mappingsWithConfirmedChoice(
             throw invalid("The confirmed instruction mapping is shadowed by a more-specific mapping for this file.");
         }
     }
-    return { mappings: next, mapping, changed: confirmed !== undefined };
+    return { mappings: next, mapping };
+}
+
+function sameMapping(a: InstructionMapping | undefined, b: InstructionMapping | undefined): boolean {
+    return a?.pathPrefix === b?.pathPrefix && a?.instructionRoot === b?.instructionRoot
+        && a?.splitLanguageSpecific === b?.splitLanguageSpecific;
 }
 
 async function saveRule(
@@ -448,25 +453,23 @@ async function saveRule(
     settings: SettingsService | undefined,
     confirmedNewFile = false,
     expectedSavedTo?: string,
+    confirmedMapping?: InstructionMapping,
 ): Promise<boolean> {
     const personal = lesson.scope === "personal";
     if ((!personal && lesson.scope !== "repo") || !lesson.rule.trim() || RULE_CONTROL_CHARACTERS.test(lesson.rule)) {
         throw invalid("The guideline needs a valid scope and single-line rule.");
     }
     if (!personal) {
-        if (!settings || lesson.reviewedPath === undefined) {
+        const reviewedPath = lesson.reviewedPath;
+        const mapping = reviewedPath === undefined ? undefined : confirmedMapping
+            ?? (settings ? selectInstructionMapping((await settings.get(repoRoot)).instructionMappings, reviewedPath) : undefined);
+        if (reviewedPath === undefined || !mapping) {
             lesson.saveError = "Choose an instruction destination before saving this repository guideline.";
             return false;
         }
-        const repositorySettings = await settings.get(repoRoot);
-        const mapping = selectInstructionMapping(repositorySettings.instructionMappings, lesson.reviewedPath);
-        if (!mapping) {
-            lesson.saveError = "Choose an instruction destination before saving this repository guideline.";
-            return false;
-        }
-        const destination = lesson.destination ?? inferRuleDestination(lesson.reviewedPath);
+        const destination = lesson.destination ?? inferRuleDestination(reviewedPath);
         const result = await saveRepositoryRule(
-            repoRoot, mapping, lesson.reviewedPath, destination, lesson.rule, confirmedNewFile,
+            repoRoot, mapping, reviewedPath, destination, lesson.rule, confirmedNewFile,
             (key, action) => store.lock(key, action),
             expectedSavedTo,
         );
@@ -1159,8 +1162,8 @@ export class ReviewService extends EventEmitter {
         return result;
     }
 
-    async saveLesson(reviewId: string, lessonId: string, { rule, scope, mapping, destination, expectedSavedTo }: {
-        rule?: unknown; scope?: unknown; mapping?: unknown; destination?: unknown; expectedSavedTo?: unknown;
+    async saveLesson(reviewId: string, lessonId: string, { rule, scope, mapping, destination, expectedSavedTo, expectedInstructionMappings }: {
+        rule?: unknown; scope?: unknown; mapping?: unknown; destination?: unknown; expectedSavedTo?: unknown; expectedInstructionMappings?: unknown;
     }) {
         if (typeof rule !== "string" || (scope !== "repo" && scope !== "personal")) throw invalid("Provide the displayed rule and scope.");
         const { lesson, saved } = await this.store.updateReview(reviewId, async (review) => {
@@ -1177,6 +1180,12 @@ export class ReviewService extends EventEmitter {
             if (expectedSavedTo !== undefined && typeof expectedSavedTo !== "string") {
                 throw invalid("expectedSavedTo must be a string.");
             }
+            if (expectedInstructionMappings !== undefined && mapping === undefined) {
+                throw invalid("expectedInstructionMappings requires mapping.");
+            }
+            const expectedMappings = expectedInstructionMappings === undefined
+                ? undefined
+                : settingsPatch({ instructionMappings: expectedInstructionMappings }).instructionMappings!;
             if (proposal.scope === "repo") {
                 const reviewedPath = reviewedPathForLesson(review, proposal);
                 if (reviewedPath === undefined) {
@@ -1187,19 +1196,26 @@ export class ReviewService extends EventEmitter {
             } else if (destination !== undefined) {
                 proposal.destination = destinationFromInput(destination, proposal.destination ?? { kind: "general" });
             }
-            if (mapping !== undefined) {
-                if (!this.settings) throw new ReviewError("unsupported", "Instruction mapping settings are unavailable.");
-                const current = await this.settings.get(review.repoRoot);
-                const selection = mappingsWithConfirmedChoice(current.instructionMappings, mapping, proposal.reviewedPath ?? "");
-                if (proposal.scope === "repo") {
-                    await previewRepositoryRuleDestination(review.repoRoot, selection.mapping, proposal.reviewedPath ?? "", proposal.destination ?? { kind: "general" });
-                }
-                if (selection.changed) {
-                    await this.settings.updateInstructionMappings(review.repoRoot, (mappings) =>
-                        mappingsWithConfirmedChoice(mappings, mapping, proposal.reviewedPath ?? "").mappings);
-                }
+            if (mapping === undefined) {
+                const didSave = await saveRule(this.store, review.repoRoot, proposal, this.settings, true, expectedSavedTo);
+                return { review, value: { lesson: proposal, saved: didSave }, journalLessons: [proposal] };
             }
-            const didSave = await saveRule(this.store, review.repoRoot, proposal, this.settings, true, expectedSavedTo);
+            if (!this.settings) throw new ReviewError("unsupported", "Instruction mapping settings are unavailable.");
+            let didSave = false;
+            // The confirmed mapping is committed only together with a successful save, and only over the mapping the card showed.
+            await this.settings.updateInstructionMappings(review.repoRoot, async (stored) => {
+                const selection = mappingsWithConfirmedChoice(stored, mapping, proposal.reviewedPath ?? "");
+                if (expectedMappings) {
+                    const prefix = selection.mapping.pathPrefix;
+                    const current = stored.find((item) => item.pathPrefix === prefix);
+                    if (!sameMapping(current, expectedMappings.find((item) => item.pathPrefix === prefix))
+                        && !sameMapping(current, selection.mapping)) {
+                        throw new ReviewError("conflict", "Repository instruction mappings changed after this guideline was shown. Review the current destination and save again.");
+                    }
+                }
+                didSave = await saveRule(this.store, review.repoRoot, proposal, this.settings, true, expectedSavedTo, selection.mapping);
+                return didSave ? selection.mappings : stored;
+            });
             return { review, value: { lesson: proposal, saved: didSave }, journalLessons: [proposal] };
         });
         if (saved) this.changed(reviewId, "message");

@@ -49,6 +49,32 @@ function appliesTo(pattern: string | string[], filePath: string): boolean {
     return patterns.some((item) => globRegex(item.replace(/\\/g, "/")).test(file));
 }
 
+// Conservative glob subsumption: true only when every path the requested pattern matches is also matched by the file pattern.
+function patternCovers(filePattern: string, requested: string): boolean {
+    const file = filePattern.replace(/\\/g, "/");
+    const wanted = requested.replace(/\\/g, "/");
+    if (file === wanted || file === "**" || file === "**/*") return true;
+    if (!file.startsWith("**/")) return false;
+    const tail = file.slice(3);
+    if (wanted === tail) return true;
+    if (!wanted.endsWith(`/${tail}`)) return false;
+    // "x**/" compiles to an optional directory prefix that need not end at a separator, so only "**" or ".../**" heads are safe.
+    const head = wanted.slice(0, -tail.length - 1);
+    return !head.endsWith("**") || head === "**" || head.endsWith("/**");
+}
+
+function coversApplyTo(filePatterns: string[], applyTo: string): boolean {
+    return applyToPatterns(applyTo).every((wanted) => filePatterns.some((pattern) => patternCovers(pattern, wanted)));
+}
+
+function scopedFileApplies(patterns: string[] | null, reviewedPath: string, applyTo: string): boolean {
+    return Boolean(patterns) && (!reviewedPath || appliesTo(patterns!, reviewedPath)) && coversApplyTo(patterns!, applyTo);
+}
+
+function scopedFileMismatch(savedTo: string, reviewedPath: string, applyTo: string): ReviewError {
+    return new ReviewError("conflict", `The existing ${savedTo} does not apply to ${reviewedPath || "the reviewed file"} with applyTo "${applyTo}".`);
+}
+
 function applyToFrom(contents: string): string[] | null {
     const frontMatter = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(contents)?.[1];
     const entry = frontMatter?.split(/\r?\n/).find((line) => /^\s*applyTo\s*:\s*/.test(line));
@@ -119,7 +145,7 @@ async function readInstructionFile(file: string): Promise<string | null> {
     }
 }
 
-async function matchingScopedFile(directory: string, filePath: string): Promise<{ file: string; contents: string } | null> {
+async function matchingScopedFile(directory: string, filePath: string, applyTo: string): Promise<{ file: string; contents: string } | null> {
     let entries;
     try {
         entries = await readdir(directory, { withFileTypes: true });
@@ -131,7 +157,7 @@ async function matchingScopedFile(directory: string, filePath: string): Promise<
         const file = path.join(directory, entry.name);
         const contents = await readInstructionFile(file);
         const pattern = contents === null ? null : applyToFrom(contents);
-        if (contents !== null && pattern && appliesTo(pattern, filePath)) return { file, contents };
+        if (contents !== null && pattern && appliesTo(pattern, filePath) && coversApplyTo(pattern, applyTo)) return { file, contents };
     }
     return null;
 }
@@ -171,7 +197,7 @@ async function resolveRepositoryRuleDestination(
         ? await ensureSafeDirectory(repoRoot, scopedDirectoryRelative, createDirectories)
         : null;
     const scoped = destination.kind === "language" && !mapping.splitLanguageSpecific && scopedDirectory
-        ? await matchingScopedFile(scopedDirectory, reviewedPath)
+        ? await matchingScopedFile(scopedDirectory, reviewedPath, destination.applyTo!)
         : null;
     let createScopedFile = false;
 
@@ -181,22 +207,16 @@ async function resolveRepositoryRuleDestination(
         let contents = scopedDirectory ? await readInstructionFile(file) : null;
         if (contents === null) {
             createScopedFile = true;
-        } else {
-            const pattern = applyToFrom(contents);
-            if (!pattern || (reviewedPath && !appliesTo(pattern, reviewedPath))) {
-                const extension = path.posix.extname(reviewedPath.replace(/\\/g, "/")).slice(1).toLowerCase();
-                const suffix = /^[a-z0-9][a-z0-9-]{0,39}$/.test(extension) ? extension : "scoped";
-                relativeFile = `${scopedDirectoryRelative}/${destination.language}-${suffix}.instructions.md`;
-                file = path.join(repoRoot, ...safeRelativePath(relativeFile));
-                contents = scopedDirectory ? await readInstructionFile(file) : null;
-                if (contents === null) {
-                    createScopedFile = true;
-                } else {
-                    const variantPattern = applyToFrom(contents);
-                    if (!variantPattern || (reviewedPath && !appliesTo(variantPattern, reviewedPath))) {
-                        throw new ReviewError("conflict", `The existing ${relativeFile} does not apply to ${reviewedPath}.`);
-                    }
-                }
+        } else if (!scopedFileApplies(applyToFrom(contents), reviewedPath, destination.applyTo!)) {
+            const extension = path.posix.extname(reviewedPath.replace(/\\/g, "/")).slice(1).toLowerCase();
+            const suffix = /^[a-z0-9][a-z0-9-]{0,39}$/.test(extension) ? extension : "scoped";
+            relativeFile = `${scopedDirectoryRelative}/${destination.language}-${suffix}.instructions.md`;
+            file = path.join(repoRoot, ...safeRelativePath(relativeFile));
+            contents = scopedDirectory ? await readInstructionFile(file) : null;
+            if (contents === null) {
+                createScopedFile = true;
+            } else if (!scopedFileApplies(applyToFrom(contents), reviewedPath, destination.applyTo!)) {
+                throw scopedFileMismatch(relativeFile, reviewedPath, destination.applyTo!);
             }
         }
         return { file, savedTo: relativeFile, createScopedFile, validateScopedFile: true };
@@ -249,11 +269,8 @@ export async function saveRepositoryRule(
             if (current === null && !resolved.createScopedFile) {
                 throw new ReviewError("conflict", `The instruction destination changed to ${resolved.savedTo}. Review and confirm the updated destination.`);
             }
-            if (current !== null) {
-                const pattern = applyToFrom(current);
-                if (!pattern || (reviewedPath && !appliesTo(pattern, reviewedPath))) {
-                    throw new ReviewError("conflict", `The existing ${resolved.savedTo} does not apply to ${reviewedPath}.`);
-                }
+            if (current !== null && !scopedFileApplies(applyToFrom(current), reviewedPath, destination.applyTo!)) {
+                throw scopedFileMismatch(resolved.savedTo, reviewedPath, destination.applyTo!);
             }
         }
         const text = current ?? "";

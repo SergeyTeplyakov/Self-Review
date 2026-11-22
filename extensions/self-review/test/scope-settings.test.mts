@@ -492,6 +492,59 @@ test("saving rejects a confirmed mapping shadowed by a more-specific entry", asy
     await assert.rejects(access(path.join(repo, ".github", "copilot-instructions.md")), { code: "ENOENT" });
 });
 
+test("saving rejects a confirmed mapping when the stored mapping changed after the card was shown", async () => {
+    const { store, service } = fresh();
+    const settings = new SettingsService({ store });
+    const { reviewId, thread, message } = await commentThread(service);
+    const shown = { pathPrefix: "", instructionRoot: "", splitLanguageSpecific: true };
+    const concurrent = { pathPrefix: "", instructionRoot: "docs", splitLanguageSpecific: false };
+    const confirmed = { pathPrefix: "", instructionRoot: "", splitLanguageSpecific: false };
+    await settings.update(repo, { instructionMappings: [shown] });
+    await agentReply(service, reviewId, thread, {
+        inReplyTo: message.messageId,
+        lessons: [{ rule: "Keep error paths explicit.", status: "proposed" }],
+    });
+    const lesson = await service.getReview(reviewId).then((review) => required(review.lessons[0]));
+    await settings.update(repo, { instructionMappings: [concurrent] });
+
+    await assert.rejects(
+        service.saveLesson(reviewId, lesson.lessonId, {
+            rule: lesson.rule, scope: "repo", mapping: confirmed,
+            destination: { kind: "general" },
+            expectedInstructionMappings: [shown],
+        }),
+        (error) => errorHasCode(error, "conflict") && /mappings changed after this guideline was shown/.test((error as Error).message),
+    );
+    assert.deepEqual((await settings.get(repo)).instructionMappings, [concurrent]);
+    assert.equal(required((await service.getReview(reviewId)).lessons[0]).status, "proposed");
+    await assert.rejects(access(path.join(repo, ".github", "copilot-instructions.md")), { code: "ENOENT" });
+    await assert.rejects(access(path.join(repo, "docs", ".github", "copilot-instructions.md")), { code: "ENOENT" });
+});
+
+test("a rejected confirmed save does not remember its mapping", async () => {
+    const { store, service } = fresh();
+    const settings = new SettingsService({ store });
+    const { reviewId, thread, message } = await commentThread(service);
+    await agentReply(service, reviewId, thread, {
+        inReplyTo: message.messageId,
+        lessons: [{ rule: "Keep error paths explicit.", status: "proposed" }],
+    });
+    const lesson = await service.getReview(reviewId).then((review) => required(review.lessons[0]));
+
+    await assert.rejects(
+        service.saveLesson(reviewId, lesson.lessonId, {
+            rule: lesson.rule, scope: "repo",
+            mapping: { pathPrefix: "", instructionRoot: "", splitLanguageSpecific: true },
+            destination: { kind: "general" },
+            expectedSavedTo: ".github/instructions/csharp.instructions.md",
+            expectedInstructionMappings: [],
+        }),
+        /destination changed/,
+    );
+    assert.deepEqual((await settings.get(repo)).instructionMappings, [], "the mapping is persisted only with a successful save");
+    await assert.rejects(access(path.join(repo, ".github", "copilot-instructions.md")), { code: "ENOENT" });
+});
+
 test("legacy lessons without a status still read as saved", async () => {
     const { store, service } = fresh();
     const { reviewId, thread, message } = await commentThread(service);
