@@ -148,6 +148,31 @@ test("split-off routing matches comma-separated applyTo patterns with trailing Y
     assert.match(await readFile(file, "utf8"), /- Prefer typed props\./);
 });
 
+test("brace groups in applyTo expand to alternatives instead of splitting at their commas", async (t) => {
+    const repo = await fixture(t);
+    const mapping: InstructionMapping = { pathPrefix: "", instructionRoot: "", splitLanguageSpecific: false };
+    const instructions = path.join(repo, ".github", "instructions");
+    const file = path.join(instructions, "typescript-guidance.instructions.md");
+    await mkdir(instructions, { recursive: true });
+    await writeFile(file, `---\napplyTo: "**/*.{ts,tsx},docs/**/*.md"\n---\n`);
+    const braced = { kind: "language", language: "typescript", applyTo: "**/*.{ts,tsx}" } as const;
+
+    assert.deepEqual(
+        await previewRepositoryRuleDestination(repo, mapping, "src/View.tsx", { kind: "language", language: "typescript", applyTo: "**/*.tsx" }),
+        { savedTo: ".github/instructions/typescript-guidance.instructions.md", needsConfirmation: false },
+    );
+    const saved = await saveRepositoryRule(repo, mapping, "src/View.ts", braced, "Prefer typed props.", false, noLock);
+    assert.equal(saved.savedTo, ".github/instructions/typescript-guidance.instructions.md");
+    assert.match(await readFile(file, "utf8"), /- Prefer typed props\./);
+
+    await writeFile(file, `---\napplyTo: "**/*.ts"\n---\n`);
+    assert.deepEqual(
+        await previewRepositoryRuleDestination(repo, mapping, "src/View.ts", braced),
+        { savedTo: ".github/copilot-instructions.md", needsConfirmation: false },
+        "a file covering only one brace alternative would narrow the rule",
+    );
+});
+
 test("an existing scoped file is chosen only when its applyTo covers the rule's full applyTo", async (t) => {
     const repo = await fixture(t);
     const instructions = path.join(repo, ".github", "instructions");

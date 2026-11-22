@@ -39,8 +39,39 @@ function globRegex(glob: string): RegExp {
     return new RegExp(`^${escaped}$`);
 }
 
+const MAX_BRACE_EXPANSIONS = 64;
+
+// Expands non-nested {a,b} groups into brace-free alternatives; an expansion that grows too large stays literal and matches nothing.
+function expandBraces(pattern: string): string[] {
+    const open = pattern.indexOf("{");
+    const close = open < 0 ? -1 : pattern.indexOf("}", open + 1);
+    if (close < 0) return [pattern];
+    const choices = pattern.slice(open + 1, close).split(",");
+    const rests = expandBraces(pattern.slice(close + 1));
+    if (choices.length * rests.length > MAX_BRACE_EXPANSIONS) return [pattern];
+    return choices.flatMap((choice) => rests.map((rest) => pattern.slice(0, open) + choice + rest));
+}
+
+// Mirrors VS Code's applyTo handling: commas inside {} or [] do not separate patterns.
 function applyToPatterns(value: string): string[] {
-    return value.split(",").map((pattern) => pattern.trim()).filter(Boolean);
+    const patterns: string[] = [];
+    let current = "";
+    let inBraces = false;
+    let inBrackets = false;
+    for (const char of value) {
+        if (char === "," && !inBraces && !inBrackets) {
+            patterns.push(current);
+            current = "";
+            continue;
+        }
+        if (char === "{") inBraces = true;
+        else if (char === "}") inBraces = false;
+        else if (char === "[") inBrackets = true;
+        else if (char === "]") inBrackets = false;
+        current += char;
+    }
+    patterns.push(current);
+    return patterns.map((pattern) => pattern.trim()).filter(Boolean).flatMap(expandBraces);
 }
 
 function appliesTo(pattern: string | string[], filePath: string): boolean {
