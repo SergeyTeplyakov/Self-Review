@@ -40,6 +40,7 @@ interface DialogState {
     error?: string;
     autoSaveLearnedRules?: boolean;
     delivery?: string;
+    commentConcurrency?: number;
     instructionMappings?: Array<{ pathPrefix: string; instructionRoot: string; splitLanguageSpecific: boolean }>;
     revisionId?: string;
     model?: string;
@@ -449,7 +450,7 @@ test("refresh progress SSE updates the status without requesting a duplicate ful
     assert.equal(requests, 0);
 });
 
-test("bottom settings controls update without replacing the stable refresh status", async () => {
+test("bottom status bar shows the build date with its build ID available on hover and focus", async () => {
     const app = await loadApp();
     app.state.review = reviewFixture();
     app.state.extensionVersion = { version: "0.3.0", buildId: "a1b2c3d4e5f6" };
@@ -458,12 +459,18 @@ test("bottom settings controls update without replacing the stable refresh statu
     const status = app.node("#review-status");
     const loadingHtml = status.innerHTML;
     assert.match(loadingHtml, /Refreshing review and Overview/);
-    assert.match(app.node("#review-status-controls").innerHTML, /v0\.3\.0 · build a1b2c3d4e5f6.*Delivery: Immediate.*Auto-save learned rules: Off/);
+    assert.match(app.node("#review-status-controls").innerHTML, /v0\.3\.0 · build a1b2c3d4e5f6/, "without a build date the build ID stays visible");
 
+    app.state.extensionVersion = { version: "0.3.0", buildId: "a1b2c3d4e5f6", builtAt: "2026-11-20T20:44:58.000Z" };
     app.state.settings = settingsFixture({ autoSaveLearnedRules: true, delivery: "batch" });
     app.run("renderLoadStatus()");
     assert.equal(status.innerHTML, loadingHtml, "updating footer controls preserves the in-progress status DOM");
-    assert.match(app.node("#review-status-controls").innerHTML, /v0\.3\.0 · build a1b2c3d4e5f6.*Delivery: Batch.*Auto-save learned rules: On/);
+    const footer = app.node("#review-status-controls").innerHTML;
+    const label = new Date("2026-11-20T20:44:58.000Z").toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+    assert.ok(footer.includes(`>v0.3.0 · ${label}</span>`), footer);
+    assert.doesNotMatch(footer, />v0\.3\.0 · build/, "the build ID moves out of the visible label");
+    assert.match(footer, /tabindex="0" title="Self-Review extension version 0\.3\.0, build a1b2c3d4e5f6, built 2026-11-20T20:44:58\.000Z" aria-label="[^"]*build a1b2c3d4e5f6/);
+    assert.doesNotMatch(footer, /Delivery:|Auto-save learned rules:/);
 
     app.run('refreshing = false; refreshError = "capture failed"; renderLoadStatus()');
     assert.match(status.innerHTML, /capture failed.*Retry/);
@@ -622,6 +629,21 @@ test("composer rerenders preserve leading newlines in both new comments and repl
     }
 });
 
+test("an empty reply box is one line until opened and stays vertically resizable in both states", async () => {
+    const app = await loadApp();
+    app.state.review = reviewFixture();
+    const html = app.run<string>('composerHtml("reply:t1", {})');
+    assert.match(html, /^<div class="composer" [^>]*><textarea[^>]*\brows="1"/);
+    const css = await readFile(new URL("../dist/web/styles.css", import.meta.url), "utf8");
+    const rule = (selector: string) => required(css.match(new RegExp(`${selector.replace(/[.()]/g, "\\$&")}\\s*\\{([^}]*)\\}`)))[1];
+    assert.match(rule(".composer:not(.open) textarea"), /height:\s*34px/);
+    assert.match(rule(".composer.open textarea"), /min-height:\s*80px/);
+    assert.match(rule(".composer textarea"), /resize:\s*vertical/);
+    for (const state of [".composer:not(.open) textarea", ".composer.open textarea"]) {
+        assert.doesNotMatch(rule(state), /resize|max-height/, `${state} must not disable or cap resizing`);
+    }
+});
+
 const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
 const skillsApp = async (
     catalog: unknown,
@@ -647,6 +669,31 @@ const skillsApp = async (
 };
 
 const NAMES = ["code-review-and-quality", "code-simplification", "ponytail-review"];
+
+test("status shows the parallel limit separately from queued, running and applying comments", async () => {
+    const app = await loadApp();
+    app.state.review = reviewFixture();
+    app.state.settings = { ...settingsFixture(), commentConcurrency: 4 };
+    app.state.review.threads = [{ status: "active", messages: [
+        { delivery: { state: "queued" } }, { delivery: { state: "processing", parallel: true } },
+        { delivery: { state: "processing", parallel: true } }, { delivery: { state: "draft" } },
+    ] }];
+    app.state.busy = true;
+    const status = () => { app.run("renderTop()"); return app.node("#top").innerHTML; };
+    assert.match(status(), /Parallelism: 4/);
+    assert.match(status(), /Copilot working · 1 queued · 2 running/);
+    app.state.review.threads[0].messages = [{ delivery: { state: "processing", parallelPhase: "applying" } }];
+    assert.match(status(), /0 queued · 0 running · 1 applying/);
+    app.state.review.threads[0].messages = [{ delivery: { state: "queued", parallel: true } }];
+    const waiting = status();
+    assert.match(waiting, /Copilot busy · 1 queued · 0 running/, "a busy conversation that has not started a comment is not working on it");
+    assert.doesNotMatch(waiting, /Copilot working/);
+    assert.match(waiting, /title="Copilot is finishing other work in this conversation\. Queued comments start when it picks them up\."/);
+    app.state.review.threads = [];
+    app.state.settings.commentConcurrency = 1;
+    assert.doesNotMatch(status(), /Parallelism/);
+    assert.match(status(), /Copilot busy<\/span>/);
+});
 const bundledCatalog = (selected = NAMES) => ({ bundled: true, selected, defaults: { selected, saved: selected !== NAMES }, skills: NAMES.map((name, i) => ({
     name, role: i === 2 ? "ponytail" : "review", title: name, summary: `Summary of ${name}`, modified: false, sha256: "0".repeat(64),
     upstream: { repository: i === 2 ? "https://github.com/DietrichGebert/ponytail" : "https://github.com/addyosmani/agent-skills", release: i === 2 ? "v5.3.3" : "0.6.15", releaseCommit: "1".repeat(40), path: `skills/${name}/SKILL.md`, fileCommit: "abcdef1234567890" },
@@ -892,7 +939,7 @@ test("the prominent review action and agent-comment counts include findings, not
     assert.doesNotMatch(html, /Agent comments|agent-comment-count|data-view="agent-comments"/);
     assert.doesNotMatch(html, /Delivery:|Auto-save learned rules:/);
     app.run("renderLoadStatus()");
-    assert.match(app.node("#review-status-controls").innerHTML, /Delivery: Immediate.*Auto-save learned rules: Off/);
+    assert.doesNotMatch(app.node("#review-status-controls").innerHTML, /Delivery:|Auto-save learned rules:/, "preferences live in Settings, not the status bar");
     const side = app.node("#side").innerHTML;
     assert.match(side, /data-view="overview".*<span class="count"[^>]*>2<\/span><span class="name">Agent reviews<\/span>/);
     assert.match(side, /Files \(\d+\)<\/div><div class="tree-scope"><span class="seg" role="group" aria-label="Review scope">.*data-scope="all".*data-scope="pending"/s);
@@ -1644,11 +1691,11 @@ test("the sidebar shows review scope near the file tree, and learning controls o
     assert.equal(required(toggle(side()).match(/ disabled/g)).length, 2, "both scope buttons are disabled while a switch is in flight");
     app.state.switching = false;
 
-    for (const [autoSaveLearnedRules, label] of [[false, "Off"], [true, "On"]]) {
+    for (const autoSaveLearnedRules of [false, true]) {
         app.state.settings = settingsFixture({ autoSaveLearnedRules, configured: true });
         assert.match(top(), new RegExp(`<details class="review-settings-menu"><summary[^>]*>Settings</summary>.*<button data-action="configure"[^>]*>Manual review settings`, "s"), String(autoSaveLearnedRules));
         assert.doesNotMatch(app.node("#top").innerHTML, /Delivery:|Auto-save learned rules:/);
-        assert.match(footer(), new RegExp(`Auto-save learned rules: ${label}`), String(autoSaveLearnedRules));
+        assert.doesNotMatch(footer(), /Auto-save learned rules/, String(autoSaveLearnedRules));
     }
     app.state.settings = null;
     html = top();
@@ -2146,6 +2193,31 @@ test("saving unrelated Configure settings omits an unchanged mapping snapshot", 
     assert.deepEqual(app.read("state.settings.instructionMappings"), [...original, concurrent]);
 });
 
+test("Configure saves instruction mappings and comment concurrency together", async () => {
+    const original = [{ pathPrefix: "src/Area", instructionRoot: "src/Area", splitLanguageSpecific: true }];
+    const edited = [{ ...original[0], instructionRoot: "" }];
+    const calls: CapturedPost[] = [];
+    const app = await loadApp({ fetch: async (url, init) => {
+        calls.push([init?.method ?? "GET", url, requestBody(init)]);
+        return jsonResponse(settingsFixture({ instructionMappings: edited, commentConcurrency: 4 }));
+    } });
+    app.state.settings = settingsFixture({ instructionMappings: original, commentConcurrency: 2 });
+    app.run("openConfigure()");
+    if (!app.state.dialog) throw new Error("Configure dialog did not open.");
+    assert.equal(app.state.dialog.commentConcurrency, 2);
+    app.state.dialog.instructionMappings = edited;
+    app.state.dialog.commentConcurrency = 4;
+
+    await app.run<Promise<void>>("saveConfigure()");
+
+    assert.deepEqual(calls, [["POST", "/api/settings", {
+        autoSaveLearnedRules: false, delivery: "immediate", commentConcurrency: 4,
+        instructionMappings: edited, expectedInstructionMappings: original,
+    }]]);
+    assert.deepEqual(app.read("state.settings.instructionMappings"), edited);
+    assert.equal(app.read("state.settings.commentConcurrency"), 4);
+});
+
 test("repository save submits the rendered rule even if the review reloads during preview", async () => {
     let resolvePreview!: (value: unknown) => void;
     const previewResponse = new Promise<unknown>((resolve) => { resolvePreview = resolve; });
@@ -2532,7 +2604,6 @@ test("the banner, Configure checkbox, and dismissal persist auto-save settings a
     assert.deepEqual(posts.at(-1), ["POST", "/api/settings", { autoSaveLearnedRules: false }]);
     assert.equal(app.state.settings.autoSaveLearnedRules, false);
     assert.equal(app.node("#banner").hidden, true, "choosing manual saving settles the question");
-    assert.match(app.node("#review-status-controls").innerHTML, /Auto-save learned rules: Off/);
     assert.equal(app.node("#toast").textContent, "Auto-save learned rules: Off");
 
     settings = settingsFixture();
@@ -2542,7 +2613,6 @@ test("the banner, Configure checkbox, and dismissal persist auto-save settings a
     assert.equal(app.node("#banner").hidden, true);
     assert.equal(app.state.settings.configured, false, "Not now leaves the auto-save setting at its default");
     assert.equal(app.state.settings.autoSaveLearnedRules, false);
-    assert.match(app.node("#review-status-controls").innerHTML, /Auto-save learned rules: Off/);
 
     await click("configure");
     assert.equal(dialog(app).autoSaveLearnedRules, false);
@@ -2559,7 +2629,6 @@ test("the banner, Configure checkbox, and dismissal persist auto-save settings a
     assert.equal(app.state.settings.autoSaveLearnedRules, true);
     assert.equal(app.state.settings.delivery, "batch");
     assert.equal(app.node("#dialog").innerHTML, "");
-    assert.match(app.node("#review-status-controls").innerHTML, /Delivery: Batch<\/span>.*Auto-save learned rules: On/);
     assert.equal(app.node("#toast").textContent, "Saved. Auto-save learned rules: On · Delivery: Batch");
     assert.equal(app.focused.at(-1), ".review-settings-menu > summary", "focus returns to the visible Settings summary after the menu collapses");
 
@@ -2808,8 +2877,9 @@ test("the top bar offers Submit review while drafts wait, and shows how comments
         html = top();
         assert.doesNotMatch(html, /Delivery:/);
         const footerHtml = footer();
-        assert.match(footerHtml, new RegExp(`Delivery: ${pill}</span>`), `${delivery}/${deliveryMode}`);
-        assert.equal(/data-action="delivery-reask"[^>]*>Change</.test(footerHtml), reask, `only a decided ask-mode review offers Change (${delivery}/${deliveryMode})`);
+        assert.doesNotMatch(footerHtml, /Delivery:/, `${delivery}/${deliveryMode}`);
+        assert.equal(/data-action="delivery-reask"[^>]*>Change delivery</.test(footerHtml), reask, `only a decided ask-mode review offers Change delivery (${delivery}/${deliveryMode})`);
+        if (reask) assert.match(footerHtml, new RegExp(`This review sends comments: ${pill}\\.`));
     }
     app.state.settings = null;
     app.state.review = reviewFixture({ threads: draftThreads() });

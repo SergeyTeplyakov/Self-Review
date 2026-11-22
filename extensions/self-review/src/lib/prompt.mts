@@ -226,7 +226,7 @@ const DESCRIPTION_EDIT = "   For description edits, read get_review then use upd
  * @param {{ header?: string, text?: string } | null} p.excerpt hunk context for the anchor
  * @param {string[] | null} p.selected selected code lines in the current revision
  */
-export function buildCommentPrompt({ review, thread, message, instanceId, excerpt, selected, autoSaveLearnedRules = false }: CommentPromptInput) {
+export function buildCommentPrompt({ review, thread, message, instanceId, excerpt, selected, autoSaveLearnedRules = false }: CommentPromptInput, mode: "direct" | "analysis" = "direct") {
     const loc: Partial<ReviewLocation> = thread.location ?? thread.anchor ?? {};
     const history = threadHistory(thread, new Set([message.messageId]));
     const isReply = history.length > 0;
@@ -253,9 +253,11 @@ export function buildCommentPrompt({ review, thread, message, instanceId, excerp
     else {
         lines.push("1. Decide whether this is a question, a change request, or both. Answer questions directly; do not change code for a pure question.");
         lines.push(...guidelineSteps(autoSaveLearnedRules, personalInstructions));
-        lines.push("3. For a change request, make the smallest complete change in the working tree, following repo instructions, and run the narrowest relevant check. Do not commit, push, or publish PR edits without explicit authorization.");
-        if (thread.kind === "overview") lines.push(DESCRIPTION_EDIT);
+        lines.push(mode === "analysis" ? "3. For an explicit edit request, propose the smallest change and how to verify it. Do not edit anything."
+            : "3. For a change request, make the smallest complete change in the working tree, following repo instructions, and run the narrowest relevant check. Do not commit, push, or publish PR edits without explicit authorization.");
+        if (thread.kind === "overview" && mode === "direct") lines.push(DESCRIPTION_EDIT);
     }
+    if (mode === "analysis") return { prompt: lines.join("\n"), displayPrompt: displayPrompt(thread, message, isReply) };
     lines.push("4. Reply in the thread (this is how the user sees your answer):");
     lines.push("   `invoke_canvas_action` with `instanceId: \"" + instanceId + "\"`, `actionName: \"reply\"`, input:");
     lines.push("   `{ reviewId: \"" + review.reviewId + "\", threadId: \"" + thread.threadId + "\", inReplyTo: \"" + message.messageId + "\", body, outcome: answered|changed|blocked|disagreed|needs-input, verification?" + LESSONS_SHAPE + " }`.");

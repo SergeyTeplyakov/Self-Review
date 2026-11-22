@@ -7,7 +7,8 @@
     "build": "npm run build:tools && node .build/extensions/self-review/scripts/build.mjs",
     "typecheck": "tsc -p tsconfig.node.json && tsc -p tsconfig.web.json && tsc -p tsconfig.tools.json --noEmit",
     "check-skill-updates": "npm run build:tools && node .build/extensions/self-review/scripts/check-bundled-skill-updates.mjs",
-    "test": "npm run build && node --test .build/extensions/self-review/test/*.test.mjs && node .build/extensions/self-review/scripts/test-build-watcher.mjs"
+    "eval:parallel-comments": "npm run build && node --test --test-timeout=60000 .build/extensions/self-review/test/parallel-comments*.test.mjs",
+    "test": "npm run build && node --test --test-timeout=120000 .build/extensions/self-review/test/*.test.mjs && node .build/extensions/self-review/scripts/test-build-watcher.mjs"
   },
   "devDependencies": {
     "@github/copilot-sdk": "1.0.30",

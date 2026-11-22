@@ -3,7 +3,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as gitDefault from "./git-process.mjs";
-import { agentReviewDefaults, settingsPatch, isDeliveryMode, isRecord, ReviewError } from "../web/contracts.mjs";
+import { agentReviewDefaults, settingsPatch, isCommentConcurrency, isDeliveryMode, isRecord, ReviewError } from "../web/contracts.mjs";
 export { DELIVERY_MODES } from "../web/contracts.mjs";
 function storedAutoSave(entry) {
     if (typeof entry?.autoSaveLearnedRules === "boolean")
@@ -193,6 +193,7 @@ export class SettingsService {
             delivery: isDeliveryMode(entry?.delivery) ? entry.delivery : DEFAULT_DELIVERY,
             instructionMappings,
             ...(instructionMappings.length ? { pathCaseSensitive: pathCaseSensitive() } : {}),
+            ...(isCommentConcurrency(entry?.commentConcurrency) ? { commentConcurrency: entry.commentConcurrency } : {}),
             configured: autoSave !== undefined,
             dismissed: entry?.promptDismissed === true,
         };
@@ -210,6 +211,10 @@ export class SettingsService {
             }
             if (patch.delivery !== undefined)
                 entry.delivery = patch.delivery;
+            if (patch.commentConcurrency === 1)
+                delete entry.commentConcurrency;
+            else if (patch.commentConcurrency !== undefined)
+                entry.commentConcurrency = patch.commentConcurrency;
             if (patch.dismissed !== undefined)
                 entry.promptDismissed = patch.dismissed;
             if (patch.instructionMappings !== undefined) {

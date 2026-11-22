@@ -1,49 +1,17 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
-import { register } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
 import type { Review } from "../src/lib/review-service.mjs";
-
-interface FakeCanvas {
-    open: (options: { instanceId: string; input: Record<string, never>; session: { workingDirectory: string } }) => Promise<unknown>;
-    onClose?: (options: { instanceId: string }) => Promise<unknown> | unknown;
-    actions?: Array<{ name: string; inputSchema: unknown }>;
-}
-
-interface FakeSdkState {
-    config: { canvases: FakeCanvas[] } | null;
-    logs: Array<{ message: string; level?: string }>;
-}
-
-declare global {
-    var __selfReviewFakeSdk: FakeSdkState;
-}
+import { host, registerTestHost } from "./provider-host.mjs";
 
 // The extension stores data under the user's home directory; point it at a temporary one before loading anything.
 const tmp = await realpath(await mkdtemp(path.join(os.tmpdir(), "mr-extension-open-")));
 process.env.HOME = tmp;
 process.env.USERPROFILE = tmp;
 
-// Replace the Copilot SDK with an in-process fake so the real extension entry point can be driven directly.
-const fake: FakeSdkState = { config: null, logs: [] };
-globalThis.__selfReviewFakeSdk = fake;
-const FAKE_SDK = `data:text/javascript,${encodeURIComponent(`
-const fake = globalThis.__selfReviewFakeSdk;
-export class CanvasError extends Error { constructor(code, message) { super(message); this.code = code; } }
-export const createCanvas = (declaration) => declaration;
-export async function joinSession(config) {
-    fake.config = config;
-    return { sessionId: "test-session", workspacePath: undefined, log: async (message, options) => { fake.logs.push({ message, level: options?.level }); }, send: async () => "message-1", on: () => () => {} };
-}`)}`;
-// module.register (Node 20.6+) keeps this working on the documented Node 22.12 minimum; the fake module itself runs on this thread.
-const LOADER = `export async function resolve(specifier, context, nextResolve) {
-    if (specifier === "@github/copilot-sdk/extension") return { url: ${JSON.stringify(FAKE_SDK)}, shortCircuit: true };
-    return nextResolve(specifier, context);
-}`;
-register(`data:text/javascript,${encodeURIComponent(LOADER)}`);
+registerTestHost();
 
 const { runGit, Store, defaultDataRoot, ReviewService, computeReviewId, loadExtension } = await import("./modules.mjs");
 const git = (cwd: string, ...args: string[]) => runGit(cwd, ["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "core.autocrlf=false", ...args]);
@@ -59,7 +27,7 @@ after(async () => {
 
 test("reply action schema accepts a suggested general instruction destination", async () => {
     await loadExtension();
-    const canvas = required(required(fake.config).canvases[0]);
+    const canvas = required(host.canvases[0]);
     const reply = required(canvas.actions?.find((action) => action.name === "reply"));
     const inputSchema = reply.inputSchema as {
         properties?: {
@@ -121,7 +89,7 @@ test("reopening a retired commit review without a usable origin keeps its path f
     }));
 
     await loadExtension();
-    const canvas = required(required(fake.config).canvases[0]);
+    const canvas = required(host.canvases[0]);
     try {
         for (const instanceId of ["no-origin", "gone-origin"]) {
             await canvas.open({ instanceId, input: {}, session: { workingDirectory: repo } });
@@ -133,7 +101,7 @@ test("reopening a retired commit review without a usable origin keeps its path f
             const snapshot = required(await store.readSnapshot(reopenedId, reopened.currentRevisionId));
             assert.deepEqual(snapshot.files.map((f) => f.path), ["src/keep.ts"], `${instanceId}: the fallback review is not widened`);
         }
-        assert.ok(fake.logs.some(({ message, level }) => level === "warning" && message.includes("historical single-commit review")));
+        assert.ok(host.logs.some(({ message, level }) => level === "warning" && message.includes("historical single-commit review")));
     } finally {
         for (const instanceId of ["no-origin", "gone-origin"]) await canvas.onClose?.({ instanceId });
     }

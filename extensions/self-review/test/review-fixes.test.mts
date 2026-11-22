@@ -3,7 +3,9 @@ import type { TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import fs from "node:fs";
 import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import {
@@ -186,6 +188,47 @@ test("an abandoned store lock fails explicitly instead of stealing ownership", {
     await writeFile(lockFile, owner);
     await assert.rejects(new Store(dir).updateSettings(() => assert.fail("must not mutate")), /stop all self-review providers before removing this lock/);
     assert.equal(await readFile(lockFile, "utf8"), owner);
+});
+
+// Fails the next matching fs.promises call once, as Windows does while another process or a scanner briefly holds the file.
+function failNextFsCall(t: TestContext, name: "open" | "rename", code: string, matches: (target: string) => boolean): () => boolean {
+    const promises = fs.promises as unknown as Record<typeof name, (...args: unknown[]) => Promise<unknown>>;
+    const original = promises[name];
+    let failed = false;
+    promises[name] = async (...args: unknown[]) => {
+        const target = String(args[name === "rename" ? 1 : 0]);
+        if (!failed && matches(target)) {
+            failed = true;
+            throw Object.assign(new Error(`${code}: simulated ${name} '${target}'`), { code });
+        }
+        return original(...args);
+    };
+    syncBuiltinESMExports();
+    t.after(() => {
+        promises[name] = original;
+        syncBuiltinESMExports();
+    });
+    return () => failed;
+}
+
+test("a store lock briefly refused by Windows is retried instead of failing the update", async (t) => {
+    const dir = await temporary(t);
+    const refused = failNextFsCall(t, "open", "EPERM", (target) => target.endsWith(".lock"));
+    const store = new Store(dir);
+    await store.updateSettings((settings) => { settings.repos.kept = {}; });
+    assert.ok(refused(), "lock creation was refused once");
+    assert.deepEqual(Object.keys((await store.readSettings()).repos), ["kept"]);
+    assert.deepEqual(await readdir(path.join(dir, "locks")), []);
+});
+
+test("transient store errors still retry while a test mocks timers", { timeout: 5000 }, async (t) => {
+    const dir = await temporary(t);
+    const store = new Store(dir);
+    const refused = failNextFsCall(t, "rename", "EPERM", (target) => target.endsWith("settings.json"));
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    await store.updateSettings((settings) => { settings.repos.kept = {}; });
+    assert.ok(refused(), "publishing settings was refused once");
+    assert.deepEqual(Object.keys((await store.readSettings()).repos), ["kept"]);
 });
 
 test("pending reviews need no inferred comparison base, and explicit All changes switching keeps sibling identity", async (t) => {
@@ -403,6 +446,22 @@ test("a comment claimed by a provider that stopped can be resent, and live claim
     assert.equal((await resend.deliver(id, orphan.thread.threadId, orphan.message.messageId, "inst", { retry: true })).delivered, true);
     assert.equal(sent.length, 1);
     assert.equal((await delivery(orphan)).state, "queued");
+});
+
+test("recovering abandoned parallel comments says whether analysis had started", async (t) => {
+    const { repo, store, service } = await fixture(t);
+    const stopped = new ReviewService({ store: new Store(store.root), pid: 999999 });
+    const id = await stopped.ensureReview({ repoPath: repo, base: "main" });
+    const queued = await stopped.createThread(id, { kind: "overview", body: "Waiting for a worker" });
+    const started = await stopped.createThread(id, { kind: "overview", body: "Being analyzed" });
+    await stopped.setDelivery(id, queued.message.messageId, { state: "queued", parallel: true });
+    await stopped.setDelivery(id, started.message.messageId, { state: "processing", parallel: true });
+
+    const checker = new ReviewService({ store: new Store(store.root), pid: 4242, isProcessAlive: (pid) => pid !== 999999 });
+    assert.equal((await checker.recoverAbandonedClaims(id)).length, 2);
+    const error = async (m: { message: ReviewMessage }) => required((await messageDelivery(service, id, m.message.messageId)).error);
+    assert.match(await error(queued), /before parallel analysis started\. Nothing was changed; resend it/);
+    assert.match(await error(started), /interrupted\. Check the reviewed checkout for any applied changes/);
 });
 
 test("a comment whose turn ends before send() returns settles instead of staying processing", async (t) => {

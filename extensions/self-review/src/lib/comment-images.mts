@@ -51,6 +51,8 @@ export async function readCommentImage(store: Store, reviewId: string, id: strin
     }
 }
 
+export const commentImagePath = (store: Store, reviewId: string, id: string) => imageLocation(store, reviewId, id).file;
+
 export async function commentImageIds(store: Store, reviewId: string, input: unknown): Promise<string[]> {
     if (input === undefined) return [];
     if (!Array.isArray(input) || input.length > MAX_IMAGES || !input.every((id): id is string => typeof id === "string")) {

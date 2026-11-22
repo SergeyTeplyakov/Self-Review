@@ -7,6 +7,10 @@ export class ReviewError extends Error {
     }
 }
 export const DELIVERY_MODES = ["immediate", "batch", "ask"];
+export const COMMENT_CONCURRENCIES = [1, 2, 3, 4];
+export function isCommentConcurrency(value) {
+    return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= COMMENT_CONCURRENCIES.length;
+}
 export const REVIEW_FOCUSES = ["review", "simplify", "both"];
 export const FUSION_REVIEWER = "copilot-fusion";
 export const SUGGESTED_REVIEWERS = ["gpt-6-astra", "gpt-6.1-sol", FUSION_REVIEWER];
@@ -74,8 +78,8 @@ export function agentReviewDefaults(defaults) {
 }
 export function settingsPatch(value) {
     if (!isRecord(value) || (value.autoSaveLearnedRules === undefined && value.delivery === undefined
-        && value.dismissed === undefined && value.instructionMappings === undefined)) {
-        throw new ReviewError("invalid_input", "Provide autoSaveLearnedRules, delivery, dismissed, or instructionMappings.");
+        && value.commentConcurrency === undefined && value.dismissed === undefined && value.instructionMappings === undefined)) {
+        throw new ReviewError("invalid_input", "Provide autoSaveLearnedRules, delivery, commentConcurrency, dismissed, or instructionMappings.");
     }
     if (value.autoSaveLearnedRules !== undefined && typeof value.autoSaveLearnedRules !== "boolean") {
         throw new ReviewError("invalid_input", "autoSaveLearnedRules must be a boolean.");
@@ -89,8 +93,12 @@ export function settingsPatch(value) {
     if (value.expectedInstructionMappings !== undefined && value.instructionMappings === undefined) {
         throw new ReviewError("invalid_input", "expectedInstructionMappings requires instructionMappings.");
     }
+    if (value.commentConcurrency !== undefined && !isCommentConcurrency(value.commentConcurrency)) {
+        throw new ReviewError("invalid_input", "commentConcurrency must be an integer from 1 to 4.");
+    }
     return {
         autoSaveLearnedRules: value.autoSaveLearnedRules, delivery: value.delivery, dismissed: value.dismissed,
+        ...(value.commentConcurrency !== undefined ? { commentConcurrency: value.commentConcurrency } : {}),
         instructionMappings: value.instructionMappings === undefined ? undefined : parseInstructionMappings(value.instructionMappings),
         expectedInstructionMappings: value.expectedInstructionMappings === undefined
             ? undefined
@@ -128,7 +136,8 @@ export function repoSettings(value) {
     if (!isRecord(value) || typeof value.repoName !== "string"
         || typeof value.autoSaveLearnedRules !== "boolean" || !isDeliveryMode(value.delivery)
         || typeof value.configured !== "boolean" || typeof value.dismissed !== "boolean"
-        || (value.pathCaseSensitive !== undefined && typeof value.pathCaseSensitive !== "boolean")) {
+        || (value.pathCaseSensitive !== undefined && typeof value.pathCaseSensitive !== "boolean")
+        || (value.commentConcurrency !== undefined && !isCommentConcurrency(value.commentConcurrency))) {
         throw new Error("Invalid repository settings response.");
     }
     const instructionMappings = value.instructionMappings === undefined ? [] : parseInstructionMappings(value.instructionMappings);
@@ -137,6 +146,7 @@ export function repoSettings(value) {
         instructionMappings,
         ...(value.pathCaseSensitive !== undefined ? { pathCaseSensitive: value.pathCaseSensitive } : {}),
         configured: value.configured, dismissed: value.dismissed,
+        ...(value.commentConcurrency !== undefined ? { commentConcurrency: value.commentConcurrency } : {}),
     };
 }
 export function settingsState(value) {

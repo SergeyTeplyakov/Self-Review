@@ -27,6 +27,7 @@ export interface RepoSettings {
     delivery: DeliveryMode;
     instructionMappings: InstructionMapping[];
     pathCaseSensitive?: boolean;
+    commentConcurrency?: number;
     configured: boolean;
     dismissed: boolean;
 }
@@ -34,6 +35,7 @@ export interface RepoSettings {
 export interface SettingsPatch {
     autoSaveLearnedRules?: boolean;
     delivery?: DeliveryMode;
+    commentConcurrency?: number;
     dismissed?: boolean;
     instructionMappings?: InstructionMapping[];
     expectedInstructionMappings?: InstructionMapping[];
@@ -44,6 +46,7 @@ export interface StoredRepoSettings {
     autoSaveLearnedRules?: unknown;
     learning?: unknown;
     delivery?: unknown;
+    commentConcurrency?: unknown;
     promptDismissed?: unknown;
     instructionMappings?: unknown;
     name?: string;

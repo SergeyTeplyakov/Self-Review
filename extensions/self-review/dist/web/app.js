@@ -232,7 +232,8 @@ function isRefreshStatus(value) {
 }
 function isExtensionVersion(value) {
     return isRecord(value) && typeof value.version === "string" && Boolean(value.version.trim())
-        && typeof value.buildId === "string" && /^[a-f0-9]{12}$/.test(value.buildId);
+        && typeof value.buildId === "string" && /^[a-f0-9]{12}$/.test(value.buildId)
+        && (value.builtAt === undefined || typeof value.builtAt === "string");
 }
 function isStateResponse(value) {
     if (!isRecord(value) || !isReview(value.review)
@@ -869,16 +870,18 @@ function renderLoadStatus() {
     }
     const controls = [];
     if (state.extensionVersion) {
-        const { version, buildId } = state.extensionVersion;
-        controls.push(`<span class="pill mono review-extension-version" title="Running Self-Review extension build ${esc(buildId)}" aria-label="Self-Review extension version ${esc(version)}, build ${esc(buildId)}">v${esc(version)} · build ${esc(buildId)}</span>`);
+        const { version, buildId, builtAt } = state.extensionVersion;
+        const built = builtAt ? new Date(builtAt) : null;
+        const date = built && !Number.isNaN(built.getTime())
+            ? built.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })
+            : "";
+        const detail = `Self-Review extension version ${version}, build ${buildId}${date ? `, built ${built?.toISOString()}` : ""}`;
+        controls.push(`<span class="pill mono review-extension-version" tabindex="0" title="${esc(detail)}" aria-label="${esc(detail)}">v${esc(version)} · ${date ? esc(date) : `build ${esc(buildId)}`}</span>`);
     }
-    if (state.settings) {
-        const repoMode = deliveryRepoMode();
-        const chosen = repoMode === "ask" ? deliveryMode() : null;
-        controls.push(chosen
-            ? `<span class="pill" title="${esc(DELIVERY[chosen].hint)} Chosen for this review.">Delivery: ${esc(DELIVERY[chosen].pill)}</span><button class="link" data-action="delivery-reask" title="Choose again how this review sends comments">Change</button>`
-            : `<span class="pill" title="${esc(DELIVERY[repoMode].hint)}">Delivery: ${esc(DELIVERY[repoMode].pill)}</span>`);
-        controls.push(`<span class="pill">${autoSaveLabel()}</span>`);
+    if (state.settings && deliveryRepoMode() === "ask") {
+        const chosen = deliveryMode();
+        if (chosen)
+            controls.push(`<button class="link" data-action="delivery-reask" title="This review sends comments: ${esc(DELIVERY[chosen].pill)}. Choose again.">Change delivery</button>`);
     }
     const controlsHtml = controls.join("");
     if (renderedFooterControlsHtml !== controlsHtml) {
@@ -1308,7 +1311,18 @@ function renderTop() {
     const rev = r.revisions.find((x) => x.revisionId === r.currentRevisionId);
     const git = r.git ?? {};
     const scope = scopeOf(r);
-    const awaiting = r.threads.flatMap((t) => t.messages).filter((m) => m.delivery && ["queued", "processing"].includes(m.delivery.state)).length;
+    const deliveries = r.threads.flatMap(t => t.messages.map(m => m.delivery));
+    const queued = deliveries.filter(d => d?.state === "queued").length;
+    const processing = deliveries.filter(d => d?.state === "processing");
+    const ready = processing.filter(d => d?.parallelPhase === "ready").length;
+    const applying = processing.filter(d => d?.parallelPhase === "applying").length;
+    const limit = state.settings?.commentConcurrency ?? 1;
+    const running = processing.length - ready - applying;
+    const counts = limit > 1 || processing.some(d => d?.parallel) || queued || running
+        ? ` · ${queued} queued · ${running} running${ready ? ` · ${ready} waiting to apply` : ""}${applying ? ` · ${applying} applying` : ""}`
+        : "";
+    // The host reports the owning conversation as busy even when it is handling something other than these comments.
+    const commentsActive = running || ready || applying;
     const branch = `<span class="pill mono" title="HEAD ${esc(git.headCommit ?? "")}">${esc(r.branch ?? "?")}</span>`;
     const parts = [
         `<section class="change-context" role="group" aria-label="Change context">`,
@@ -1332,12 +1346,16 @@ function renderTop() {
         if (git.uncommittedFiles)
             parts.push(`<span class="pill warn" title="Diff includes working-tree changes">${git.uncommittedFiles} uncommitted</span>`);
     }
+    if (limit > 1)
+        parts.push(`<span class="pill" title="Maximum comments analyzed together in this repository">Parallelism: ${limit}</span>`);
     if (state.connection === "lost")
         parts.push(`<span class="pill warn" title="If this persists, reopen the canvas">disconnected</span>`);
+    else if (commentsActive)
+        parts.push(`<span class="pill busy"><span class="dot"></span>Copilot working${counts}</span>`);
     else if (state.busy === true)
-        parts.push(`<span class="pill busy"><span class="dot"></span>Copilot working${awaiting ? ` · ${awaiting} pending` : ""}</span>`);
-    else if (state.busy === false)
-        parts.push(`<span class="pill"><span class="dot muted"></span>Copilot idle${awaiting ? ` · ${awaiting} pending` : ""}</span>`);
+        parts.push(`<span class="pill busy" title="${queued ? "Copilot is finishing other work in this conversation. Queued comments start when it picks them up." : "Copilot is working in this conversation."}"><span class="dot"></span>Copilot busy${counts}</span>`);
+    else if (state.busy === false || queued)
+        parts.push(`<span class="pill"><span class="dot muted"></span>Copilot idle${counts}</span>`);
     parts.push(`<span class="spacer"></span>${agentReviewButtonHtml()}${reviewSettingsMenuHtml()}<button data-action="refresh" title="Re-read the working tree">Refresh</button></div></section>`);
     const drafts = draftMessages().length;
     const controls = [];
@@ -1413,6 +1431,7 @@ function dialogHtml() {
             : `<p class="muted">No mappings yet. Repository rules remain proposals until a destination is configured.</p>`)
         + `<button data-action="mapping-add">Add destination mapping</button></fieldset>`
         + `<fieldset class="choices"><legend>Send comments to Copilot</legend>${choicesHtml("delivery", DELIVERY_MODES, DELIVERY, d.delivery)}</fieldset>`
+        + `<fieldset class="choices"><legend>Comment processing</legend><label>Concurrent comments <select name="commentConcurrency" aria-describedby="comment-concurrency-hint">${[1, 2, 3, 4].map(n => `<option value="${n}"${n === (d.commentConcurrency ?? 1) ? " selected" : ""}>${n === 1 ? "1 (serial)" : n}</option>`).join("")}</select></label><p id="comment-concurrency-hint">2–4 comments can be analyzed together in this checkout. Only the coordinator edits, one change at a time. Follow-ups in the same thread wait their turn.</p></fieldset>`
         + (d.error ? `<div class="modal-error" role="alert">${esc(d.error)}</div>` : "")
         + `<div class="modal-actions"><button data-action="dialog-cancel"${d.saving ? " disabled" : ""}>Cancel</button>`
         + `<button class="primary" data-action="dialog-save"${d.saving ? " disabled" : ""}>${d.saving ? "Saving…" : "Save"}</button></div>`
@@ -1456,6 +1475,7 @@ function openConfigure() {
     const mappings = state.settings.instructionMappings.map((mapping) => ({ ...mapping }));
     state.dialog = {
         type: "configure", autoSaveLearnedRules: autoSaveLearnedRules(), delivery: deliveryRepoMode(),
+        commentConcurrency: state.settings.commentConcurrency ?? 1,
         originalInstructionMappings: mappings.map((mapping) => ({ ...mapping })),
         instructionMappings: mappings,
         saving: false, error: "",
@@ -1787,6 +1807,7 @@ async function saveConfigure() {
         const mappingsChanged = JSON.stringify(d.instructionMappings) !== JSON.stringify(d.originalInstructionMappings);
         await updateSettings({
             autoSaveLearnedRules: d.autoSaveLearnedRules, delivery: d.delivery,
+            ...(d.commentConcurrency !== (state.settings?.commentConcurrency ?? 1) ? { commentConcurrency: d.commentConcurrency } : {}),
             ...(mappingsChanged ? {
                 instructionMappings: d.instructionMappings,
                 expectedInstructionMappings: d.originalInstructionMappings,
@@ -2077,7 +2098,7 @@ function composerHtml(key, { label, placeholder, kind, path, side, startLine, en
         : `<button class="primary" data-action="submit" data-key="${k}"${disabled ? " disabled" : ""}>${p?.sending ? "Sending…" : "Comment"}</button>`;
     return `<div class="composer${open ? " open" : ""}" ${data}>`
         + (label ? `<div class="label">${esc(label)}</div>` : "")
-        + `<textarea data-composer="${k}" placeholder="${esc(placeholder ?? "Write a comment…")}" ${p?.sending ? "disabled" : ""}>${draftHtml}</textarea>`
+        + `<textarea data-composer="${k}" rows="1" placeholder="${esc(placeholder ?? "Write a comment…")}" ${p?.sending ? "disabled" : ""}>${draftHtml}</textarea>`
         + `<div class="review-commands" role="group" aria-label="Review commands" hidden></div>`
         + imagesHtml(images, key, Boolean(p?.sending))
         + (uploading ? `<div class="muted" role="status">Attaching image…</div>` : "")
@@ -2103,11 +2124,13 @@ function deliveryHtml(m) {
             return `<span class="delivery queued">Queued for Copilot${stale ? ` · ${resend("Resend")}` : ""}</span>`;
         }
         case "processing":
+            if (d.parallel)
+                return `<span class="delivery processing">${d.parallelPhase === "ready" ? "Waiting to apply" : d.parallelPhase === "applying" ? "Applying change…" : "Analyzing comment…"}</span>`;
             return `<span class="delivery processing">Copilot is working…</span>`;
         case "replied":
             return `<span class="delivery replied">✓ Replied</span>`;
         case "no-reply":
-            return `<span class="delivery no-reply" title="Copilot finished without replying in this thread">No reply · ${resend("Resend")}</span>`;
+            return `<span class="delivery no-reply" title="${esc(d.error ?? "Copilot finished without replying in this thread")}">${d.error ? "Processing failed" : "No reply"} · ${resend("Resend")}</span>`;
         case "failed":
             return `<span class="delivery failed" title="${esc(d.error ?? "")}">Delivery failed · ${resend("Retry")}</span>`;
         default:
@@ -3166,11 +3189,13 @@ async function onChange(e) {
             state.dialog.focus = el.value;
         return;
     }
-    if ((el.name === "autoSaveLearnedRules" || el.name === "delivery") && state.dialog?.type === "configure") {
+    if ((el.name === "autoSaveLearnedRules" || el.name === "delivery" || el.name === "commentConcurrency") && state.dialog?.type === "configure") {
         if (el instanceof HTMLInputElement && el.name === "autoSaveLearnedRules")
             state.dialog.autoSaveLearnedRules = el.checked;
         if (el.name === "delivery" && (el.value === "immediate" || el.value === "batch" || el.value === "ask"))
             state.dialog.delivery = el.value;
+        if (el.name === "commentConcurrency" && /^[1-4]$/.test(el.value))
+            state.dialog.commentConcurrency = Number(el.value);
         return;
     }
     if (el.dataset?.action !== "status")

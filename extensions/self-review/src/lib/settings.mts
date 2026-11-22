@@ -3,7 +3,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as gitDefault from "./git-process.mjs";
-import { agentReviewDefaults, settingsPatch, isDeliveryMode, isRecord, ReviewError } from "../web/contracts.mjs";
+import { agentReviewDefaults, settingsPatch, isCommentConcurrency, isDeliveryMode, isRecord, ReviewError } from "../web/contracts.mjs";
 import type { AgentReviewDefaults, DeliveryChoice, DeliveryMode, GitRunner, InstructionMapping, Log, RepoSettings, SettingsStore, StoredRepoSettings } from "../../types/contracts.js";
 export { DELIVERY_MODES } from "../web/contracts.mjs";
 
@@ -196,6 +196,7 @@ export class SettingsService {
             delivery: isDeliveryMode(entry?.delivery) ? entry.delivery : DEFAULT_DELIVERY,
             instructionMappings,
             ...(instructionMappings.length ? { pathCaseSensitive: pathCaseSensitive() } : {}),
+            ...(isCommentConcurrency(entry?.commentConcurrency) ? { commentConcurrency: entry.commentConcurrency } : {}),
             configured: autoSave !== undefined,
             dismissed: entry?.promptDismissed === true,
         };
@@ -213,6 +214,8 @@ export class SettingsService {
                 delete entry.learning;
             }
             if (patch.delivery !== undefined) entry.delivery = patch.delivery;
+            if (patch.commentConcurrency === 1) delete entry.commentConcurrency;
+            else if (patch.commentConcurrency !== undefined) entry.commentConcurrency = patch.commentConcurrency;
             if (patch.dismissed !== undefined) entry.promptDismissed = patch.dismissed;
             if (patch.instructionMappings !== undefined) {
                 if (patch.expectedInstructionMappings !== undefined
