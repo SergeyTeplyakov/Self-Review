@@ -22,7 +22,7 @@ export async function readGitBlob(cwd: string, oid: string, maxBytes: number): P
  * @param {{allowFail?: boolean, input?: string}} [options]
  * @returns {Promise<{ok: boolean, stdout: string, stderr: string, exitCode: number | null}>}
  */
-export function runGit(cwd: string, args: string[], { allowFail = false, input }: { allowFail?: boolean; input?: string } = {}): Promise<{
+export function runGit(cwd: string, args: string[], { allowFail = false, input, env }: { allowFail?: boolean; input?: string; env?: NodeJS.ProcessEnv } = {}): Promise<{
     ok: boolean;
     stdout: string;
     stderr: string;
@@ -37,7 +37,7 @@ export function runGit(cwd: string, args: string[], { allowFail = false, input }
                 maxBuffer: 256 * 1024 * 1024,
                 windowsHide: true,
                 encoding: "utf8",
-                env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" },
+                env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0", ...env },
             },
             (err, stdout, stderr) => {
                 if (err && !allowFail) {

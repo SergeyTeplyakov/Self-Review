@@ -2539,7 +2539,7 @@ function fileView(file: DiffFile, { stacked = false, folded = false }: { stacked
         html.push(`<div class="thread">${composerHtml(fileKey, { kind: "file", path: file.path, label: `Comment on ${file.path}`, alwaysOpen: true })}</div>`);
     }
     if (file.binary) html.push(imageDiffHtml(file) || `<div class="card muted">${esc(file.note ?? "Binary file not shown.")}</div>`);
-    if (!file.binary && !file.hunks.length) html.push(`<div class="card muted">No textual changes (mode or rename only).</div>`);
+    if (!file.binary && !file.hunks.length) html.push(`<div class="card muted">No textual changes (mode or rename only).</div>`, imageDiffHtml(file));
     if (!stacked && !file.full && needsContent(file)) {
         const entry = contentEntry(file);
         const why = entry.status === "unavailable"

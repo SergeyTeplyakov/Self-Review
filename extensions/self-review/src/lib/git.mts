@@ -128,6 +128,25 @@ async function readRepoFile(repoRoot: string, relPath: string, maxBytes = Infini
     }
 }
 
+// Git omits the index line only when content is unchanged (a pure rename or mode change), so both sides are the base blob.
+// Text-classified images with content changes keep their text diff: Git LFS pointers use image extensions.
+async function addUnchangedImageSides(repoRoot: string, baseCommit: string, files: DiffFile[]) {
+    const unchanged = files.filter((file) => !file.imageSides && !file.binary && !file.hunks.length && !file.typeChanged
+        && (file.status === "modified" || file.status === "renamed") && (imagePath(file.path) || imagePath(file.oldPath))
+        && !/[\r\n]/.test(file.oldPath ?? file.path));
+    if (!unchanged.length) return;
+    const lookup = await runGit(repoRoot, ["cat-file", "--batch-check=%(objectname) %(objecttype)"], {
+        allowFail: true, env: { GIT_NO_LAZY_FETCH: "1" },
+        input: unchanged.map((file) => `${baseCommit}:${file.oldPath ?? file.path}\n`).join(""),
+    });
+    if (!lookup.ok) return;
+    const lines = lookup.stdout.split("\n");
+    unchanged.forEach((file, i) => {
+        const blob = /^([0-9a-f]{40}|[0-9a-f]{64}) blob$/.exec(lines[i] ?? "");
+        if (blob) file.imageSides = { old: blob[1], new: blob[1] };
+    });
+}
+
 // scope "all" diffs the working tree against the merge-base with `base` (the whole branch or PR);
 // scope "pending" diffs it against HEAD, so committed work is left out.
 export async function captureSnapshot({ repoRoot, base, paths, exclude, includeUntracked = true, contextLines = 5, scope = "all" }: CaptureOptions): Promise<Snapshot> {
@@ -148,6 +167,7 @@ export async function captureSnapshot({ repoRoot, base, paths, exclude, includeU
         "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--full-index", "--find-renames", "--src-prefix=a/", "--dst-prefix=b/", `-U${contextLines}`, baseCommit, "--", ...pathspec,
     ]);
     const files = parseUnifiedDiff(diff.stdout);
+    await addUnchangedImageSides(repoRoot, baseCommit, files);
     const hash = createHash("sha256").update(baseCommit).update("\0").update(diff.stdout);
 
     if (includeUntracked) {

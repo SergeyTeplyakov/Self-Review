@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -80,5 +80,37 @@ test("image requests serve only the selected side, review and revision", async (
         await expectBytes("added.png", "new", png(9), revisionId);
     } finally {
         await server.close();
+    }
+});
+
+test("pure image renames and mode-only changes preview the unchanged blob on both sides", async (t) => {
+    const tmp = await mkdtemp(path.join(os.tmpdir(), "image-diff-test-"));
+    t.after(() => rm(tmp, { recursive: true, force: true }));
+    const repo = path.join(tmp, "repo");
+    await mkdir(repo);
+    const git = (...args: string[]) => runGit(repo, ["-c", "user.name=test", "-c", "user.email=test@example.invalid",
+        "-c", "commit.gpgsign=false", ...args]);
+    const png = (value: number) => Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0, value]);
+    await git("init", "-q", "-b", "main");
+    await writeFile(path.join(repo, "a.png"), png(1));
+    await writeFile(path.join(repo, "b.png"), png(2));
+    await git("add", ".");
+    await git("commit", "-qm", "base");
+    await git("mv", "a.png", "renamed.png");
+    // Set both: Git reads the working-tree mode where core.filemode is on and the index mode where it is off.
+    await chmod(path.join(repo, "b.png"), 0o755);
+    await git("update-index", "--chmod=+x", "b.png");
+
+    const service = new ReviewService({ store: new Store(path.join(tmp, "reviews")) });
+    const review = await service.ensureReview({ repoPath: repo, base: "main", scope: "pending" });
+    const { files } = await service.getSnapshot(review);
+    for (const [name, status, bytes] of [["renamed.png", "renamed", png(1)], ["b.png", "modified", png(2)]] as const) {
+        const file = files.find((entry) => entry.path === name);
+        assert.ok(file, name);
+        assert.equal(file.status, status);
+        assert.equal(file.hunks.length, 0);
+        for (const side of ["old", "new"]) {
+            assert.deepEqual((await service.getDiffImage(review, "r1", name, side)).bytes, bytes, `${name} ${side}`);
+        }
     }
 });

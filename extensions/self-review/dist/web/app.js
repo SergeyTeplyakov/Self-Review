@@ -2327,7 +2327,7 @@ function fileView(file, { stacked = false, folded = false } = {}) {
     if (file.binary)
         html.push(imageDiffHtml(file) || `<div class="card muted">${esc(file.note ?? "Binary file not shown.")}</div>`);
     if (!file.binary && !file.hunks.length)
-        html.push(`<div class="card muted">No textual changes (mode or rename only).</div>`);
+        html.push(`<div class="card muted">No textual changes (mode or rename only).</div>`, imageDiffHtml(file));
     if (!stacked && !file.full && needsContent(file)) {
         const entry = contentEntry(file);
         const why = entry.status === "unavailable"
