@@ -173,6 +173,20 @@ test("brace groups in applyTo expand to alternatives instead of splitting at the
     );
 });
 
+test("applyTo matching ignores case, so an uppercase extension keeps its inferred destination", async (t) => {
+    const repo = await fixture(t);
+    const mapping: InstructionMapping = { pathPrefix: "", instructionRoot: "", splitLanguageSpecific: false };
+    const file = path.join(repo, ".github", "instructions", "csharp-style.instructions.md");
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, `---\napplyTo: "**/*.CS"\n---\n`);
+    const inferred = inferRuleDestination("src/Program.CS");
+    assert.deepEqual(inferred, { kind: "language", language: "csharp", applyTo: "**/*.cs" });
+
+    const saved = await saveRepositoryRule(repo, mapping, "src/Program.CS", inferred, "Prefer typed guards.", false, noLock);
+    assert.equal(saved.savedTo, ".github/instructions/csharp-style.instructions.md");
+    assert.match(await readFile(file, "utf8"), /- Prefer typed guards\./);
+});
+
 test("an existing scoped file is chosen only when its applyTo covers the rule's full applyTo", async (t) => {
     const repo = await fixture(t);
     const instructions = path.join(repo, ".github", "instructions");

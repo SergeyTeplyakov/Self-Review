@@ -26,7 +26,7 @@ Each mapping has **Split language-specific rules into scoped files**, on by defa
 - **Off:** Self-Review does not require the split. It appends to an existing instruction file under the mapped root whose `applyTo` covers the reviewed file and every pattern in the rule's `applyTo`, or uses that root's general instruction file when none does.
 - **Repository-wide rules:** These always go to the mapped root's general instruction file, regardless of the split setting.
 
-Existing scoped instruction files may use comma-separated `applyTo` globs; Self-Review matches any listed pattern and ignores a standard trailing YAML comment. As in VS Code, commas inside a brace group do not separate patterns, and a group such as `**/*.{ts,tsx}` stands for each of its alternatives. A file covers a requested pattern when it lists the same pattern, a universal pattern (`**` or `**/*`), or a `**/` pattern the requested one narrows (for example, `**/*.ts` covers `src/**/*.ts`).
+Existing scoped instruction files may use comma-separated `applyTo` globs; Self-Review matches any listed pattern and ignores a standard trailing YAML comment. As in VS Code, commas inside a brace group do not separate patterns, a group such as `**/*.{ts,tsx}` stands for each of its alternatives, and matching ignores case. A file covers a requested pattern when it lists the same pattern, a universal pattern (`**` or `**/*`), or a `**/` pattern the requested one narrows (for example, `**/*.ts` covers `src/**/*.ts`).
 
 An ancestor instruction file can inform the agent's suggestion and help avoid duplicate guidance, but it is never a fallback destination for a mapped rule.
 

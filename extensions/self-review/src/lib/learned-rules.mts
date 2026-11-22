@@ -36,7 +36,7 @@ function globRegex(glob: string): RegExp {
         .replace(/\?/g, "[^/]")
         .replace(/\u0000\//g, "(?:.*/)?")
         .replace(/\u0000/g, ".*");
-    return new RegExp(`^${escaped}$`);
+    return new RegExp(`^${escaped}$`, "i");
 }
 
 const MAX_BRACE_EXPANSIONS = 64;
@@ -81,9 +81,10 @@ function appliesTo(pattern: string | string[], filePath: string): boolean {
 }
 
 // Conservative glob subsumption: true only when every path the requested pattern matches is also matched by the file pattern.
+// Matching ignores case, as in VS Code, so the comparison does too.
 function patternCovers(filePattern: string, requested: string): boolean {
-    const file = filePattern.replace(/\\/g, "/");
-    const wanted = requested.replace(/\\/g, "/");
+    const file = filePattern.replace(/\\/g, "/").toLowerCase();
+    const wanted = requested.replace(/\\/g, "/").toLowerCase();
     if (file === wanted || file === "**" || file === "**/*") return true;
     if (!file.startsWith("**/")) return false;
     const tail = file.slice(3);
