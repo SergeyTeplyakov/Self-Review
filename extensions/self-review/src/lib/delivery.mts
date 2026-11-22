@@ -6,6 +6,7 @@ import { buildBatchPrompt, buildCommentPrompt } from "./prompt.mjs";
 import { readCommentImage } from "./comment-images.mjs";
 import type { ReviewService, DraftClaim } from "./review-service.mjs";
 import type { Log } from "../../types/contracts.js";
+import { ParallelComments } from "./parallel-comments.mjs";
 
 type CopilotSession = Awaited<ReturnType<typeof import("@github/copilot-sdk/extension").joinSession>>;
 export type SendOptions = Parameters<CopilotSession["send"]>[0];
@@ -36,6 +37,8 @@ export class Delivery extends EventEmitter {
     readonly autoSaveLearnedRules: (repoRoot: string) => Promise<boolean>;
     readonly sessionId: () => string | undefined;
     readonly fallbackOwner: string;
+    readonly parallel: ParallelComments;
+    readonly commentConcurrency: (repoRoot: string) => Promise<number>;
     busy: boolean | null;
     private readonly bySessionMessageId: Map<string, DeliveryTarget[]>;
     private readonly seenSessionMessageIds: Map<string, { finished: boolean }>;
@@ -51,9 +54,11 @@ export class Delivery extends EventEmitter {
      * @param {(repoRoot: string) => Promise<boolean>} [p.autoSaveLearnedRules]
      * @param {() => string | undefined} [p.sessionId] conversation that processes the comments this instance sends
      */
-    constructor({ service, send, log = () => {}, reviewIds = () => [], autoSaveLearnedRules = async () => false, sessionId = () => undefined }: {
+    constructor({ service, send, log = () => {}, reviewIds = () => [], autoSaveLearnedRules = async () => false,
+        sessionId = () => undefined, commentConcurrency = async () => 1 }: {
         service: ReviewService; send: (options: SendOptions) => Promise<string>; log?: Log; reviewIds?: () => Iterable<string>;
         autoSaveLearnedRules?: (repoRoot: string) => Promise<boolean>; sessionId?: () => string | undefined;
+        commentConcurrency?: (repoRoot: string) => Promise<number>;
     }) {
         super();
         this.service = service;
@@ -63,6 +68,8 @@ export class Delivery extends EventEmitter {
         this.autoSaveLearnedRules = autoSaveLearnedRules;
         this.sessionId = sessionId;
         this.fallbackOwner = `delivery-${randomUUID()}`;
+        this.commentConcurrency = commentConcurrency;
+        this.parallel = new ParallelComments(service, send, () => this.owner(), root => this.repoLearning(root));
         this.busy = null;
         this.bySessionMessageId = new Map();
         // Session message ids seen before send() resolved, and whether their turn has already finished.
@@ -111,6 +118,9 @@ export class Delivery extends EventEmitter {
     async sendClaimed(reviewId: string, claims: DraftClaim[], instanceId: string): Promise<DeliveryResult> {
         let sessionMessageId;
         try {
+            const { repoRoot } = await this.service.getReview(reviewId);
+            const concurrency = await this.commentConcurrency(repoRoot);
+            if (concurrency > 1) return await this.parallel.enqueue(reviewId, instanceId, claims, concurrency);
             const threadIds = [...new Set(claims.map((c) => c.threadId))];
             const contexts = [];
             for (const threadId of threadIds) contexts.push(await this.service.promptContext(reviewId, threadId));
@@ -187,6 +197,7 @@ export class Delivery extends EventEmitter {
     }
 
     onUserMessage(event: UserMessageEvent) {
+        this.parallel.onUserMessage(event);
         return this.enqueueLifecycle(() => this.handleUserMessage(event));
     }
 
@@ -233,6 +244,7 @@ export class Delivery extends EventEmitter {
     }
 
     async handleIdle() {
+        await this.parallel.onIdle();
         this.setBusy(false);
         for (const seen of this.seenSessionMessageIds.values()) seen.finished = true;
         const ids = new Set([...this.touched, ...this.reviewIds()]);

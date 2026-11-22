@@ -405,6 +405,22 @@ test("a comment claimed by a provider that stopped can be resent, and live claim
     assert.equal((await delivery(orphan)).state, "queued");
 });
 
+test("recovering abandoned parallel comments says whether analysis had started", async (t) => {
+    const { repo, store, service } = await fixture(t);
+    const stopped = new ReviewService({ store: new Store(store.root), pid: 999999 });
+    const id = await stopped.ensureReview({ repoPath: repo, base: "main" });
+    const queued = await stopped.createThread(id, { kind: "overview", body: "Waiting for a worker" });
+    const started = await stopped.createThread(id, { kind: "overview", body: "Being analyzed" });
+    await stopped.setDelivery(id, queued.message.messageId, { state: "queued", parallel: true });
+    await stopped.setDelivery(id, started.message.messageId, { state: "processing", parallel: true });
+
+    const checker = new ReviewService({ store: new Store(store.root), pid: 4242, isProcessAlive: (pid) => pid !== 999999 });
+    assert.equal((await checker.recoverAbandonedClaims(id)).length, 2);
+    const error = async (m: { message: ReviewMessage }) => required((await messageDelivery(service, id, m.message.messageId)).error);
+    assert.match(await error(queued), /before parallel analysis started\. Nothing was changed; resend it/);
+    assert.match(await error(started), /interrupted\. Check the reviewed checkout for any applied changes/);
+});
+
 test("a comment whose turn ends before send() returns settles instead of staying processing", async (t) => {
     const { repo, service } = await fixture(t);
     const id = await service.ensureReview({ repoPath: repo, base: "main" });

@@ -3,6 +3,7 @@ import { isRecord } from "../web/contracts.mjs";
 export interface ExtensionVersion {
     version: string;
     buildId: string;
+    builtAt?: string;
 }
 
 export function parseExtensionVersion(value: unknown): ExtensionVersion {

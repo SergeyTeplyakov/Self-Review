@@ -4,7 +4,7 @@
 // repository's auto-save setting, proposes or saves guidelines drawn from the feedback.
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { joinSession, createCanvas, CanvasError } from "@github/copilot-sdk/extension";
 import { Store, migrateLegacyDataRoot } from "./lib/store.mjs";
 import { parseExtensionVersion } from "./lib/extension-version.mjs";
@@ -21,7 +21,13 @@ const CANVAS_ID = "self-review";
 const WEB_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "web");
 const MODULE_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
 const DISTRIBUTION_DIRECTORY = path.basename(MODULE_DIRECTORY) === "dist" ? MODULE_DIRECTORY : path.join(MODULE_DIRECTORY, "dist");
-const extensionVersion = parseExtensionVersion(JSON.parse(await readFile(path.join(DISTRIBUTION_DIRECTORY, "version.json"), "utf8")));
+const VERSION_FILE = path.join(DISTRIBUTION_DIRECTORY, "version.json");
+// version.json is rewritten only when the build fingerprint changes, so its file date is the build date
+// without adding a timestamp that would make the committed distribution non-reproducible.
+const extensionVersion = {
+    ...parseExtensionVersion(JSON.parse(await readFile(VERSION_FILE, "utf8"))),
+    builtAt: (await stat(VERSION_FILE)).mtime.toISOString(),
+};
 const REPO_FIELDS = ["repoPath", "base", "paths", "exclude", "includeUntracked", "context"];
 let session = null;
 const log = (message, level = "info") => {
@@ -51,6 +57,7 @@ const delivery = new Delivery({
     send,
     reviewIds: openReviewIds,
     autoSaveLearnedRules,
+    commentConcurrency: async (repoRoot) => (await settings.get(repoRoot)).commentConcurrency ?? 1,
     sessionId: () => session?.sessionId,
 });
 const reviewSkills = new ReviewSkills({ store });
@@ -415,6 +422,41 @@ const actions = [
                 includeResolved: input.includeResolved === true,
             });
             return { ...summary, autoSaveLearnedRules: await autoSaveLearnedRules(review.repoRoot) };
+        }),
+    },
+    {
+        name: "take_comment_workers",
+        description: "Take the next wave of read-only analysis jobs in the reviewed checkout, or a single edit for the coordinator. Only the coordinator writes, and only for an explicit edit request.",
+        inputSchema: {
+            type: "object", properties: { runId: { type: "string" } }, required: ["runId"], additionalProperties: false,
+        },
+        handler: guarded(ctx => delivery.parallel.take(requireString(inputOf(ctx), "runId"))),
+    },
+    {
+        name: "finish_comment_worker",
+        description: "Submit an analysis result (proposed queues a plan without replying) or a verified coordinator edit. Terminal results reply to the original comment.",
+        inputSchema: {
+            type: "object",
+            properties: {
+                runId: { type: "string" }, jobId: { type: "string" }, body: { type: "string" },
+                outcome: { type: "string", enum: [...OUTCOMES, "proposed"] }, verification: { type: "string" },
+                lessons: {
+                    type: "array", items: {
+                        type: "object", properties: {
+                            lessonId: { type: "string" }, scope: { type: "string", enum: ["repo", "personal"] },
+                            rule: { type: "string" }, status: { type: "string", enum: LESSON_STATUSES },
+                        }, additionalProperties: false,
+                    },
+                },
+            },
+            required: ["runId", "jobId", "body", "outcome"], additionalProperties: false,
+        },
+        handler: guarded(ctx => {
+            const input = inputOf(ctx);
+            return delivery.parallel.finish(requireString(input, "runId"), requireString(input, "jobId"), {
+                body: requireString(input, "body"), outcome: requireString(input, "outcome"),
+                verification: typeof input.verification === "string" ? input.verification : undefined, lessons: input.lessons,
+            });
         }),
     },
     {
