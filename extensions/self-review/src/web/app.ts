@@ -50,6 +50,12 @@ type DiffFile = {
     full?: boolean;
 };
 type Snapshot = { revisionId: string; files: DiffFile[] };
+type ImageEntry =
+    | { status: "loading" }
+    | { status: "failed" }
+    | { status: "ready"; url: string; width: number; height: number; size: number };
+type ImageMode = "2-up" | "swipe" | "onion";
+type ImageView = { mode: ImageMode; split: number; opacity: number };
 type ThreadLocation = {
     path: string;
     side?: DiffSide;
@@ -283,6 +289,9 @@ type State = {
     collapsedDirs: Set<string> | null;
     fileFold: Map<string, boolean>;
     content: Map<string, ContentEntry>;
+    // Decoded diff images keyed by object ID, shared by every file and revision that shows the same bytes.
+    images: Map<string, ImageEntry>;
+    imageViews: Map<string, ImageView>;
     settings: import("../../types/contracts.js").RepoSettings | null;
     extensionVersion?: ExtensionVersion;
     dialog: Dialog | null;
@@ -620,6 +629,8 @@ const state: State = {
     collapsedDirs: null,
     fileFold: new Map<string, boolean>(),
     content: new Map<string, ContentEntry>(),
+    images: new Map<string, ImageEntry>(),
+    imageViews: new Map<string, ImageView>(),
     settings: null,
     extensionVersion: undefined,
     dialog: null,
@@ -1092,6 +1103,8 @@ function resetForReview() {
     state.collapsedThreads.clear();
     state.fileFold.clear();
     state.content.clear();
+    pruneImages(null);
+    state.imageViews.clear();
     state.collapsedDirs = null;
     viewRestored = false;
 }
@@ -1172,6 +1185,7 @@ async function loadState() {
             state.review = data.review;
             state.extensionVersion = data.extensionVersion;
             if (reviewChanged) restorePinnedComposers(data.review.reviewId);
+            if (state.snapshot !== snapshot) pruneImages(snapshot);
             state.snapshot = snapshot;
             serverRefresh = data.refresh;
             refreshError = "";
@@ -1495,6 +1509,9 @@ function render() {
     const focusKey = active instanceof HTMLTextAreaElement ? active.dataset.composer : undefined;
     const selStart = active instanceof HTMLTextAreaElement ? active.selectionStart : null;
     const selEnd = active instanceof HTMLTextAreaElement ? active.selectionEnd : null;
+    // Keep keyboard focus on a swipe or opacity slider across background re-renders.
+    const imageControl = active instanceof HTMLInputElement && active.dataset?.imageControl
+        ? `input[data-image-control="${CSS.escape(active.dataset.imageControl)}"][data-path="${CSS.escape(active.dataset.path ?? "")}"]` : "";
     const main = $("#main");
     if (!main) return;
     const scroll = main.scrollTop;
@@ -1510,8 +1527,10 @@ function render() {
             `<div class="thread"><div class="muted">Diff changed. This comment keeps its original location in ${esc(options.revisionId)}.</div>${composerHtml(key, options)}</div>`,
         ).join(""));
     }
+    paintImageDiffs();
     main.scrollTop = scroll;
     renderRuler();
+    if (imageControl) document.querySelector<HTMLElement>(imageControl)?.focus();
     if (focusKey) {
         const el = document.querySelector<HTMLTextAreaElement>(`textarea[data-composer="${CSS.escape(focusKey)}"]`);
         if (el) {
@@ -2732,17 +2751,179 @@ function lessonsView(): string {
     return `<h2>Lessons learned (${lessons.length})</h2><table class="lessons-table"><thead><tr><th>Scope</th><th>Status</th><th>Rule</th><th>Saved to</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
-function imageDiffHtml(file: DiffFile): string {
-    const rev = state.snapshot?.revisionId;
-    const reviewId = state.review?.reviewId;
-    if (!rev || !reviewId || !file.imageSides) return "";
-    const figures = (["old", "new"] as const).filter(side => file.imageSides?.[side]).map(side => {
-        const label = side === "old" ? "Before" : "After";
-        const name = side === "old" ? file.oldPath ?? file.path : file.path;
-        const url = `/api/diff-image/${encodeURIComponent(rev)}?review=${encodeURIComponent(reviewId)}&path=${encodeURIComponent(file.path)}&side=${side}&t=${encodeURIComponent(TOKEN)}`;
-        return `<figure><figcaption class="${side}">${label}</figcaption><div class="image-stage"><img loading="lazy" decoding="async" src="${esc(url)}" alt="${esc(`${label}: ${name}`)}"></div></figure>`;
+const IMAGE_SIDES = ["old", "new"] as const;
+const IMAGE_SIDE_LABELS: Record<DiffSide, string> = { old: "Before", new: "After" };
+const IMAGE_MODES: readonly ImageMode[] = ["2-up", "swipe", "onion"];
+const IMAGE_MODE_LABELS: Record<ImageMode, string> = { "2-up": "2-up", swipe: "Swipe", onion: "Onion skin" };
+const DEFAULT_IMAGE_VIEW: ImageView = { mode: "2-up", split: 50, opacity: 50 };
+const IMAGE_UNAVAILABLE = "Preview unavailable: the image may have changed since this revision, be unsupported, or exceed 2 MB. Refresh to compare the latest version.";
+// Start fetching an image this far before its block scrolls into view.
+const IMAGE_PREFETCH_MARGIN = "600px";
+let imageObserver: IntersectionObserver | null = null;
+
+const imageView = (path: string): ImageView => state.imageViews.get(path) ?? DEFAULT_IMAGE_VIEW;
+
+function formatBytes(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    const [amount, unit] = bytes < 1024 * 1024 ? [bytes / 1024, "KB"] : [bytes / (1024 * 1024), "MB"];
+    return `${amount < 10 ? amount.toFixed(1) : Math.round(amount)} ${unit}`;
+}
+
+function imageMeta(entry: Extract<ImageEntry, { status: "ready" }>): string {
+    const size = formatBytes(entry.size);
+    return entry.width && entry.height ? `${entry.width} × ${entry.height} px · ${size}` : size;
+}
+
+function revokeImageUrl(entry: ImageEntry | undefined): void {
+    if (entry?.status === "ready" && entry.url.startsWith("blob:")) URL.revokeObjectURL(entry.url);
+}
+
+function pruneImages(snapshot: Snapshot | null): void {
+    const referenced = new Set(snapshot?.files.flatMap((file) => IMAGE_SIDES.map((side) => file.imageSides?.[side] ?? "")));
+    for (const [oid, entry] of state.images) {
+        // A failed image is retried in the next revision, since Refresh may have made its bytes readable again.
+        if (referenced.has(oid) && entry.status !== "failed") continue;
+        revokeImageUrl(entry);
+        state.images.delete(oid);
+    }
+}
+
+function readDataUrl(blob: Blob): Promise<string> {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => typeof reader.result === "string" ? resolve(reader.result) : reject(new Error("Unreadable image."));
+        reader.onerror = () => reject(reader.error ?? new Error("Unreadable image."));
+        reader.readAsDataURL(blob);
     });
-    return figures.length ? `<div class="image-diff">${figures.join("")}</div>` : "";
+}
+
+async function loadImage(path: string, side: DiffSide, oid: string): Promise<void> {
+    const revisionId = state.snapshot?.revisionId;
+    const reviewId = state.review?.reviewId;
+    if (!revisionId || !reviewId || state.images.has(oid)) return;
+    const loading: ImageEntry = { status: "loading" };
+    state.images.set(oid, loading);
+    let loaded: ImageEntry = { status: "failed" };
+    try {
+        const query = new URLSearchParams({ review: reviewId, path, side });
+        const response = await fetch(`/api/diff-image/${encodeURIComponent(revisionId)}?${query}`, { headers: { "X-MR-Token": TOKEN } });
+        if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+        const blob = await response.blob();
+        // A same-origin blob: SVG opened in its own tab would run scripts as this page; a data: URL has an opaque origin.
+        const url = blob.type === "image/svg+xml" ? await readDataUrl(blob) : URL.createObjectURL(blob);
+        loaded = { status: "ready", url, width: 0, height: 0, size: blob.size };
+        const image = new Image();
+        image.src = url;
+        await image.decode();
+        loaded = { ...loaded, width: image.naturalWidth, height: image.naturalHeight };
+    } catch {
+        revokeImageUrl(loaded);
+        loaded = { status: "failed" };
+    }
+    // The review or revision moved on while this image loaded.
+    if (state.images.get(oid) !== loading) {
+        revokeImageUrl(loaded);
+        return;
+    }
+    state.images.set(oid, loaded);
+    repaintImageDiffs((file) => IMAGE_SIDES.some((s) => file.imageSides?.[s] === oid));
+}
+
+function requestImages(block: Element): void {
+    const path = block instanceof HTMLElement ? block.dataset.imagePath ?? "" : "";
+    const file = fileOf(path);
+    for (const side of IMAGE_SIDES) {
+        const oid = file?.imageSides?.[side];
+        if (oid) void loadImage(path, side, oid);
+    }
+}
+
+// Rendered markup carries only object IDs; decoded URLs are attached afterwards, and missing images load as they near the viewport.
+function paintImageDiffs(): void {
+    for (const img of Array.from(document.querySelectorAll<HTMLImageElement>("img[data-image-oid]"))) {
+        const entry = state.images.get(img.dataset.imageOid ?? "");
+        if (entry?.status === "ready" && img.getAttribute("src") !== entry.url) img.src = entry.url;
+    }
+    imageObserver?.disconnect();
+    const pending = Array.from(document.querySelectorAll<HTMLElement>(".image-diff[data-image-pending]"));
+    if (!pending.length) return;
+    if (typeof IntersectionObserver !== "function") {
+        pending.forEach(requestImages);
+        return;
+    }
+    imageObserver ??= new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+            if (!entry.isIntersecting) continue;
+            imageObserver?.unobserve(entry.target);
+            requestImages(entry.target);
+        }
+    }, { root: $("#main"), rootMargin: IMAGE_PREFETCH_MARGIN });
+    for (const block of pending) imageObserver.observe(block);
+}
+
+function repaintImageDiffs(affects: (file: DiffFile) => boolean): void {
+    let repainted = false;
+    for (const block of Array.from(document.querySelectorAll<HTMLElement>(".image-diff[data-image-path]"))) {
+        const file = fileOf(block.dataset.imagePath);
+        if (!file || !affects(file)) continue;
+        block.outerHTML = imageDiffHtml(file);
+        repainted = true;
+    }
+    paintImageDiffs();
+    if (repainted) renderRuler();
+}
+
+function imageDiffHtml(file: DiffFile): string {
+    const sides = IMAGE_SIDES.filter((side) => file.imageSides?.[side]);
+    if (!state.snapshot || !state.review || !sides.length) return "";
+    const path = esc(file.path);
+    const oidOf = (side: DiffSide) => file.imageSides?.[side] ?? "";
+    const entryOf = (side: DiffSide) => state.images.get(oidOf(side));
+    const entries = sides.map(entryOf);
+    const attrs = `class="image-diff" data-image-path="${path}"${entries.some((entry) => !entry) ? " data-image-pending" : ""}`;
+    if (entries.every((entry) => entry?.status === "failed")) {
+        const message = file.binary ? `${file.note ?? "Binary file not shown."} ${IMAGE_UNAVAILABLE}` : IMAGE_UNAVAILABLE;
+        return `<div ${attrs}><div class="card muted">${esc(message)}</div></div>`;
+    }
+    const image = (side: DiffSide, style = "") => {
+        const name = side === "old" ? file.oldPath ?? file.path : file.path;
+        return `<img data-image-oid="${esc(oidOf(side))}" alt="${esc(`${IMAGE_SIDE_LABELS[side]}: ${name}`)}"${style}>`;
+    };
+    const before = entryOf("old");
+    const after = entryOf("new");
+    const comparable = before?.status === "ready" && after?.status === "ready" && oidOf("old") !== oidOf("new")
+        && before.width > 0 && before.height > 0 && after.width > 0 && after.height > 0;
+    const view = imageView(file.path);
+    const mode = comparable ? view.mode : "2-up";
+    const modes = comparable
+        ? `<span class="seg image-modes" role="group" aria-label="Image comparison">${IMAGE_MODES.map((m) =>
+            `<button type="button" data-action="image-mode" data-path="${path}" data-mode="${m}" aria-pressed="${m === mode}">${IMAGE_MODE_LABELS[m]}</button>`).join("")}</span>`
+        : "";
+    if (!comparable || mode === "2-up") {
+        const figures = sides.map((side) => {
+            const entry = entryOf(side);
+            const body = entry?.status === "ready" ? image(side)
+                : `<p class="muted">${entry?.status === "failed" ? esc(IMAGE_UNAVAILABLE) : "Loading preview…"}</p>`;
+            const meta = entry?.status === "ready" ? ` <span class="image-meta">${esc(imageMeta(entry))}</span>` : "";
+            return `<figure><figcaption class="${side}">${IMAGE_SIDE_LABELS[side]}${meta}</figcaption><div class="image-stage">${body}</div></figure>`;
+        });
+        return `<div ${attrs}>${modes}<div class="image-sides">${figures.join("")}</div></div>`;
+    }
+    // Both layers share one stage sized to the larger image, so pixels at the same position line up.
+    const width = Math.max(before.width, after.width);
+    const height = Math.max(before.height, after.height);
+    const layer = (side: DiffSide, entry: Extract<ImageEntry, { status: "ready" }>) =>
+        `<div class="image-layer ${side}">${image(side, ` style="width:${(entry.width / width) * 100}%"`)}</div>`;
+    const stage = `--split:${view.split}%;--opacity:${view.opacity};aspect-ratio:${width} / ${height};width:min(100%, ${width}px, calc(50vh * ${width} / ${height}))`;
+    const swipe = mode === "swipe"
+        ? `<div class="image-divider" aria-hidden="true"></div><input type="range" class="image-swipe" min="0" max="100" value="${view.split}" aria-label="Swipe position: Before shows left of the divider, After right of it" data-image-control="split" data-path="${path}">`
+        : "";
+    const onion = mode === "onion"
+        ? `<label class="image-opacity"><span>Before</span><input type="range" min="0" max="100" value="${view.opacity}" aria-label="After image opacity" data-image-control="opacity" data-path="${path}"><span>After</span></label>`
+        : "";
+    const legend = `<div class="image-legend">${IMAGE_SIDES.map((side) =>
+        `<span><span class="image-side-label ${side}">${IMAGE_SIDE_LABELS[side]}</span> ${esc(imageMeta(side === "old" ? before : after))}</span>`).join("")}</div>`;
+    return `<div ${attrs}>${modes}<div class="image-compare ${mode}" style="${stage}">${layer("old", before)}${layer("new", after)}${swipe}</div>${onion}${legend}</div>`;
 }
 
 function fileView(file: DiffFile, { stacked = false, folded = false }: { stacked?: boolean; folded?: boolean } = {}): string {
@@ -2791,7 +2972,10 @@ function fileView(file: DiffFile, { stacked = false, folded = false }: { stacked
         html.push(`<div class="thread">${composerHtml(fileKey, { kind: "file", path: file.path, label: `Comment on ${file.path}`, alwaysOpen: true })}</div>`);
     }
     if (file.binary) html.push(imageDiffHtml(file) || `<div class="card muted">${esc(file.note ?? "Binary file not shown.")}</div>`);
-    if (!file.binary && !file.hunks.length) html.push(`<div class="card muted">No textual changes (mode or rename only).</div>`, imageDiffHtml(file));
+    else {
+        if (!file.hunks.length) html.push(`<div class="card muted">No textual changes (mode or rename only).</div>`);
+        html.push(imageDiffHtml(file));
+    }
     if (!stacked && !file.full && needsContent(file)) {
         const entry = contentEntry(file);
         const why = entry.status === "unavailable"
@@ -3143,6 +3327,15 @@ async function onClick(e: MouseEvent): Promise<void> {
                 document.querySelector<HTMLElement>(`.file-section[data-file="${CSS.escape(path)}"]`)?.scrollIntoView({ block: "nearest" });
                 break;
             }
+            case "image-mode": {
+                const path = value("path");
+                const mode = IMAGE_MODES.find((m) => m === value("mode"));
+                if (!mode) break;
+                state.imageViews.set(path, { ...imageView(path), mode });
+                repaintImageDiffs((file) => file.path === path);
+                document.querySelector<HTMLElement>(`.image-diff[data-image-path="${CSS.escape(path)}"] [data-action="image-mode"][data-mode="${mode}"]`)?.focus();
+                break;
+            }
             case "fold-all":
                 for (const f of filesUnder(state.view.type === "folder" ? state.view.path : "")) state.fileFold.set(f.path, value("fold") === "1");
                 render();
@@ -3437,6 +3630,16 @@ function onInput(e: Event): void {
             return;
         }
     }
+    const control = el.dataset?.imageControl;
+    if (control === "split" || control === "opacity") {
+        const path = el.dataset.path ?? "";
+        const amount = Math.min(100, Math.max(0, Number(el.value) || 0));
+        const view = { ...imageView(path) };
+        view[control] = amount;
+        state.imageViews.set(path, view);
+        el.closest(".image-diff")?.querySelector<HTMLElement>(".image-compare")?.style.setProperty(`--${control}`, control === "split" ? `${amount}%` : String(amount));
+        return;
+    }
     const candidate = el.closest?.<HTMLElement>("[data-lesson-form]");
     const form = candidate?.dataset?.lessonForm ? candidate : null;
     if (form) {
@@ -3693,15 +3896,6 @@ function onMouseUp(): void {
 
 // ---------- Boot ----------
 
-document.addEventListener("error", (event) => {
-    const image = event.target;
-    if (image instanceof HTMLImageElement && image.closest(".image-diff")) {
-        const message = document.createElement("p");
-        message.className = "muted";
-        message.textContent = "Preview unavailable. The image may have changed since this revision, be unsupported, or exceed 2 MB. Refresh to compare the latest version.";
-        image.replaceWith(message);
-    }
-}, true);
 document.addEventListener("click", onClick);
 document.addEventListener("auxclick", (e) => {
     if (e.button === 1) void onClick(e);

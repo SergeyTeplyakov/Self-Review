@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { resolveObjectURL } from "node:buffer";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
 import { parseUnifiedDiff } from "./modules.mjs";
@@ -3066,4 +3067,187 @@ test("Send now, Discard, Submit review and the delivery question call the server
     assert.deepEqual(toast(), ["Sending each comment now, but 2 waiting drafts could not be sent: session closed", true]);
     replies.set("/api/delivery", jsonResponse({ mode: null, submitted: 0 }));
     assert.deepEqual(await act("delivery-reask"), ['POST /api/delivery {"mode":null}', "GET /api/state"]);
+});
+
+const OLD_IMAGE = "1".repeat(40);
+const NEW_IMAGE = "2".repeat(40);
+const IMAGE_PATH = "art/logo.png";
+type ImageFile = ReturnType<typeof parseUnifiedDiff>[number];
+type LoadImage = (path: string, side: "old" | "new", oid: string) => Promise<void>;
+
+async function imageReviewApp(globals: Record<string, unknown> = {}) {
+    const app = await loadApp({ CSS: { escape: (value: string) => value }, ...globals });
+    const [file] = parseUnifiedDiff(`diff --git a/${IMAGE_PATH} b/${IMAGE_PATH}\nindex ${OLD_IMAGE}..${NEW_IMAGE} 100644\nBinary files a/${IMAGE_PATH} and b/${IMAGE_PATH} differ\n`);
+    app.state.review = reviewFixture();
+    app.state.snapshot = { revisionId: "r1", files: [file] };
+    return { app, file };
+}
+
+const setImage = (app: LoadedApp, oid: string, entry: Record<string, unknown>) =>
+    app.run(`state.images.set(${JSON.stringify(oid)}, ${JSON.stringify(entry)})`);
+const imageHtml = (app: LoadedApp, file: ImageFile) => app.run(`imageDiffHtml(${JSON.stringify(file)})`);
+const readyImage = (width: number, height: number, size: number, url = "blob:image") => ({ status: "ready", url, width, height, size });
+
+test("image previews show loading, size metadata and per-side fallbacks, offering comparison modes only for two different decoded images", async () => {
+    const { app, file } = await imageReviewApp();
+    assert.deepEqual(file.imageSides, { old: OLD_IMAGE, new: NEW_IMAGE });
+    assert.deepEqual(app.read("[1023, 1024, 10 * 1024, 1.5 * 1024 * 1024].map(formatBytes)"), ["1023 B", "1.0 KB", "10 KB", "1.5 MB"]);
+
+    let html = imageHtml(app, file);
+    assert.match(html, /^<div class="image-diff" data-image-path="art\/logo.png" data-image-pending>/, "unloaded sides ask to be fetched near the viewport");
+    assert.equal(html.match(/Loading preview…/g)?.length, 2);
+    assert.doesNotMatch(html, /image-modes|<img/);
+
+    setImage(app, OLD_IMAGE, readyImage(640, 480, 2048));
+    setImage(app, NEW_IMAGE, { status: "failed" });
+    html = imageHtml(app, file);
+    assert.doesNotMatch(html, /data-image-pending|image-modes/);
+    assert.match(html, /<figcaption class="old">Before <span class="image-meta">640 × 480 px · 2\.0 KB<\/span><\/figcaption><div class="image-stage"><img data-image-oid="1{40}" alt="Before: art\/logo.png"><\/div>/);
+    assert.match(html, /<figcaption class="new">After<\/figcaption><div class="image-stage"><p class="muted">Preview unavailable: /);
+
+    setImage(app, OLD_IMAGE, { status: "failed" });
+    assert.match(imageHtml(app, file), /<div class="card muted">Binary file not shown\. Preview unavailable: /, "an unreadable image falls back to the binary message");
+
+    setImage(app, OLD_IMAGE, readyImage(640, 480, 2048));
+    setImage(app, NEW_IMAGE, readyImage(800, 600, 3 * 1024 * 1024));
+    html = imageHtml(app, file);
+    assert.match(html, /After <span class="image-meta">800 × 600 px · 3\.0 MB<\/span>/);
+    assert.deepEqual([...html.matchAll(/data-mode="([^"]+)" aria-pressed="(true|false)">([^<]+)</g)].map((match) => match.slice(1)),
+        [["2-up", "true", "2-up"], ["swipe", "false", "Swipe"], ["onion", "false", "Onion skin"]]);
+
+    assert.doesNotMatch(imageHtml(app, { ...file, imageSides: { old: NEW_IMAGE, new: NEW_IMAGE } }), /image-modes/, "identical bytes have nothing to compare");
+    html = imageHtml(app, { ...file, status: "added", oldPath: null, imageSides: { new: NEW_IMAGE } });
+    assert.equal(html.match(/<figure>/g)?.length, 1);
+    assert.doesNotMatch(html, /image-modes|Before/);
+    setImage(app, NEW_IMAGE, readyImage(0, 0, 512));
+    html = imageHtml(app, file);
+    assert.match(html, /After <span class="image-meta">512 B<\/span>/, "an image without intrinsic dimensions reports only its size");
+    assert.doesNotMatch(html, /image-modes/);
+});
+
+test("swipe and onion skin stack both images on a stage sized to the larger one, and their sliders update the view in place", async () => {
+    const { app, file } = await imageReviewApp();
+    const click = clicker(app);
+    setImage(app, OLD_IMAGE, readyImage(400, 200, 100));
+    setImage(app, NEW_IMAGE, readyImage(800, 400, 100));
+    await click("image-mode", { path: IMAGE_PATH, mode: "swipe" });
+    assert.deepEqual(app.read(`state.imageViews.get("${IMAGE_PATH}")`), { mode: "swipe", split: 50, opacity: 50 });
+    assert.ok(app.focused.includes(`.image-diff[data-image-path="${IMAGE_PATH}"] [data-action="image-mode"][data-mode="swipe"]`), "the pressed mode keeps focus");
+    let html = imageHtml(app, file);
+    assert.match(html, /aria-pressed="true">Swipe</);
+    assert.match(html, /<div class="image-compare swipe" style="--split:50%;--opacity:50;aspect-ratio:800 \/ 400;width:min\(100%, 800px, calc\(50vh \* 800 \/ 400\)\)">/);
+    assert.match(html, /<div class="image-layer old"><img data-image-oid="1{40}" alt="Before: art\/logo.png" style="width:50%"><\/div><div class="image-layer new"><img data-image-oid="2{40}" alt="After: art\/logo.png" style="width:100%"><\/div>/);
+    assert.match(html, /<input type="range" class="image-swipe" min="0" max="100" value="50" aria-label="[^"]+" data-image-control="split" data-path="art\/logo.png">/);
+    assert.match(html, /Before<\/span> 400 × 200 px · 100 B<\/span><span><span class="image-side-label new">After<\/span> 800 × 400 px · 100 B/);
+    assert.doesNotMatch(html, /image-sides|data-image-control="opacity"/);
+
+    const properties: [string, string][] = [];
+    const stage = Object.assign(new MockElement(), { style: { setProperty: (name: string, value: string) => properties.push([name, value]) } });
+    const slide = (control: string, value: string) => {
+        const input = Object.assign(new MockElement("INPUT"), { value, dataset: { imageControl: control, path: IMAGE_PATH } });
+        input.closest = () => Object.assign(new MockElement(), { querySelector: () => stage });
+        return app.run("onInput")({ target: input });
+    };
+    slide("split", "120");
+    slide("split", "-5");
+    assert.deepEqual(properties, [["--split", "100%"], ["--split", "0%"]], "dragging restyles the stage without re-rendering it");
+    assert.equal(app.read(`state.imageViews.get("${IMAGE_PATH}").split`), 0);
+
+    await click("image-mode", { path: IMAGE_PATH, mode: "onion" });
+    slide("opacity", "25");
+    assert.deepEqual(properties.at(-1), ["--opacity", "25"]);
+    html = imageHtml(app, file);
+    assert.match(html, /<div class="image-compare onion" style="--split:0%;--opacity:25;/);
+    assert.match(html, /<input type="range" min="0" max="100" value="25" aria-label="After image opacity" data-image-control="opacity"/);
+    assert.doesNotMatch(html, /image-swipe/);
+    await click("image-mode", { path: IMAGE_PATH, mode: "unknown" });
+    assert.deepEqual(app.read(`state.imageViews.get("${IMAGE_PATH}")`), { mode: "onion", split: 0, opacity: 25 });
+});
+
+test("an SVG keeps its textual diff below the preview and falls back to its source when the preview is unavailable", async () => {
+    const { app } = await imageReviewApp();
+    const [svg] = parseUnifiedDiff(`diff --git a/art/icon.svg b/art/icon.svg\nnew file mode 100644\nindex 0000000..${NEW_IMAGE}\n--- /dev/null\n+++ b/art/icon.svg\n@@ -0,0 +1 @@\n+<svg xmlns="http://www.w3.org/2000/svg"/>\n`);
+    svg.imageSides = { new: NEW_IMAGE };
+    app.state.snapshot = { revisionId: "r1", files: [svg] };
+    app.state.files = [svg];
+    let html = app.run(`fileView(${JSON.stringify(svg)}, { stacked: true })`);
+    assert.ok(html.includes('class="image-diff"') && html.indexOf('class="image-diff"') < html.indexOf('<tr class="row '), "the preview precedes the source diff");
+    setImage(app, NEW_IMAGE, { status: "failed" });
+    html = app.run(`fileView(${JSON.stringify(svg)}, { stacked: true })`);
+    assert.match(html, /<div class="card muted">Preview unavailable: /);
+    assert.doesNotMatch(html, /Binary file not shown/);
+    assert.match(html, /<tr class="row /);
+});
+
+test("images load as data: URLs for SVG and revocable blob: URLs otherwise, failing closed and pruning stale entries", async () => {
+    const requests: string[] = [];
+    const bodies: Record<string, Blob> = {
+        "art/icon.svg": new Blob(['<svg xmlns="http://www.w3.org/2000/svg"/>'], { type: "image/svg+xml" }),
+        [IMAGE_PATH]: new Blob([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], { type: "image/png" }),
+    };
+    let decodeFails = false;
+    class FakeImage {
+        src = "";
+        naturalWidth = 0;
+        naturalHeight = 0;
+        async decode() {
+            if (decodeFails) throw new Error("EncodingError");
+            [this.naturalWidth, this.naturalHeight] = [24, 12];
+        }
+    }
+    class FakeFileReader {
+        result: string | null = null;
+        error: Error | null = null;
+        onload: (() => void) | null = null;
+        onerror: (() => void) | null = null;
+        readAsDataURL(blob: Blob) {
+            void blob.arrayBuffer().then((bytes) => {
+                this.result = `data:${blob.type};base64,${Buffer.from(bytes).toString("base64")}`;
+                this.onload?.();
+            });
+        }
+    }
+    const fetch = async (url: string) => {
+        requests.push(url);
+        const body = bodies[new URLSearchParams(url.split("?")[1]).get("path") ?? ""];
+        return body ? { ok: true, blob: async () => body } : { ok: false, status: 404, statusText: "Not Found" };
+    };
+    const { app } = await imageReviewApp({ fetch, Image: FakeImage, FileReader: FakeFileReader });
+    const loadImage = app.run<LoadImage>("loadImage");
+    const SVG_IMAGE = "3".repeat(40);
+    const BROKEN_IMAGE = "4".repeat(40);
+
+    await loadImage("art/icon.svg", "new", SVG_IMAGE);
+    assert.equal(requests[0], "/api/diff-image/r1?review=r&path=art%2Ficon.svg&side=new");
+    const svgUrl = `data:image/svg+xml;base64,${Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>').toString("base64")}`;
+    assert.deepEqual(app.read(`state.images.get("${SVG_IMAGE}")`), readyImage(24, 12, bodies["art/icon.svg"].size, svgUrl), "SVG never gets a same-origin URL");
+
+    await loadImage(IMAGE_PATH, "new", NEW_IMAGE);
+    const pngUrl = app.read<{ url: string }>(`state.images.get("${NEW_IMAGE}")`).url;
+    assert.match(pngUrl, /^blob:/);
+    assert.ok(resolveObjectURL(pngUrl));
+    await loadImage(IMAGE_PATH, "new", NEW_IMAGE);
+    assert.equal(requests.length, 2, "a cached object ID is not fetched again");
+
+    await loadImage("missing.png", "old", OLD_IMAGE);
+    assert.deepEqual(app.read(`state.images.get("${OLD_IMAGE}")`), { status: "failed" });
+    decodeFails = true;
+    await loadImage(IMAGE_PATH, "old", BROKEN_IMAGE);
+    assert.deepEqual(app.read(`state.images.get("${BROKEN_IMAGE}")`), { status: "failed" });
+
+    // The next revision references the SVG, the PNG and the image that failed; only decoded images it still shows survive.
+    app.run(`pruneImages({ files: [{ imageSides: { old: "${OLD_IMAGE}", new: "${SVG_IMAGE}" } }] })`);
+    assert.deepEqual(app.read("[...state.images.keys()]"), [SVG_IMAGE], "failed images retry after Refresh");
+    assert.equal(resolveObjectURL(pngUrl), undefined, "an image no longer shown releases its blob URL");
+
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const slow = await imageReviewApp({ fetch: async (url: string) => { await gate; return fetch(url); }, Image: FakeImage });
+    decodeFails = false;
+    const pending = slow.app.run<LoadImage>("loadImage")(IMAGE_PATH, "new", NEW_IMAGE);
+    assert.deepEqual(slow.app.read(`state.images.get("${NEW_IMAGE}")`), { status: "loading" });
+    slow.app.run("pruneImages(null)");
+    release();
+    await pending;
+    assert.equal(slow.app.read(`state.images.has("${NEW_IMAGE}")`), false, "a load that finishes after its review moved on is discarded");
 });

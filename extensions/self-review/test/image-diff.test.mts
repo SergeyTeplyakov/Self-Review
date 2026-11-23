@@ -5,7 +5,7 @@ import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { Delivery, ReviewService, Store, readGitBlobPrefixes, runGit, startReviewServer } from "./modules.mjs";
+import { Delivery, ReviewService, Store, SVG_PROLOG_BYTES, diffImageType, isSvg, readGitBlobPrefixes, runGit, startReviewServer } from "./modules.mjs";
 
 test("image requests serve only the selected side, review and revision", async (t) => {
     const tmp = await mkdtemp(path.join(os.tmpdir(), "image-diff-test-"));
@@ -265,6 +265,108 @@ test("an image Git diffs as text that replaces a symlink previews beside the lin
     assert.deepEqual(Object.keys(file.imageSides ?? {}), ["new"]);
     assert.deepEqual(file.hunks.flatMap((hunk) => hunk.rows).map((row) => [row.t, row.s]), [["del", "target.jpg"]], "the link's change stays");
     assert.deepEqual((await service.getDiffImage(review, "r1", "photo.jpg", "new")).bytes, jpeg("photo"));
+});
+
+test("SVG is recognized by its root element after any prolog, and only within the prolog limit", () => {
+    const root = '<svg xmlns="http://www.w3.org/2000/svg"/>';
+    for (const text of [root, "<svg>", `\uFEFF \t${root}`,
+        `<?xml version="1.0"?>\r\n<!-- a > b -->\n<!DOCTYPE svg [ <!ENTITY a "x>y"> ]>\n${root}`,
+        `<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">${root}`]) {
+        assert.equal(diffImageType(Buffer.from(text)), "svg", text);
+    }
+    for (const text of ["", "<svgx/>", "text <svg/>", "<html><svg/></html>", "<?xml", "<!-- unclosed <svg/>", "<!DOCTYPE svg [ <svg/>",
+        `<!--${"x".repeat(SVG_PROLOG_BYTES)}--><svg/>`]) {
+        assert.equal(isSvg(Buffer.from(text)), false, text.slice(0, 40));
+    }
+    assert.equal(diffImageType(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0, 1])), "png");
+});
+
+test("SVG changes keep their text diff beside sandboxed previews, and renamed images preview their old path", async (t) => {
+    const tmp = await mkdtemp(path.join(os.tmpdir(), "image-diff-test-"));
+    t.after(() => rm(tmp, { recursive: true, force: true }));
+    const repo = path.join(tmp, "repo");
+    await mkdir(repo);
+    const git = (...args: string[]) => runGit(repo, ["-c", "user.name=test", "-c", "user.email=test@example.invalid",
+        "-c", "commit.gpgsign=false", ...args]);
+    const put = (name: string, bytes: Buffer | string) => writeFile(path.join(repo, name), bytes);
+    // Unchanged lines keep a changed SVG similar enough for Git to detect its rename.
+    const svg = (fill: string, eol = "\n") => Buffer.from([`<?xml version="1.0"?>`, `<!-- generated > by hand -->`,
+        `<svg xmlns="http://www.w3.org/2000/svg" width="4" height="4">`,
+        ...Array.from({ length: 12 }, (_, i) => `<desc>unchanged line ${i}</desc>`),
+        `<rect width="4" height="4" fill="${fill}"/>`, `</svg>`, ""].join(eol));
+    const raster = (last: number) => Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), Buffer.alloc(2000), Buffer.from([last])]);
+    const lfsPointer = (digit: number) => `version https://git-lfs.github.com/spec/v1\noid sha256:${String(digit).repeat(64)}\nsize ${digit}\n`;
+    await git("init", "-q", "-b", "main");
+    await put(".gitattributes", "crlf.svg text eol=crlf\n");
+    await put("icon.svg", svg("red"));
+    await put("logo.svg", svg("green"));
+    await put("pointer.svg", lfsPointer(1));
+    await put("crlf.svg", svg("blue", "\r\n"));
+    await put("photo.png", raster(1));
+    await git("add", ".");
+    await git("commit", "-qm", "base");
+    await put("icon.svg", svg("orange"));
+    await git("mv", "logo.svg", "brand.svg");
+    await put("brand.svg", svg("lime"));
+    await git("mv", "photo.png", "picture.png");
+    await put("picture.png", raster(2));
+    await git("add", "brand.svg", "picture.png");
+    await put("pointer.svg", lfsPointer(2));
+    await put("crlf.svg", svg("black", "\r\n"));
+    await put("new.svg", svg("white"));
+
+    const service = new ReviewService({ store: new Store(path.join(tmp, "reviews")) });
+    const review = await service.ensureReview({ repoPath: repo, base: "main", scope: "pending" });
+    const { files } = await service.getSnapshot(review);
+    const fileNamed = (name: string) => {
+        const file = files.find((entry) => entry.path === name);
+        assert.ok(file, name);
+        return file;
+    };
+    for (const name of ["icon.svg", "brand.svg", "crlf.svg", "new.svg"]) {
+        const file = fileNamed(name);
+        assert.equal(file.binary, false, name);
+        assert.ok(file.hunks.length, `${name} keeps its text diff`);
+        assert.deepEqual(Object.keys(file.imageSides ?? {}).sort(), name === "new.svg" ? ["new"] : ["new", "old"], name);
+    }
+    assert.equal(fileNamed("new.svg").untracked, true);
+    for (const [name, oldPath] of [["brand.svg", "logo.svg"], ["picture.png", "photo.png"]]) {
+        assert.equal(fileNamed(name).status, "renamed", `Git must detect the ${oldPath} rename`);
+        assert.equal(fileNamed(name).oldPath, oldPath);
+    }
+    assert.equal(fileNamed("picture.png").binary, true);
+    assert.equal(fileNamed("pointer.svg").imageSides, undefined, "an LFS pointer named like an SVG is not an image");
+
+    const server = await startReviewServer({
+        service, delivery: new Delivery({ service, send: async () => { throw new Error("Unexpected delivery"); } }),
+        instanceId: "svg-images", getReviewId: () => review,
+        webRoot: fileURLToPath(new URL("../dist/web/", import.meta.url)),
+    });
+    try {
+        const expectImage = async (name: string, side: string, type: string, expected: Buffer) => {
+            const url = new URL(server.url);
+            url.pathname = "/api/diff-image/r1";
+            url.searchParams.set("review", review);
+            url.searchParams.set("side", side);
+            url.searchParams.set("path", name);
+            const res = await fetch(url);
+            assert.equal(res.status, 200, `${name} ${side}`);
+            assert.equal(res.headers.get("Content-Type"), type);
+            assert.match(res.headers.get("Content-Security-Policy") ?? "", /default-src 'none'.*; sandbox$/);
+            assert.deepEqual(Buffer.from(await res.arrayBuffer()), expected, `${name} ${side}`);
+        };
+        await expectImage("icon.svg", "old", "image/svg+xml", svg("red"));
+        await expectImage("icon.svg", "new", "image/svg+xml", svg("orange"));
+        await expectImage("brand.svg", "old", "image/svg+xml", svg("green"));
+        await expectImage("brand.svg", "new", "image/svg+xml", svg("lime"));
+        // Git hashes this file after converting its line endings; serve the bytes on disk.
+        await expectImage("crlf.svg", "new", "image/svg+xml", svg("black", "\r\n"));
+        await expectImage("new.svg", "new", "image/svg+xml", svg("white"));
+        await expectImage("picture.png", "old", "image/png", raster(1));
+        await expectImage("picture.png", "new", "image/png", raster(2));
+    } finally {
+        await server.close();
+    }
 });
 
 test("blob prefixes keep only the start of each wanted blob, across stream chunks", async (t) => {
