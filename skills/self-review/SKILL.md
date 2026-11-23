@@ -219,8 +219,10 @@ the rest.
    the verification outcome, or the reason work is blocked or disputed. Include
    the wording and scope of any proposed or refined guideline. If thread reply delivery fails, say so
    in chat; do not imply the reply was saved.
-7. Refresh the review to a new revision after edits. Retain the comment history
-   and original anchors; do not silently attach an old comment to different code.
+7. After edits, read the review to confirm the panel picked them up; open panels
+   refresh themselves, so use manual Refresh only if watching failed or the
+   revision is stale. Retain the comment history and original anchors; do not
+   silently attach an old comment to different code.
 8. Honor the user's resolution preference. When they delegate resolution (including
    a standing personal instruction), resolve after replying and verifying that
    the request is addressed. Leave unanswered, blocked, disputed, or
