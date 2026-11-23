@@ -407,7 +407,7 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
             }
             const mode = await service.setDeliveryChoice(reviewId, body.mode);
             // Choosing immediate sends whatever was held while the review was undecided.
-            const result = mode === "immediate" ? await delivery.submit(reviewId, instanceId) : { submitted: 0 };
+            const result = mode === "immediate" ? await delivery.submit(reviewId, instanceId, "immediate") : { submitted: 0 };
             return send(res, 200, { mode, submitted: result.submitted, ...("error" in result && result.error ? { error: result.error } : {}) });
         }
         if (parts[0] === "refresh" && parts.length === 1) {

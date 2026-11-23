@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { buildBatchPrompt, buildCommentPrompt } from "./prompt.mjs";
 import { readCommentImage } from "./comment-images.mjs";
+import { resolveDelivery } from "./settings.mjs";
 import { ParallelComments } from "./parallel-comments.mjs";
 const errorMessage = (error) => String(error && typeof error === "object" && "message" in error ? error.message ?? error : error);
 // Also accepts markers written before the rename to Self Review Canvas, so in-flight replies still match.
@@ -18,7 +19,7 @@ export class Delivery extends EventEmitter {
     sessionId;
     fallbackOwner;
     parallel;
-    commentConcurrency;
+    settings;
     busy;
     bySessionMessageId;
     seenSessionMessageIds;
@@ -34,7 +35,7 @@ export class Delivery extends EventEmitter {
      * @param {(repoRoot: string) => Promise<boolean>} [p.autoSaveLearnedRules]
      * @param {() => string | undefined} [p.sessionId] conversation that processes the comments this instance sends
      */
-    constructor({ service, send, log = () => { }, reviewIds = () => [], autoSaveLearnedRules = async () => false, sessionId = () => undefined, commentConcurrency = async () => 1 }) {
+    constructor({ service, send, log = () => { }, reviewIds = () => [], autoSaveLearnedRules = async () => false, sessionId = () => undefined, settings }) {
         super();
         this.service = service;
         this.send = send;
@@ -43,7 +44,7 @@ export class Delivery extends EventEmitter {
         this.autoSaveLearnedRules = autoSaveLearnedRules;
         this.sessionId = sessionId;
         this.fallbackOwner = `delivery-${randomUUID()}`;
-        this.commentConcurrency = commentConcurrency;
+        this.settings = settings;
         this.parallel = new ParallelComments(service, send, () => this.owner(), root => this.repoLearning(root));
         this.busy = null;
         this.bySessionMessageId = new Map();
@@ -68,15 +69,15 @@ export class Delivery extends EventEmitter {
         const claim = await this.service.claimDelivery(reviewId, threadId, messageId, { retry, senderSessionId: this.owner() });
         if (!claim)
             return { delivered: false, skipped: true };
-        return this.sendClaimed(reviewId, [{ threadId, messageId, ...claim }], instanceId);
+        return this.sendClaimed(reviewId, [{ threadId, messageId, ...claim }], instanceId, "immediate");
     }
-    // Sends every draft of a review as one prompt; drafts are claimed atomically so a review is submitted once.
-    async submit(reviewId, instanceId) {
+    // Explicit submissions stay together; choosing immediate can release held drafts to parallel workers.
+    async submit(reviewId, instanceId, mode = "combined") {
         this.touched.add(reviewId);
         const claims = await this.service.claimDrafts(reviewId, { senderSessionId: this.owner() });
         if (!claims.length)
             return { submitted: 0, delivered: false };
-        const result = await this.sendClaimed(reviewId, claims, instanceId);
+        const result = await this.sendClaimed(reviewId, claims, instanceId, mode);
         return { submitted: claims.length, ...result };
     }
     async repoLearning(repoRoot) {
@@ -89,13 +90,17 @@ export class Delivery extends EventEmitter {
         }
     }
     // Builds and sends the prompt for claimed messages: one comment uses the single-comment prompt, more use the batch prompt.
-    async sendClaimed(reviewId, claims, instanceId) {
+    async sendClaimed(reviewId, claims, instanceId, mode) {
         let sessionMessageId;
         try {
-            const { repoRoot } = await this.service.getReview(reviewId);
-            const concurrency = await this.commentConcurrency(repoRoot);
-            if (concurrency > 1)
-                return await this.parallel.enqueue(reviewId, instanceId, claims, concurrency);
+            if (mode === "immediate" && this.settings) {
+                const review = await this.service.getReview(reviewId);
+                const settings = await this.settings.get(review.repoRoot);
+                const limit = settings.commentConcurrency ?? 1;
+                if (limit > 1 && resolveDelivery(settings.delivery, review) === "immediate") {
+                    return await this.parallel.enqueue(reviewId, instanceId, claims, limit);
+                }
+            }
             const threadIds = [...new Set(claims.map((c) => c.threadId))];
             const contexts = [];
             for (const threadId of threadIds)

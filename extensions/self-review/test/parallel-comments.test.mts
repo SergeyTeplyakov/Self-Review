@@ -25,7 +25,7 @@ async function fixture(t: TestContext, limit: number | null = 2) {
     const reviewId = await service.ensureReview({ repoPath: root, scope: "pending" });
     const sent: SendOptions[] = [];
     const delivery = new Delivery({
-        service, commentConcurrency: async repoRoot => (await settings.get(repoRoot)).commentConcurrency ?? 1,
+        service, settings,
         autoSaveLearnedRules: async repoRoot => (await settings.get(repoRoot)).autoSaveLearnedRules,
         send: async options => {
             sent.push(options);
@@ -77,6 +77,25 @@ test("parallel processing is opt-in per repository and switching back restores s
     assert.match(await dispatch(f.reviewId), /^\[self-review sr:/);
 });
 
+test("submitting drafts keeps the whole review together, even when a parallel limit is saved", async t => {
+    const f = await fixture(t, 3);
+    for (const mode of ["batch", "ask", "immediate"] as const) {
+        await f.settings.update(f.root, { delivery: mode });
+        if (mode === "ask") await f.service.setDeliveryChoice(f.reviewId, "batch");
+        await f.newThread("Rename the helper", true);
+        await f.newThread("Update its callers too", true);
+        const before = f.sent.length;
+        const result = await f.delivery.submit(f.reviewId, "parallel-test");
+        assert.equal(result.submitted, 2);
+        assert.equal(f.sent.length, before + 1);
+        assert.match(f.sent[before].prompt, /with 2 comments in 2 threads/);
+        assert.equal(f.sent[before].mode, "enqueue");
+
+        await f.send(await f.newThread("Send this one now", true));
+        assert.equal(f.sent.at(-1)?.mode, mode === "immediate" ? "immediate" : "enqueue");
+    }
+});
+
 test("parallel processing starts newly eligible work while earlier workers are still running", async t => {
     const f = await fixture(t);
     await f.settings.update(f.root, { autoSaveLearnedRules: true });
@@ -85,7 +104,9 @@ test("parallel processing starts newly eligible work while earlier workers are s
     const followup = await addFollowUp();
     const b = await f.newThread("Change b.txt", true);
     const c = await f.newThread("Explain c.txt", true);
-    const result = await f.delivery.submit(f.reviewId, "parallel-test");
+    await f.settings.update(f.root, { delivery: "ask" });
+    await f.service.setDeliveryChoice(f.reviewId, "immediate");
+    const result = await f.delivery.submit(f.reviewId, "parallel-test", "immediate");
     assert.equal(result.submitted, 4);
     assert.equal(f.sent.length, 1);
     assert.equal(f.sent[0].mode, "immediate");

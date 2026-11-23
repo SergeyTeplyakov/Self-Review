@@ -5,6 +5,7 @@ import { EventEmitter } from "node:events";
 import { buildBatchPrompt, buildCommentPrompt } from "./prompt.mjs";
 import { readCommentImage } from "./comment-images.mjs";
 import type { ReviewService, DraftClaim } from "./review-service.mjs";
+import { resolveDelivery, type SettingsService } from "./settings.mjs";
 import type { Log } from "../../types/contracts.js";
 import { ParallelComments } from "./parallel-comments.mjs";
 
@@ -38,7 +39,7 @@ export class Delivery extends EventEmitter {
     readonly sessionId: () => string | undefined;
     readonly fallbackOwner: string;
     readonly parallel: ParallelComments;
-    readonly commentConcurrency: (repoRoot: string) => Promise<number>;
+    private readonly settings?: SettingsService;
     busy: boolean | null;
     private readonly bySessionMessageId: Map<string, DeliveryTarget[]>;
     private readonly seenSessionMessageIds: Map<string, { finished: boolean }>;
@@ -55,10 +56,10 @@ export class Delivery extends EventEmitter {
      * @param {() => string | undefined} [p.sessionId] conversation that processes the comments this instance sends
      */
     constructor({ service, send, log = () => {}, reviewIds = () => [], autoSaveLearnedRules = async () => false,
-        sessionId = () => undefined, commentConcurrency = async () => 1 }: {
+        sessionId = () => undefined, settings }: {
         service: ReviewService; send: (options: SendOptions) => Promise<string>; log?: Log; reviewIds?: () => Iterable<string>;
         autoSaveLearnedRules?: (repoRoot: string) => Promise<boolean>; sessionId?: () => string | undefined;
-        commentConcurrency?: (repoRoot: string) => Promise<number>;
+        settings?: SettingsService;
     }) {
         super();
         this.service = service;
@@ -68,7 +69,7 @@ export class Delivery extends EventEmitter {
         this.autoSaveLearnedRules = autoSaveLearnedRules;
         this.sessionId = sessionId;
         this.fallbackOwner = `delivery-${randomUUID()}`;
-        this.commentConcurrency = commentConcurrency;
+        this.settings = settings;
         this.parallel = new ParallelComments(service, send, () => this.owner(), root => this.repoLearning(root));
         this.busy = null;
         this.bySessionMessageId = new Map();
@@ -93,15 +94,15 @@ export class Delivery extends EventEmitter {
         this.touched.add(reviewId);
         const claim = await this.service.claimDelivery(reviewId, threadId, messageId, { retry, senderSessionId: this.owner() });
         if (!claim) return { delivered: false, skipped: true };
-        return this.sendClaimed(reviewId, [{ threadId, messageId, ...claim }], instanceId);
+        return this.sendClaimed(reviewId, [{ threadId, messageId, ...claim }], instanceId, "immediate");
     }
 
-    // Sends every draft of a review as one prompt; drafts are claimed atomically so a review is submitted once.
-    async submit(reviewId: string, instanceId: string): Promise<DeliveryResult & { submitted: number }> {
+    // Explicit submissions stay together; choosing immediate can release held drafts to parallel workers.
+    async submit(reviewId: string, instanceId: string, mode: "combined" | "immediate" = "combined"): Promise<DeliveryResult & { submitted: number }> {
         this.touched.add(reviewId);
         const claims = await this.service.claimDrafts(reviewId, { senderSessionId: this.owner() });
         if (!claims.length) return { submitted: 0, delivered: false };
-        const result = await this.sendClaimed(reviewId, claims, instanceId);
+        const result = await this.sendClaimed(reviewId, claims, instanceId, mode);
         return { submitted: claims.length, ...result };
     }
 
@@ -115,12 +116,17 @@ export class Delivery extends EventEmitter {
     }
 
     // Builds and sends the prompt for claimed messages: one comment uses the single-comment prompt, more use the batch prompt.
-    async sendClaimed(reviewId: string, claims: DraftClaim[], instanceId: string): Promise<DeliveryResult> {
+    private async sendClaimed(reviewId: string, claims: DraftClaim[], instanceId: string, mode: "combined" | "immediate"): Promise<DeliveryResult> {
         let sessionMessageId;
         try {
-            const { repoRoot } = await this.service.getReview(reviewId);
-            const concurrency = await this.commentConcurrency(repoRoot);
-            if (concurrency > 1) return await this.parallel.enqueue(reviewId, instanceId, claims, concurrency);
+            if (mode === "immediate" && this.settings) {
+                const review = await this.service.getReview(reviewId);
+                const settings = await this.settings.get(review.repoRoot);
+                const limit = settings.commentConcurrency ?? 1;
+                if (limit > 1 && resolveDelivery(settings.delivery, review) === "immediate") {
+                    return await this.parallel.enqueue(reviewId, instanceId, claims, limit);
+                }
+            }
             const threadIds = [...new Set(claims.map((c) => c.threadId))];
             const contexts = [];
             for (const threadId of threadIds) contexts.push(await this.service.promptContext(reviewId, threadId));

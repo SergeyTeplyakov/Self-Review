@@ -25,9 +25,9 @@ make an empty initial commit, then add two untracked files: `retry.json` with
 `{"maxRetries":3}` and `label.txt` with `draft`. Open a **Pending** review of
 the disposable repo itself so both files are in the review.
 
-In that repo's **Settings → Manual review settings**, select **Batch** and
-set **Comment processing → Concurrent comments** to **2**. Submit these two
-comments together, each on its own file:
+In that repo's **Settings → Manual review settings**, select **Send each comment now**
+and set **Comment processing → Concurrent comments** to **2**. Post these two
+comments in quick succession, each on its own file:
 
 | Comment | What counts as a good result |
 | --- | --- |

@@ -694,6 +694,64 @@ test("status shows the parallel limit separately from queued, running and applyi
     assert.doesNotMatch(status(), /Parallelism/);
     assert.match(status(), /Copilot busy<\/span>/);
 });
+
+test("the Parallelism badge opens the repository concurrency control and disappears after saving serial mode", async () => {
+    const calls: CapturedPost[] = [];
+    const app = await loadApp({ fetch: async (url, init) => {
+        calls.push([init?.method ?? "GET", url, requestBody(init)]);
+        return jsonResponse(settingsFixture({ commentConcurrency: 1 }));
+    } });
+    app.state.review = reviewFixture();
+    app.state.settings = settingsFixture({ commentConcurrency: 3 });
+    app.run("renderTop()");
+    const badge = required(app.node("#top").innerHTML.match(/<button\b[^>]*data-action="([^"]+)"[^>]*>Parallelism: 3<\/button>/));
+    const click = clicker(app);
+    await click(badge[1]);
+    assert.match(app.node("#dialog").innerHTML, /<option value="3" selected>3<\/option>/);
+    assert.equal(app.focused.at(-1), '#dialog select[name="commentConcurrency"]');
+    await click("dialog-cancel");
+    assert.equal(app.focused.at(-1), `[data-action="${badge[1]}"]`);
+    assert.deepEqual(calls, []);
+
+    await click(badge[1]);
+    await app.run("onChange")({ target: { name: "commentConcurrency", value: "1" } });
+    await click("dialog-save");
+    assert.deepEqual(calls, [["POST", "/api/settings", { autoSaveLearnedRules: false, delivery: "immediate", commentConcurrency: 1 }]]);
+    assert.doesNotMatch(app.node("#top").innerHTML, /Parallelism/);
+    assert.equal(app.focused.at(-1), '[data-action="configure"]');
+});
+
+test("batch delivery disables concurrency without overwriting the immediate-mode limit", async () => {
+    const patches: Record<string, unknown>[] = [];
+    const app = await loadApp({ fetch: async (_url, init) => {
+        const patch = requestBody(init);
+        patches.push(patch);
+        return jsonResponse(settingsFixture({ commentConcurrency: 3, ...patch }));
+    } });
+    app.state.review = reviewFixture({ deliveryMode: "batch" });
+    app.state.settings = settingsFixture({ commentConcurrency: 3 });
+    const click = clicker(app);
+    const change = (name: string, value: string) => app.run("onChange")({ target: { name, value } });
+    await click("configure-parallelism");
+    await change("commentConcurrency", "2");
+    for (const delivery of ["ask", "batch"]) {
+        await change("delivery", delivery);
+        const html = app.node("#dialog").innerHTML;
+        assert.match(html, /<select name="commentConcurrency"[^>]* disabled>/);
+        assert.match(html, /Batched comments are sent together/);
+        assert.match(html, /<option value="3" selected>/);
+    }
+    await click("dialog-save");
+    assert.deepEqual(patches, [{ delivery: "batch", autoSaveLearnedRules: false }]);
+    assert.doesNotMatch(app.node("#top").innerHTML, /Parallelism:/);
+    assert.equal(app.focused.at(-1), '[data-action="configure"]');
+    await click("configure");
+    await change("delivery", "immediate");
+    assert.doesNotMatch(app.node("#dialog").innerHTML, /<select name="commentConcurrency"[^>]* disabled/);
+    await click("dialog-save");
+    assert.match(app.node("#top").innerHTML, /Parallelism: 3/);
+});
+
 const bundledCatalog = (selected = NAMES) => ({ bundled: true, selected, defaults: { selected, saved: selected !== NAMES }, skills: NAMES.map((name, i) => ({
     name, role: i === 2 ? "ponytail" : "review", title: name, summary: `Summary of ${name}`, modified: false, sha256: "0".repeat(64),
     upstream: { repository: i === 2 ? "https://github.com/DietrichGebert/ponytail" : "https://github.com/addyosmani/agent-skills", release: i === 2 ? "v5.3.3" : "0.6.15", releaseCommit: "1".repeat(40), path: `skills/${name}/SKILL.md`, fileCommit: "abcdef1234567890" },
@@ -1749,7 +1807,7 @@ test("the Configure dialog is an accessible modal with auto-save off by default 
         [["immediate", false], ["batch", true], ["ask", false]],
     );
     assert.match(html, /<span class="choice-title">Ask for each review<\/span>/);
-    assert.doesNotMatch(html, /role="alert"|\sdisabled[\s>]/);
+    assert.doesNotMatch(html, /role="alert"|<button\b[^>]* disabled/);
     assert.match(html, /data-action="dialog-save">Save<\/button>/);
 
     app.state.dialog = { autoSaveLearnedRules: true, instructionMappings: [], saving: true, error: "Could not save <b>" };
