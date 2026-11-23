@@ -264,6 +264,26 @@ installation-shaped copy. A test (including its hooks) that runs longer than two
 minutes fails instead of stalling the run. Commit generated `dist/` changes
 together with source changes; CI checks that the distribution is up to date.
 
+For a local provider installation, `npm run deploy:provider -- deploy --backup
+<new-backup-directory> --receipt <new-receipt.json>` checks that the checkout's
+distribution matches a fresh build, verifies a hash-checked backup, and replaces
+only the installed `dist`. Reload the provider through the host afterward, then
+run `npm run deploy:provider -- verify --receipt <new-receipt.json> --url
+<provider-url>` to compare files and the served build ID. To roll back, use
+`npm run deploy:provider -- restore --backup <backup-directory> --receipt
+<new-receipt.json>` and reload again. Verify the restored build against the
+backup with `npm run deploy:provider -- verify --backup <backup-directory>
+--receipt <new-receipt.json> --url <provider-url>`; without `--backup`, verify
+compares against the checkout. The provider URL can be the canvas URL, including
+its `t` authentication parameter. Each operation writes a JSON receipt with
+file hashes, build IDs, Git commit, and before/after data-directory manifests; it
+reports changes to that directory but does not modify reviews, settings, or
+learned rules. Receipts and backups must not already exist. `--checkout`,
+`--install`, and `--data` select alternative paths; defaults are the current
+checkout and the user's Copilot installation and data directories. Keep backups
+and receipts outside all three directories. This is separate from the build and
+does not reload or install the provider automatically.
+
 The SDK package is a **development-only** source of its public canvas types, pinned
 for reproducible checking; the installed Copilot runtime still supplies the SDK at
 run time. No extension-local SDK installation is needed. If `tsc` or SDK declarations
