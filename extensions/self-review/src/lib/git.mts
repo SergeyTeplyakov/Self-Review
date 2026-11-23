@@ -9,7 +9,7 @@ import path from "node:path";
 import { mergeTypeChanges, parseDiffPatches, synthesizeAddedFile } from "./diff.mjs";
 import type { DiffFile } from "./diff.mjs";
 import type { ReviewScope } from "../../types/contracts.js";
-import { IMAGE_SIGNATURE_BYTES, imagePath, imageType, MAX_IMAGE_BYTES } from "./image-format.mjs";
+import { DIFF_IMAGE_SNIFF_BYTES, diffImageType, imagePath, MAX_IMAGE_BYTES } from "./image-format.mjs";
 
 export interface CaptureOptions {
     repoRoot: string;
@@ -84,12 +84,14 @@ async function readUntracked(repoRoot: string, relPath: string): Promise<DiffFil
         return { path: relPath, oldPath: null, status: "added", binary: true, untracked: true, additions: 0, deletions: 0, hunks: [], contentHash: result.contentHash, note: "File too large to display" };
     }
     const { buffer } = result;
-    const image = imagePath(relPath) && imageType(buffer);
-    if (image || isBinary(buffer)) {
+    const image = imagePath(relPath) ? diffImageType(buffer) : undefined;
+    const imageSides = image && { imageSides: { new: result.contentHash } };
+    if ((image && image !== "svg") || isBinary(buffer)) {
         return { path: relPath, oldPath: null, status: "added", binary: true, untracked: true, additions: 0, deletions: 0, hunks: [], contentHash: result.contentHash,
-            ...(image && { imageSides: { new: result.contentHash } }) };
+            ...imageSides };
     }
-    return { ...synthesizeAddedFile(relPath, buffer.toString("utf8")), contentHash: result.contentHash };
+    // SVG is text: it keeps its diff beside the preview.
+    return { ...synthesizeAddedFile(relPath, buffer.toString("utf8")), contentHash: result.contentHash, ...imageSides };
 }
 
 // Read symlinks as Git does (their target text), never as the target's contents.
@@ -135,8 +137,8 @@ function regularFile(mode: string | undefined) {
 }
 
 // Git reports image sides only for files it diffs as binary. Find the rest, keeping only sides whose exact bytes have
-// an image signature, so text with an image name, such as a Git LFS pointer, keeps its text diff:
-// - Git diffs a file as text when its first 8000 bytes contain no NUL, which some valid JPEGs satisfy.
+// an image signature or an <svg> root, so text with an image name, such as a Git LFS pointer, keeps its text diff:
+// - Git diffs a file as text when its first 8000 bytes contain no NUL, which some valid JPEGs and every SVG satisfy.
 // - Git omits the index line only when content is unchanged (a pure rename or mode change), so both sides are the base blob.
 // Pass patches before mergeTypeChanges, so that a symlink replaced by an image checks the image alone.
 async function addImageSides(repoRoot: string, baseCommit: string, patches: DiffFile[], textImageIds: Map<DiffFile, [string, string]>) {
@@ -178,26 +180,32 @@ async function addImageSides(repoRoot: string, baseCommit: string, patches: Diff
     // One stream for every candidate, since where images live in Git LFS every changed image is a text candidate.
     // Only signatures are kept, so memory does not grow with the candidates' total size.
     const signatures = await readGitBlobPrefixes(repoRoot, candidates.flatMap(({ sides }) => [sides.old, sides.new].filter((oid) => oid !== undefined)),
-        MAX_IMAGE_BYTES, IMAGE_SIGNATURE_BYTES);
+        MAX_IMAGE_BYTES, DIFF_IMAGE_SNIFF_BYTES);
     for (const { file, sides } of candidates) {
         const images: ImageSides = {};
+        let raster = false;
         for (const side of ["old", "new"] as const) {
             const oid = sides[side];
+            if (!oid) continue;
             // Git's diff names an unstaged file's blob without storing it; use the file only if its bytes still match.
-            const bytes = oid && (signatures.get(oid) ?? (side === "new" ? await readMatchingWorkingImage(repoRoot, file, oid) : null));
-            if (bytes && imageType(bytes)) images[side] = oid;
+            const bytes = signatures.get(oid) ?? (side === "new" ? await readMatchingWorkingImage(repoRoot, file, oid) : null);
+            const type = bytes && diffImageType(bytes);
+            if (!type) continue;
+            images[side] = oid;
+            raster ||= type !== "svg";
         }
         if (!images.old && !images.new) continue;
         file.imageSides = images;
-        // As Git does, show the whole change as binary when either side is.
-        if (textImageIds.has(file)) Object.assign(file, { binary: true, hunks: [], additions: 0, deletions: 0 });
+        // As Git does, show the whole change as binary when either side is. SVG is text and keeps its diff.
+        if (raster && textImageIds.has(file)) Object.assign(file, { binary: true, hunks: [], additions: 0, deletions: 0 });
     }
 }
 
 // Refresh stores a new revision only when the fingerprint changes. Bump this when capture records data that Git's diff
 // output does not show, so the next refresh of an existing review stores that data rather than keeping the revision
 // captured without it. Version 2 added image sides, which a pure rename or mode change gains with an unchanged diff.
-const CAPTURE_VERSION = 2;
+// Version 3 added SVG image sides.
+const CAPTURE_VERSION = 3;
 
 // scope "all" diffs the working tree against the merge-base with `base` (the whole branch or PR);
 // scope "pending" diffs it against HEAD, so committed work is left out.
@@ -315,9 +323,14 @@ export async function readMatchingWorkingImage(repoRoot: string, file: DiffFile,
         const result = await readRepoFile(repoRoot, file.path, MAX_IMAGE_BYTES, false);
         if (!result || result.tooLarge) return null;
         const bytes = result.buffer;
-        const hash = file.untracked ? result.contentHash : createHash(expected.length === 64 ? "sha256" : "sha1")
-            .update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
-        return hash === expected ? bytes : null;
+        if (file.untracked) return result.contentHash === expected ? bytes : null;
+        const blobId = (content: Buffer) => createHash(expected.length === 64 ? "sha256" : "sha1")
+            .update(`blob ${content.length}\0`).update(content).digest("hex");
+        if (blobId(bytes) === expected) return bytes;
+        // Git hashes text after converting CRLF to LF on check-in (core.autocrlf, text, eol). XML parsers read CRLF as
+        // LF, so an SVG that matches once converted renders exactly as its blob does.
+        const normalized = diffImageType(bytes) === "svg" && Buffer.from(bytes.toString("latin1").replaceAll("\r\n", "\n"), "latin1");
+        return normalized && blobId(normalized) === expected ? bytes : null;
     } catch (err) {
         if (errorCode(err) === "ENOENT" || errorCode(err) === "ENOTDIR") return null;
         throw err;

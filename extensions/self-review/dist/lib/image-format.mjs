@@ -2,8 +2,71 @@ export const MAX_IMAGE_BYTES = 2 * 1024 * 1024;
 export const IMAGE_TYPES = { png: "image/png", jpg: "image/jpeg", gif: "image/gif", webp: "image/webp" };
 // imageType reads no further than this.
 export const IMAGE_SIGNATURE_BYTES = 12;
+// Diff previews also show SVG, which comment images do not accept.
+export const DIFF_IMAGE_TYPES = { ...IMAGE_TYPES, svg: "image/svg+xml" };
+// The <svg> root must start within this many bytes, after any XML declaration, comments, and DOCTYPE.
+export const SVG_PROLOG_BYTES = 8 * 1024;
+// diffImageType reads no further than this.
+export const DIFF_IMAGE_SNIFF_BYTES = Math.max(IMAGE_SIGNATURE_BYTES, SVG_PROLOG_BYTES);
 export function imagePath(name) {
-    return name !== null && /\.(?:png|jpe?g|gif|webp)$/i.test(name);
+    return name !== null && /\.(?:png|jpe?g|gif|webp|svg)$/i.test(name);
+}
+export function diffImageType(bytes) {
+    return imageType(bytes) ?? (isSvg(bytes) ? "svg" : undefined);
+}
+// Accepts a document whose root element is <svg>. A scan rather than a regular expression, so that crafted
+// prologs cannot make it backtrack.
+export function isSvg(bytes) {
+    const text = bytes.toString("utf8", 0, Math.min(bytes.length, SVG_PROLOG_BYTES));
+    let pos = text.startsWith("\uFEFF") ? 1 : 0;
+    for (;;) {
+        while (" \t\r\n".includes(text[pos] ?? "x"))
+            pos++;
+        let close;
+        let skip;
+        if (text.startsWith("<?", pos)) {
+            [close, skip] = [text.indexOf("?>", pos + 2), 2];
+        }
+        else if (text.startsWith("<!--", pos)) {
+            [close, skip] = [text.indexOf("-->", pos + 4), 3];
+        }
+        else if (text.startsWith("<!DOCTYPE", pos)) {
+            [close, skip] = [doctypeEnd(text, pos + "<!DOCTYPE".length), 1];
+        }
+        else {
+            return /^<svg[\s/>]/.test(text.slice(pos, pos + 5));
+        }
+        if (close < 0)
+            return false;
+        pos = close + skip;
+    }
+}
+// Returns the index of the ">" that closes a DOCTYPE, or -1. Quoted literals, and comments and processing
+// instructions in the bracketed internal subset, may contain "[", "]" and ">".
+function doctypeEnd(text, pos) {
+    let subset = false;
+    for (let i = pos; i < text.length; i++) {
+        const ch = text[i];
+        let open = 1;
+        let end;
+        if (ch === '"' || ch === "'")
+            end = ch;
+        else if (subset && text.startsWith("<!--", i))
+            [open, end] = [4, "-->"];
+        else if (subset && text.startsWith("<?", i))
+            [open, end] = [2, "?>"];
+        else if (ch === "[" || ch === "]")
+            subset = ch === "[";
+        else if (ch === ">" && !subset)
+            return i;
+        if (end === undefined)
+            continue;
+        const close = text.indexOf(end, i + open);
+        if (close < 0)
+            return -1;
+        i = close + end.length - 1;
+    }
+    return -1;
 }
 export function imageType(bytes) {
     if (bytes.subarray(0, 8).toString("hex") === "89504e470d0a1a0a")
