@@ -35,25 +35,46 @@ test("deploy, verify and restore preserve data and record manifests", async (t) 
     assert.equal(readFileSync(path.join(data, "settings.json"), "utf8"), "settings");
 
     let servedBuild = receipt.buildIdAfter;
-    const server = createServer((_req, res) => res.end(JSON.stringify({ extensionVersion: { buildId: servedBuild } })));
+    const server = createServer((req, res) => {
+        if (req.url !== "/api/state?t=test-token") {
+            res.writeHead(403).end();
+            return;
+        }
+        res.end(JSON.stringify({ extensionVersion: { buildId: servedBuild } }));
+    });
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     t.after(() => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())));
     const address = server.address();
     assert.ok(address && typeof address !== "string");
-    const url = `http://127.0.0.1:${address.port}`;
-    await run({ ...options, operation: "verify", receipt: path.join(root, "verify.json"), url });
+    const url = `http://127.0.0.1:${address.port}/?t=test-token`;
+    await run({ ...options, backup: undefined, operation: "verify", receipt: path.join(root, "verify.json"), url });
     servedBuild = "different";
-    await assert.rejects(run({ ...options, operation: "verify", receipt: path.join(root, "provider-mismatch.json"), url }), /Provider build ID mismatch/);
+    await assert.rejects(run({ ...options, backup: undefined, operation: "verify", receipt: path.join(root, "provider-mismatch.json"), url }), /Provider build ID mismatch/);
     writeFileSync(path.join(dist, "version.json"), JSON.stringify({ buildId: "different" }));
-    await assert.rejects(run({ ...options, operation: "verify", receipt: path.join(root, "mismatch-version.json"), url }), /hash mismatch/);
+    await assert.rejects(run({ ...options, backup: undefined, operation: "verify", receipt: path.join(root, "mismatch-version.json"), url }), /hash mismatch/);
     writeFileSync(path.join(dist, "extra"), "tampered");
-    await assert.rejects(run({ ...options, operation: "verify", receipt: path.join(root, "mismatch.json") }), /hash mismatch/);
+    await assert.rejects(run({ ...options, backup: undefined, operation: "verify", receipt: path.join(root, "mismatch.json") }), /hash mismatch/);
     await assert.rejects(run({ ...options, operation: "deploy", receipt: path.join(root, "existing.json") }, () => {}), /Backup already exists/);
     await run({ ...options, operation: "restore", receipt: path.join(root, "restore.json") });
     assert.equal(readFileSync(path.join(dist, "old.txt"), "utf8"), "old");
     assert.equal(readFileSync(path.join(data, "reviews", "review.json"), "utf8"), "review");
+    servedBuild = "old";
+    await run({ ...options, operation: "verify", receipt: path.join(root, "verify-backup.json"), url });
+    await assert.rejects(run({ ...options, backup: undefined, operation: "verify", receipt: path.join(root, "verify-checkout.json"), url }), /hash mismatch/);
+    for (const damaged of ["missing-version", "malformed-version", "invalid-build-id", "missing-dist"] as const) {
+        if (damaged === "missing-dist") rmSync(dist, { recursive: true });
+        else if (damaged === "missing-version") rmSync(path.join(dist, "version.json"));
+        else writeFileSync(path.join(dist, "version.json"), damaged === "malformed-version" ? "{" : "{}");
+        const restoreReceipt = path.join(root, `${damaged}.json`);
+        await run({ ...options, operation: "restore", receipt: restoreReceipt });
+        const recorded = JSON.parse(readFileSync(restoreReceipt, "utf8")) as { buildIdBefore: string | null; buildIdAfter: string };
+        assert.equal(recorded.buildIdBefore, null);
+        assert.equal(recorded.buildIdAfter, "old");
+        assert.equal(readFileSync(path.join(dist, "old.txt"), "utf8"), "old");
+    }
     writeFileSync(path.join(backup, "dist", "old.txt"), "tampered");
     await assert.rejects(run({ ...options, operation: "restore", receipt: path.join(root, "bad-backup.json") }), /Backup hash mismatch/);
+    await assert.rejects(run({ ...options, operation: "verify", receipt: path.join(root, "verify-bad-backup.json") }), /Backup hash mismatch/);
     assert.equal(readFileSync(path.join(dist, "old.txt"), "utf8"), "old");
 });
 

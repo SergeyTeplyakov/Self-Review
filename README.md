@@ -270,7 +270,11 @@ only the installed `dist`. Reload the provider through the host afterward, then
 run `npm run deploy:provider -- verify --receipt <new-receipt.json> --url
 <provider-url>` to compare files and the served build ID. To roll back, use
 `npm run deploy:provider -- restore --backup <backup-directory> --receipt
-<new-receipt.json>` and reload again. Each operation writes a JSON receipt with
+<new-receipt.json>` and reload again. Verify the restored build against the
+backup with `npm run deploy:provider -- verify --backup <backup-directory>
+--receipt <new-receipt.json> --url <provider-url>`; without `--backup`, verify
+compares against the checkout. The provider URL can be the canvas URL, including
+its `t` authentication parameter. Each operation writes a JSON receipt with
 file hashes, build IDs, Git commit, and before/after data-directory manifests; it
 reports changes to that directory but does not modify reviews, settings, or
 learned rules. Receipts and backups must not already exist. `--checkout`,

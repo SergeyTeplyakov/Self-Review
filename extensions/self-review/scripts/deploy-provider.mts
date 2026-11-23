@@ -58,15 +58,42 @@ function same(a: Snapshot, b: Snapshot): boolean {
     return JSON.stringify(a) === JSON.stringify(b);
 }
 
-function version(dist: string): string {
-    const value: unknown = JSON.parse(readFileSync(path.join(dist, "version.json"), "utf8"));
+function optionalVersion(dist: string): string | null {
+    let text: string;
+    try {
+        text = readFileSync(path.join(dist, "version.json"), "utf8");
+    } catch (error) {
+        if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
+        throw error;
+    }
+    let value: unknown;
+    try {
+        value = JSON.parse(text);
+    } catch (error) {
+        if (error instanceof SyntaxError) return null;
+        throw error;
+    }
     if (typeof value !== "object" || value === null || !("buildId" in value) ||
-        typeof value.buildId !== "string" || !value.buildId) throw new Error(`Invalid build ID in ${dist}`);
+        typeof value.buildId !== "string" || !value.buildId) return null;
     return value.buildId;
+}
+
+function version(dist: string): string {
+    const buildId = optionalVersion(dist);
+    if (!buildId) throw new Error(`Missing or invalid build ID in ${dist}`);
+    return buildId;
 }
 
 function requireSame(expected: Snapshot, actual: Snapshot, what: string): void {
     if (!expected.exists || !same(expected, actual)) throw new Error(`${what} hash mismatch`);
+}
+
+function verifiedBackup(backup: string): Snapshot {
+    const expected: unknown = JSON.parse(readFileSync(path.join(backup, "manifest.json"), "utf8"));
+    const actual = snapshot(path.join(backup, "dist"));
+    if (JSON.stringify(expected) !== JSON.stringify(actual) || !actual.exists) throw new Error("Backup hash mismatch");
+    version(path.join(backup, "dist"));
+    return actual;
 }
 
 function replaceDist(install: string, source: string, expected: Snapshot): void {
@@ -75,22 +102,34 @@ function replaceDist(install: string, source: string, expected: Snapshot): void 
     const staged = path.join(staging, "new");
     const previous = path.join(staging, "previous");
     let moved = false;
+    let installed = false;
     try {
         cpSync(source, staged, { recursive: true, errorOnExist: true });
         requireSame(expected, snapshot(staged), "Staged distribution");
-        renameSync(target, previous);
-        moved = true;
+        if (existsSync(target)) {
+            renameSync(target, previous);
+            moved = true;
+        }
         try {
             renameSync(staged, target);
+            installed = true;
             requireSame(expected, snapshot(target), "Installed distribution");
         } catch (error) {
-            if (existsSync(target)) rmSync(target, { recursive: true });
-            renameSync(previous, target);
-            moved = false;
+            try {
+                if (installed) rmSync(target, { recursive: true });
+                if (moved) {
+                    renameSync(previous, target);
+                    moved = false;
+                }
+            } catch (rollbackError) {
+                throw new AggregateError([error, rollbackError], `Install failed and rollback failed; previous distribution remains at ${previous}`);
+            }
             throw error;
         }
-        rmSync(previous, { recursive: true });
-        moved = false;
+        if (moved) {
+            rmSync(previous, { recursive: true });
+            moved = false;
+        }
     } finally {
         // Keep the previous distribution if rollback itself failed.
         if (!moved) rmSync(staging, { recursive: true, force: true });
@@ -116,8 +155,8 @@ export async function run(options: Options, checkBuild?: () => void): Promise<vo
     const startedAt = new Date().toISOString();
     const dataBefore = snapshot(data);
     const before = snapshot(dist);
-    if (!before.exists) throw new Error("Installed dist is missing");
-    const buildIdBefore = version(dist);
+    if (!before.exists && options.operation !== "restore") throw new Error("Installed dist is missing");
+    const buildIdBefore = options.operation === "restore" ? optionalVersion(dist) : version(dist);
     const commit = execFileSync("git", ["-C", checkout, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
     // Reserve the receipt before any mutation; never overwrite another run.
     writeFileSync(receipt, "", { flag: "wx" });
@@ -146,18 +185,18 @@ export async function run(options: Options, checkBuild?: () => void): Promise<vo
             writeFileSync(path.join(backup!, "manifest.json"), `${JSON.stringify(before, null, 2)}\n`, { flag: "wx" });
             replaceDist(install, built, sourceManifest);
         } else if (options.operation === "restore") {
-            const expected: unknown = JSON.parse(readFileSync(path.join(backup!, "manifest.json"), "utf8"));
-            const backedUp = snapshot(path.join(backup!, "dist"));
-            if (JSON.stringify(expected) !== JSON.stringify(backedUp) || !backedUp.exists) throw new Error("Backup hash mismatch");
-            sourceManifest = backedUp;
-            version(path.join(backup!, "dist"));
-            replaceDist(install, path.join(backup!, "dist"), backedUp);
+            sourceManifest = verifiedBackup(backup!);
+            replaceDist(install, path.join(backup!, "dist"), sourceManifest);
         } else {
-            sourceManifest = snapshot(built);
+            const reference = backup ? path.join(backup, "dist") : built;
+            sourceManifest = backup ? verifiedBackup(backup) : snapshot(built);
             requireSame(sourceManifest, before, "Installed distribution");
-            version(built);
+            const expectedBuildId = version(reference);
             if (options.url) {
-                const response = await fetch(new URL("/api/state", options.url));
+                const stateUrl = new URL(options.url);
+                stateUrl.pathname = "/api/state";
+                stateUrl.hash = "";
+                const response = await fetch(stateUrl);
                 if (!response.ok) throw new Error(`Provider state returned HTTP ${response.status}`);
                 const state: unknown = await response.json();
                 if (typeof state !== "object" || state === null || !("extensionVersion" in state) ||
@@ -166,16 +205,16 @@ export async function run(options: Options, checkBuild?: () => void): Promise<vo
                     throw new Error("Provider state has no build ID");
                 }
                 providerBuildId = state.extensionVersion.buildId;
-                if (providerBuildId !== version(built)) throw new Error("Provider build ID mismatch");
+                if (providerBuildId !== expectedBuildId) throw new Error("Provider build ID mismatch");
             }
         }
     } catch (caught) {
         error = caught;
     } finally {
         try {
-            installedAfter = snapshot(dist);
-            buildIdAfter = version(dist);
             dataAfter = snapshot(data);
+            installedAfter = snapshot(dist);
+            buildIdAfter = error && options.operation === "restore" ? optionalVersion(dist) : version(dist);
             if (!same(dataBefore, dataAfter)) throw new Error("Data directory changed during operation");
         } catch (caught) {
             error = error ? new AggregateError([error, caught], "Operation and final verification failed") : caught;
@@ -189,7 +228,8 @@ export async function run(options: Options, checkBuild?: () => void): Promise<vo
         }, null, 2)}\n`);
     }
     if (error) throw error;
-    if (options.operation !== "verify") console.log("Reload the provider, then run verify with --url to check the served build ID.");
+    if (options.operation === "deploy") console.log("Reload the provider, then run verify with --url to check the served build ID.");
+    if (options.operation === "restore") console.log("Reload the provider, then run verify with --backup and --url to check the restored build ID.");
 }
 
 function parseArgs(args: string[]): Options {
