@@ -151,6 +151,10 @@ and verified target:
 
 - The PR identity and target are correct, the remote head is the intended commit,
   and there is no unexpected local or remote drift.
+- Reassess issue coverage for each changed head. If a review fix deferred a
+  requirement, replace its `Closes` link with `Refs` and note what remains.
+  Immediately before merging, recheck the published links for the final head
+  and target as in section 2; the PR body can change without changing the SHA.
 - Applicable review is complete for the final changes. Relevant inline and
   overview-only feedback is addressed or explicitly reported as unresolved.
 - Every applicable CI workflow and matrix job has a successful result for that
