@@ -97,7 +97,16 @@ export class Delivery extends EventEmitter {
                 const review = await this.service.getReview(reviewId);
                 const settings = await this.settings.get(review.repoRoot);
                 const limit = settings.commentConcurrency ?? 1;
-                if (limit > 1 && resolveDelivery(settings.delivery, review) === "immediate") {
+                const submitted = new Set(claims.map((claim) => claim.messageId));
+                const hasPendingSerialPredecessor = claims.some((claim) => {
+                    const thread = review.threads.find((entry) => entry.threadId === claim.threadId);
+                    if (!thread)
+                        return false;
+                    const index = thread.messages.findIndex((message) => message.messageId === claim.messageId);
+                    return index > 0 && thread.messages.slice(0, index).some((message) => message.author === "user" && !submitted.has(message.messageId) && !message.delivery?.parallel
+                        && ["saving", "queued", "processing"].includes(message.delivery?.state ?? ""));
+                });
+                if (limit > 1 && resolveDelivery(settings.delivery, review) === "immediate" && !hasPendingSerialPredecessor) {
                     return await this.parallel.enqueue(reviewId, instanceId, claims, limit);
                 }
             }

@@ -96,6 +96,22 @@ test("submitting drafts keeps the whole review together, even when a parallel li
     }
 });
 
+test("immediate follow-ups stay queued behind a pending combined submission in the same thread", async t => {
+    const f = await fixture(t, 3);
+    await f.settings.update(f.root, { delivery: "batch" });
+    const first = await f.newThread("First batch comment", true);
+    await f.service.addMessage(f.reviewId, first.thread.threadId, { author: "user", body: "Second batch comment", hold: true });
+    await f.delivery.submit(f.reviewId, "parallel-test");
+    assert.match(f.sent[0].prompt, /with 2 comments in 1 thread/);
+
+    await f.settings.update(f.root, { delivery: "immediate" });
+    const followUp = await f.service.addMessage(f.reviewId, first.thread.threadId, { author: "user", body: "Immediate follow-up" });
+    await f.delivery.deliver(f.reviewId, first.thread.threadId, followUp.message.messageId, "parallel-test");
+
+    assert.equal(f.sent[1].mode, "enqueue");
+    assert.doesNotMatch(f.sent[1].prompt, /^\[self-review parallel:/);
+});
+
 test("parallel processing starts newly eligible work while earlier workers are still running", async t => {
     const f = await fixture(t);
     await f.settings.update(f.root, { autoSaveLearnedRules: true });
