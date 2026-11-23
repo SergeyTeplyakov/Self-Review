@@ -94,11 +94,14 @@ does not itself authorize a paid review.
    never force-push or push to the target branch.
 2. Create the PR or reuse the matching open PR for this branch and target.
    Verify the repository, PR number, base branch, head branch, and remote head
-   SHA. Do not silently retarget an existing PR. In the PR body, link the source
-   ticket and any issue found during self-review: `Closes #N` when the PR
-   completes the issue, otherwise `Refs #N` with the remaining items. Confirm
-   that `gh pr view <number> --json closingIssuesReferences` lists exactly the
-   issues meant to close.
+   SHA. Do not silently retarget an existing PR. Verify the repository's default
+   branch (`gh repo view --json defaultBranchRef`) and link the issues identified
+   in self-review. For a default-branch PR, use `Closes #N` for completed issues
+   and `Refs #N` plus what remains for partial fixes. Verify the published body
+   references and confirm `gh pr view <number> --json closingIssuesReferences`
+   lists exactly the issues meant to close. For another target, use `Refs #N`,
+   verify the references in the published body, and note that this merge won't
+   close those issues. Carry them to the eventual default-branch PR.
 3. Request GitHub Copilot review and verify the request in the PR timeline;
    a successful CLI exit alone is not proof that the review was requested.
 4. Inspect the complete PR review, including every inline thread and overview
@@ -195,15 +198,18 @@ after the gates pass; do not use it to bypass checks or to queue an unverified
 head. Never force a merge or bypass policy.
 
 After the merge command, verify the PR's actual merged state and merged commit
-before reporting success. For a merge into the default branch, also confirm that
-each issue in `closingIssuesReferences` is closed. If the head changed or the
-guard rejects the merge, restart verification for the new state. When any gate
-is blocked, leave the PR
+before reporting success. If the head changed or the guard rejects the merge,
+restart verification for the new state. When any gate is blocked, leave the PR
 open and report its exact status, completed validation, review state, and the
 reason it was not merged. Never claim a PR is merged based only on a command
 exit or a queued merge.
 
-After GitHub confirms the PR is merged:
+After GitHub confirms the PR is merged (including a merge performed by someone
+else), check issue closure before cleanup unless the user declined further work.
+For a default-branch merge, verify each intended closing issue from section 2
+is actually closed. On resumption, recover that list from the PR's closing
+references and body. Report any discrepancy; do not close issues yourself.
+Then clean up:
 
 1. Record the PR's merge commit, run `git fetch origin`, and verify that merge
    commit is an ancestor of `origin/main` (for example,

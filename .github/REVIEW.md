@@ -21,9 +21,11 @@ one axis never hides a failure on the other.
    - requirements that are missing or only partly done;
    - behavior the issue did not ask for;
    - requirements that look implemented but behave incorrectly.
-4. Decide each link for the PR body: `Closes #N` when the change meets every
-   requirement, otherwise `Refs #N` with the remaining items. Put these links
-   and the remaining items in the canvas Overview description.
+4. Use `Closes #N` when the change meets every requirement and the PR targets
+   the default branch. Otherwise use `Refs #N` and say what remains, including
+   delivery to the default branch if that is the only step left. Qualify issue
+   numbers from other repositories as `owner/repo#N`. Put the links and remaining
+   work in the canvas Overview during normal review setup, not in a read-only run.
 5. Without a ticket, report "no spec available" and judge the change against
    the user's request. Do not infer requirements from the code.
 

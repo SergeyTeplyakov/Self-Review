@@ -35,6 +35,12 @@ After every push to a PR branch, run the checks in section 3 of
 `.github/skills/create-pr/SKILL.md`. Before reporting a UI change done, run its
 "Live build checks".
 
+# Self-review
+
+The agent coordinating a self-review follows [REVIEW.md](REVIEW.md), including
+when the review starts from the canvas. In a read-only model run, report the
+Spec and Standards checks without editing the Overview, worktree, or issues.
+
 # Authorization
 
 Completing a change never implies running paid agent reviews, pushing, opening or

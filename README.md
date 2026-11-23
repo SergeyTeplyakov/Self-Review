@@ -181,7 +181,7 @@ Any repository can add its own `.github/REVIEW.md`; the self-review skill reads 
 
 Canvases are a GitHub Copilot app feature. The skill loads in Copilot CLI too, but without the canvas there is nothing to comment on.
 Ask Copilot **"create PR"** to run the workflow; it merges only when its review and CI gates pass and no unusual signals remain. Say **"manual mode"** or **"no merge"** to leave the PR open.
-The PR body links the source issue with `Closes #N`, or with `Refs #N` and the remaining work when the PR only partly solves it.
+The PR body uses `Closes #N` for a completed issue on a default-branch PR. A partial fix or a PR to another branch uses `Refs #N` and says what remains.
 After every push or PR creation, the workflow reuses a verified matching
 Self-Review canvas or opens one automatically, preserving the user's existing
 review and filters while showing the whole PR on the correct checkout and base.
