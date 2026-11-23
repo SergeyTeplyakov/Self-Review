@@ -271,10 +271,13 @@ test("SVG is recognized by its root element after any prolog, and only within th
     const root = '<svg xmlns="http://www.w3.org/2000/svg"/>';
     for (const text of [root, "<svg>", `\uFEFF \t${root}`,
         `<?xml version="1.0"?>\r\n<!-- a > b -->\n<!DOCTYPE svg [ <!ENTITY a "x>y"> ]>\n${root}`,
+        `<!DOCTYPE svg [<!ENTITY marker "]">]>${root}`,
+        `<!DOCTYPE svg [<!-- ] > " --><?pi ] > ' ?><!ENTITY a 'x"]>'>]>${root}`,
         `<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">${root}`]) {
         assert.equal(diffImageType(Buffer.from(text)), "svg", text);
     }
     for (const text of ["", "<svgx/>", "text <svg/>", "<html><svg/></html>", "<?xml", "<!-- unclosed <svg/>", "<!DOCTYPE svg [ <svg/>",
+        `<!DOCTYPE svg [<!ENTITY a "]>"><svg/>`, `<!DOCTYPE svg SYSTEM "unclosed><svg/>`, `<!DOCTYPE svg [<!-- ]> <svg/>`,
         `<!--${"x".repeat(SVG_PROLOG_BYTES)}--><svg/>`]) {
         assert.equal(isSvg(Buffer.from(text)), false, text.slice(0, 40));
     }

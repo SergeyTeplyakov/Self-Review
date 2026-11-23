@@ -913,9 +913,9 @@ async function captureImages(browser: Browser, url: string, theme: "light" | "da
     await page.locator("#toast").waitFor({ state: "hidden" });
     // Every visible preview must decode; a block that only rendered its fallback fails here.
     const decoded = async (count: number) => {
-        const images = page.locator(".image-diff img[data-image-oid]");
+        const images = page.locator(".image-diff img[data-image-key]");
         await page.waitForFunction((n) => {
-            const shown = [...document.querySelectorAll<HTMLImageElement>(".image-diff img[data-image-oid]")];
+            const shown = [...document.querySelectorAll<HTMLImageElement>(".image-diff img[data-image-key]")];
             return shown.length === n && shown.every((image) => image.complete && image.naturalWidth > 0);
         }, count);
         return images;

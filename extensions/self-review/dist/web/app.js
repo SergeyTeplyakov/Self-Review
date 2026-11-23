@@ -977,6 +977,8 @@ async function refreshReview() {
     renderLoadStatus();
     try {
         await api("POST", "refresh", {});
+        // An unchanged capture keeps the current revision, so retry its failed images here.
+        pruneImages(state.snapshot);
         await loadState();
     }
     catch (error) {
@@ -2516,6 +2518,9 @@ const IMAGE_UNAVAILABLE = "Preview unavailable: the image may have changed since
 const IMAGE_PREFETCH_MARGIN = "600px";
 let imageObserver = null;
 const imageView = (path) => state.imageViews.get(path) ?? DEFAULT_IMAGE_VIEW;
+// Cached per path and side rather than per object ID alone: paths with identical bytes can be read from different
+// working-tree files, so one path's failed request must not hide another's readable preview.
+const imageKey = (path, side, oid) => `${side}:${oid}:${path}`;
 function formatBytes(bytes) {
     if (bytes < 1024)
         return `${bytes} B`;
@@ -2531,13 +2536,16 @@ function revokeImageUrl(entry) {
         URL.revokeObjectURL(entry.url);
 }
 function pruneImages(snapshot) {
-    const referenced = new Set(snapshot?.files.flatMap((file) => IMAGE_SIDES.map((side) => file.imageSides?.[side] ?? "")));
-    for (const [oid, entry] of state.images) {
-        // A failed image is retried in the next revision, since Refresh may have made its bytes readable again.
-        if (referenced.has(oid) && entry.status !== "failed")
+    const referenced = new Set(snapshot?.files.flatMap((file) => IMAGE_SIDES.flatMap((side) => {
+        const oid = file.imageSides?.[side];
+        return oid ? [imageKey(file.path, side, oid)] : [];
+    })));
+    for (const [key, entry] of state.images) {
+        // A failed image is retried after Refresh, which may have made its bytes readable again.
+        if (referenced.has(key) && entry.status !== "failed")
             continue;
         revokeImageUrl(entry);
-        state.images.delete(oid);
+        state.images.delete(key);
     }
 }
 function readDataUrl(blob) {
@@ -2551,10 +2559,11 @@ function readDataUrl(blob) {
 async function loadImage(path, side, oid) {
     const revisionId = state.snapshot?.revisionId;
     const reviewId = state.review?.reviewId;
-    if (!revisionId || !reviewId || state.images.has(oid))
+    const key = imageKey(path, side, oid);
+    if (!revisionId || !reviewId || state.images.has(key))
         return;
     const loading = { status: "loading" };
-    state.images.set(oid, loading);
+    state.images.set(key, loading);
     let loaded = { status: "failed" };
     try {
         const query = new URLSearchParams({ review: reviewId, path, side });
@@ -2574,13 +2583,13 @@ async function loadImage(path, side, oid) {
         revokeImageUrl(loaded);
         loaded = { status: "failed" };
     }
-    // The review or revision moved on while this image loaded.
-    if (state.images.get(oid) !== loading) {
+    // The review, revision or path moved on while this image loaded.
+    if (state.images.get(key) !== loading) {
         revokeImageUrl(loaded);
         return;
     }
-    state.images.set(oid, loaded);
-    repaintImageDiffs((file) => IMAGE_SIDES.some((s) => file.imageSides?.[s] === oid));
+    state.images.set(key, loaded);
+    repaintImageDiffs((file) => file.path === path);
 }
 function requestImages(block) {
     const path = block instanceof HTMLElement ? block.dataset.imagePath ?? "" : "";
@@ -2593,8 +2602,8 @@ function requestImages(block) {
 }
 // Rendered markup carries only object IDs; decoded URLs are attached afterwards, and missing images load as they near the viewport.
 function paintImageDiffs() {
-    for (const img of Array.from(document.querySelectorAll("img[data-image-oid]"))) {
-        const entry = state.images.get(img.dataset.imageOid ?? "");
+    for (const img of Array.from(document.querySelectorAll("img[data-image-key]"))) {
+        const entry = state.images.get(img.dataset.imageKey ?? "");
         if (entry?.status === "ready" && img.getAttribute("src") !== entry.url)
             img.src = entry.url;
     }
@@ -2636,7 +2645,7 @@ function imageDiffHtml(file) {
         return "";
     const path = esc(file.path);
     const oidOf = (side) => file.imageSides?.[side] ?? "";
-    const entryOf = (side) => state.images.get(oidOf(side));
+    const entryOf = (side) => state.images.get(imageKey(file.path, side, oidOf(side)));
     const entries = sides.map(entryOf);
     const attrs = `class="image-diff" data-image-path="${path}"${entries.some((entry) => !entry) ? " data-image-pending" : ""}`;
     if (entries.every((entry) => entry?.status === "failed")) {
@@ -2645,7 +2654,7 @@ function imageDiffHtml(file) {
     }
     const image = (side, style = "") => {
         const name = side === "old" ? file.oldPath ?? file.path : file.path;
-        return `<img data-image-oid="${esc(oidOf(side))}" alt="${esc(`${IMAGE_SIDE_LABELS[side]}: ${name}`)}"${style}>`;
+        return `<img data-image-key="${esc(imageKey(file.path, side, oidOf(side)))}" alt="${esc(`${IMAGE_SIDE_LABELS[side]}: ${name}`)}"${style}>`;
     };
     const before = entryOf("old");
     const after = entryOf("new");

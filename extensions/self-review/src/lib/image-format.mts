@@ -33,17 +33,34 @@ export function isSvg(bytes: Buffer) {
         } else if (text.startsWith("<!--", pos)) {
             [close, skip] = [text.indexOf("-->", pos + 4), 3];
         } else if (text.startsWith("<!DOCTYPE", pos)) {
-            // An internal subset in brackets may contain ">".
-            const gt = text.indexOf(">", pos);
-            const bracket = text.indexOf("[", pos);
-            const from = bracket >= 0 && (gt < 0 || bracket < gt) ? text.indexOf("]", bracket) : pos;
-            [close, skip] = [from < 0 ? -1 : text.indexOf(">", from), 1];
+            [close, skip] = [doctypeEnd(text, pos + "<!DOCTYPE".length), 1];
         } else {
             return /^<svg[\s/>]/.test(text.slice(pos, pos + 5));
         }
         if (close < 0) return false;
         pos = close + skip;
     }
+}
+
+// Returns the index of the ">" that closes a DOCTYPE, or -1. Quoted literals, and comments and processing
+// instructions in the bracketed internal subset, may contain "[", "]" and ">".
+function doctypeEnd(text: string, pos: number) {
+    let subset = false;
+    for (let i = pos; i < text.length; i++) {
+        const ch = text[i];
+        let open = 1;
+        let end: string | undefined;
+        if (ch === '"' || ch === "'") end = ch;
+        else if (subset && text.startsWith("<!--", i)) [open, end] = [4, "-->"];
+        else if (subset && text.startsWith("<?", i)) [open, end] = [2, "?>"];
+        else if (ch === "[" || ch === "]") subset = ch === "[";
+        else if (ch === ">" && !subset) return i;
+        if (end === undefined) continue;
+        const close = text.indexOf(end, i + open);
+        if (close < 0) return -1;
+        i = close + end.length - 1;
+    }
+    return -1;
 }
 
 export function imageType(bytes: Buffer): ImageExtension | undefined {
