@@ -1,5 +1,7 @@
 export const MAX_IMAGE_BYTES = 2 * 1024 * 1024;
 export const IMAGE_TYPES = { png: "image/png", jpg: "image/jpeg", gif: "image/gif", webp: "image/webp" };
+// imageType reads no further than this.
+export const IMAGE_SIGNATURE_BYTES = 12;
 export function imagePath(name) {
     return name !== null && /\.(?:png|jpe?g|gif|webp)$/i.test(name);
 }

@@ -41,8 +41,9 @@ function sameSidePath(rest) {
 function newFile() {
     return { path: null, oldPath: null, status: "modified", binary: false, untracked: false, additions: 0, deletions: 0, hunks: [] };
 }
+// Parses each patch on its own, so a type change stays a deletion plus an addition until mergeTypeChanges joins them.
 // textImageIds receives Git's old/new blob IDs for image paths diffed as text; only their bytes can show whether they are images.
-export function parseUnifiedDiff(text, textImageIds) {
+export function parseDiffPatches(text, textImageIds) {
     const files = [];
     const blobs = new WeakMap();
     let file = null;
@@ -175,8 +176,16 @@ export function parseUnifiedDiff(text, textImageIds) {
         else
             textImageIds?.set(f, ids);
     }
-    // Git splits a type change (regular file <-> symlink) into a deletion and addition.
-    // Consumers identify files by path, so expose the complete replacement as one change.
+    // A well-formed Git header always supplies a path. Keep the historical
+    // parser representation for malformed input without changing its output.
+    return files;
+}
+export function parseUnifiedDiff(text) {
+    return mergeTypeChanges(parseDiffPatches(text));
+}
+// Git splits a type change (regular file <-> symlink) into a deletion and addition.
+// Consumers identify files by path, so expose the complete replacement as one change.
+export function mergeTypeChanges(files) {
     const normalized = [];
     const byPath = new Map();
     for (const f of files) {
@@ -196,11 +205,8 @@ export function parseUnifiedDiff(text, textImageIds) {
             });
         }
         else {
-            // A well-formed Git header always supplies a path. Keep the historical
-            // parser representation for malformed input without changing its output.
-            const parsed = f;
-            normalized.push(parsed);
-            byPath.set(f.path, parsed);
+            normalized.push(f);
+            byPath.set(f.path, f);
         }
     }
     return normalized;

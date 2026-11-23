@@ -1,13 +1,13 @@
 // Read-only git access for capturing review snapshots. Never mutates the repository:
 // GIT_OPTIONAL_LOCKS=0 keeps diff/status from rewriting the index.
-import { readGitBlobs, runGit } from "./git-process.mjs";
+import { readGitBlobPrefixes, runGit } from "./git-process.mjs";
 export { runGit } from "./git-process.mjs";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, open, readlink, realpath } from "node:fs/promises";
 import path from "node:path";
-import { parseUnifiedDiff, synthesizeAddedFile } from "./diff.mjs";
-import { imagePath, imageType, MAX_IMAGE_BYTES } from "./image-format.mjs";
+import { mergeTypeChanges, parseDiffPatches, synthesizeAddedFile } from "./diff.mjs";
+import { IMAGE_SIGNATURE_BYTES, imagePath, imageType, MAX_IMAGE_BYTES } from "./image-format.mjs";
 const errorCode = (error) => error && typeof error === "object" && "code" in error ? error.code : undefined;
 const MAX_UNTRACKED_BYTES = 2 * 1024 * 1024;
 export async function resolveRepoRoot(repoPath) {
@@ -109,21 +109,32 @@ async function readRepoFile(repoRoot, relPath, maxBytes = Infinity, hashOversize
         await handle.close();
     }
 }
+// A symlink's blob holds its target path and a submodule's ID names a commit; only regular files hold their content.
+function regularFile(mode) {
+    return mode === undefined || mode.startsWith("100");
+}
 // Git reports image sides only for files it diffs as binary. Find the rest, keeping only sides whose exact bytes have
 // an image signature, so text with an image name, such as a Git LFS pointer, keeps its text diff:
 // - Git diffs a file as text when its first 8000 bytes contain no NUL, which some valid JPEGs satisfy.
 // - Git omits the index line only when content is unchanged (a pure rename or mode change), so both sides are the base blob.
-async function addImageSides(repoRoot, baseCommit, files, textImageIds) {
+// Pass patches before mergeTypeChanges, so that a symlink replaced by an image checks the image alone.
+async function addImageSides(repoRoot, baseCommit, patches, textImageIds) {
     const candidates = [];
     const unchanged = [];
-    for (const file of files) {
-        if (file.imageSides || file.binary || file.typeChanged || !(imagePath(file.path) || imagePath(file.oldPath)))
+    for (const file of patches) {
+        if (file.imageSides || file.binary || !(imagePath(file.path) || imagePath(file.oldPath)))
             continue;
         const ids = textImageIds.get(file);
         if (ids) {
-            candidates.push({ file, sides: { ...(file.status !== "added" && { old: ids[0] }), ...(file.status !== "deleted" && { new: ids[1] }) } });
+            const sides = {};
+            if (file.status !== "added" && regularFile(file.oldMode))
+                sides.old = ids[0];
+            if (file.status !== "deleted" && regularFile(file.newMode))
+                sides.new = ids[1];
+            candidates.push({ file, sides });
         }
-        else if (!file.hunks.length && (file.status === "modified" || file.status === "renamed") && !/[\r\n]/.test(file.oldPath ?? file.path)) {
+        else if (!file.hunks.length && (file.status === "modified" || file.status === "renamed")
+            && regularFile(file.oldMode) && regularFile(file.newMode) && !/[\r\n]/.test(file.oldPath ?? file.path)) {
             unchanged.push(file);
         }
     }
@@ -141,14 +152,15 @@ async function addImageSides(repoRoot, baseCommit, files, textImageIds) {
     }
     if (!candidates.length)
         return;
-    // One batch for every candidate: where images live in Git LFS, every changed image is a text candidate.
-    const blobs = await readGitBlobs(repoRoot, candidates.flatMap(({ sides }) => [sides.old, sides.new].filter((oid) => oid !== undefined)), MAX_IMAGE_BYTES);
+    // One stream for every candidate, since where images live in Git LFS every changed image is a text candidate.
+    // Only signatures are kept, so memory does not grow with the candidates' total size.
+    const signatures = await readGitBlobPrefixes(repoRoot, candidates.flatMap(({ sides }) => [sides.old, sides.new].filter((oid) => oid !== undefined)), MAX_IMAGE_BYTES, IMAGE_SIGNATURE_BYTES);
     for (const { file, sides } of candidates) {
         const images = {};
         for (const side of ["old", "new"]) {
             const oid = sides[side];
             // Git's diff names an unstaged file's blob without storing it; use the file only if its bytes still match.
-            const bytes = oid && (blobs.get(oid) ?? (side === "new" ? await readMatchingWorkingImage(repoRoot, file, oid) : null));
+            const bytes = oid && (signatures.get(oid) ?? (side === "new" ? await readMatchingWorkingImage(repoRoot, file, oid) : null));
             if (bytes && imageType(bytes))
                 images[side] = oid;
         }
@@ -179,8 +191,9 @@ export async function captureSnapshot({ repoRoot, base, paths, exclude, includeU
         "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--full-index", "--find-renames", "--src-prefix=a/", "--dst-prefix=b/", `-U${contextLines}`, baseCommit, "--", ...pathspec,
     ]);
     const textImageIds = new Map();
-    const files = parseUnifiedDiff(diff.stdout, textImageIds);
-    await addImageSides(repoRoot, baseCommit, files, textImageIds);
+    const patches = parseDiffPatches(diff.stdout, textImageIds);
+    await addImageSides(repoRoot, baseCommit, patches, textImageIds);
+    const files = mergeTypeChanges(patches);
     const hash = createHash("sha256").update(baseCommit).update("\0").update(diff.stdout);
     if (includeUntracked) {
         const list = await runGit(repoRoot, ["ls-files", "--others", "--exclude-standard", "-z", "--", ...pathspec]);

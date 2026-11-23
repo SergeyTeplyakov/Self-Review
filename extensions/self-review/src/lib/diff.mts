@@ -85,8 +85,9 @@ function newFile(): ParsedFile {
     return { path: null, oldPath: null, status: "modified", binary: false, untracked: false, additions: 0, deletions: 0, hunks: [] };
 }
 
+// Parses each patch on its own, so a type change stays a deletion plus an addition until mergeTypeChanges joins them.
 // textImageIds receives Git's old/new blob IDs for image paths diffed as text; only their bytes can show whether they are images.
-export function parseUnifiedDiff(text: string, textImageIds?: Map<DiffFile, [string, string]>): DiffFile[] {
+export function parseDiffPatches(text: string, textImageIds?: Map<DiffFile, [string, string]>): DiffFile[] {
     const files: ParsedFile[] = [];
     const blobs = new WeakMap<ParsedFile, [string, string]>();
     let file: ParsedFile | null = null;
@@ -205,10 +206,20 @@ export function parseUnifiedDiff(text: string, textImageIds?: Map<DiffFile, [str
             };
         } else textImageIds?.set(f as DiffFile, ids);
     }
-    // Git splits a type change (regular file <-> symlink) into a deletion and addition.
-    // Consumers identify files by path, so expose the complete replacement as one change.
+    // A well-formed Git header always supplies a path. Keep the historical
+    // parser representation for malformed input without changing its output.
+    return files as DiffFile[];
+}
+
+export function parseUnifiedDiff(text: string): DiffFile[] {
+    return mergeTypeChanges(parseDiffPatches(text));
+}
+
+// Git splits a type change (regular file <-> symlink) into a deletion and addition.
+// Consumers identify files by path, so expose the complete replacement as one change.
+export function mergeTypeChanges(files: DiffFile[]): DiffFile[] {
     const normalized: DiffFile[] = [];
-    const byPath = new Map<string | null, DiffFile>();
+    const byPath = new Map<string, DiffFile>();
     for (const f of files) {
         const previous = byPath.get(f.path);
         if (previous?.status === "deleted" && f.status === "added") {
@@ -225,11 +236,8 @@ export function parseUnifiedDiff(text: string, textImageIds?: Map<DiffFile, [str
                 }] : [],
             });
         } else {
-            // A well-formed Git header always supplies a path. Keep the historical
-            // parser representation for malformed input without changing its output.
-            const parsed = f as DiffFile;
-            normalized.push(parsed);
-            byPath.set(f.path, parsed);
+            normalized.push(f);
+            byPath.set(f.path, f);
         }
     }
     return normalized;

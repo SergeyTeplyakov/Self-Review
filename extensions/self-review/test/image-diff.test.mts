@@ -4,7 +4,7 @@ import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { Delivery, ReviewService, Store, runGit, startReviewServer } from "./modules.mjs";
+import { Delivery, ReviewService, Store, readGitBlobPrefixes, runGit, startReviewServer } from "./modules.mjs";
 
 test("image requests serve only the selected side, review and revision", async (t) => {
     const tmp = await mkdtemp(path.join(os.tmpdir(), "image-diff-test-"));
@@ -188,4 +188,49 @@ test("images Git diffs as text preview from their bytes, while text named like a
     assert.notEqual(revisionId, "r1");
     assert.equal((await fileIn(pending, "new.jpg", revisionId)).untracked, false);
     await expectImage(pending, revisionId, "new.jpg", { new: jpeg("new") });
+});
+
+test("an image Git diffs as text that replaces a symlink previews beside the link's change", async (t) => {
+    const tmp = await mkdtemp(path.join(os.tmpdir(), "image-diff-test-"));
+    t.after(() => rm(tmp, { recursive: true, force: true }));
+    const repo = path.join(tmp, "repo");
+    await mkdir(repo);
+    const git = (...args: string[]) => runGit(repo, ["-c", "user.name=test", "-c", "user.email=test@example.invalid",
+        "-c", "commit.gpgsign=false", ...args]);
+    await git("init", "-q", "-b", "main");
+    // Recording the symlink in the index works even where the file system cannot create one.
+    const target = (await runGit(repo, ["hash-object", "-w", "--stdin"], { input: "target.jpg" })).stdout.trim();
+    await git("update-index", "--add", "--cacheinfo", `120000,${target},photo.jpg`);
+    await git("commit", "-qm", "base");
+    await git("rm", "-q", "--cached", "photo.jpg");
+    await writeFile(path.join(repo, "photo.jpg"), jpeg("photo"));
+    await git("add", "photo.jpg");
+    assert.doesNotMatch((await git("diff", "--numstat", "HEAD", "--", "photo.jpg")).stdout, /^-\t-\t/m, "Git must diff the fixture as text");
+
+    const service = new ReviewService({ store: new Store(path.join(tmp, "reviews")) });
+    const review = await service.ensureReview({ repoPath: repo, base: "main", scope: "pending" });
+    const file = (await service.getSnapshot(review)).files.find((entry) => entry.path === "photo.jpg");
+    assert.ok(file);
+    assert.equal(file.typeChanged, true);
+    assert.equal(file.binary, true);
+    assert.deepEqual(Object.keys(file.imageSides ?? {}), ["new"]);
+    assert.deepEqual(file.hunks.flatMap((hunk) => hunk.rows).map((row) => [row.t, row.s]), [["del", "target.jpg"]], "the link's change stays");
+    assert.deepEqual((await service.getDiffImage(review, "r1", "photo.jpg", "new")).bytes, jpeg("photo"));
+});
+
+test("blob prefixes keep only the start of each wanted blob, across stream chunks", async (t) => {
+    const repo = await mkdtemp(path.join(os.tmpdir(), "image-diff-test-"));
+    t.after(() => rm(repo, { recursive: true, force: true }));
+    await runGit(repo, ["init", "-q"]);
+    const blob = async (name: string, bytes: Buffer) => {
+        await writeFile(path.join(repo, name), bytes);
+        return (await runGit(repo, ["hash-object", "-w", name])).stdout.trim();
+    };
+    // Larger than a pipe chunk, and full of newlines, so the next header arrives mid-chunk after content that looks like one.
+    const large = await blob("large", Buffer.concat([Buffer.from("LARGE-START-"), Buffer.alloc(300 * 1024, "\n")]));
+    const small = await blob("small", Buffer.from("tiny"));
+    const tooLarge = await blob("too-large", Buffer.alloc(400 * 1024 + 1));
+    const tree = (await runGit(repo, ["mktree"], { input: "" })).stdout.trim();
+    const prefixes = await readGitBlobPrefixes(repo, [large, tooLarge, "1".repeat(large.length), tree, small, large], 400 * 1024, 12);
+    assert.deepEqual(prefixes, new Map([[large, Buffer.from("LARGE-START-")], [small, Buffer.from("tiny")]]));
 });
