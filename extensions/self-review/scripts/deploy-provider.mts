@@ -196,7 +196,7 @@ export async function run(options: Options, checkBuild?: () => void): Promise<vo
                 const stateUrl = new URL(options.url);
                 stateUrl.pathname = "/api/state";
                 stateUrl.hash = "";
-                const response = await fetch(stateUrl);
+                const response = await fetch(stateUrl, { signal: AbortSignal.timeout(10_000) });
                 if (!response.ok) throw new Error(`Provider state returned HTTP ${response.status}`);
                 const state: unknown = await response.json();
                 if (typeof state !== "object" || state === null || !("extensionVersion" in state) ||
@@ -216,6 +216,7 @@ export async function run(options: Options, checkBuild?: () => void): Promise<vo
             installedAfter = snapshot(dist);
             buildIdAfter = error && options.operation === "restore" ? optionalVersion(dist) : version(dist);
             if (!same(dataBefore, dataAfter)) throw new Error("Data directory changed during operation");
+            if (!error && options.operation === "verify" && sourceManifest) requireSame(sourceManifest, installedAfter, "Installed distribution");
         } catch (caught) {
             error = error ? new AggregateError([error, caught], "Operation and final verification failed") : caught;
         }

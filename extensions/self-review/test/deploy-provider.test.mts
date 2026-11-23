@@ -106,6 +106,50 @@ test("reports concurrent data changes in the receipt", async (t) => {
     assert.notDeepEqual(receipt.dataBefore, receipt.dataAfter);
 });
 
+test("verification detects changes during a provider request and bounds incomplete responses", async (t) => {
+    const root = mkdtempSync(path.join(os.tmpdir(), "self-review-verify-test-"));
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    const install = path.join(root, "install");
+    const dist = path.join(install, "dist");
+    const data = path.join(root, "data");
+    mkdirSync(install);
+    mkdirSync(data);
+    cpSync(path.join(process.cwd(), "extensions", "self-review", "dist"), dist, { recursive: true });
+    const { buildId } = JSON.parse(readFileSync(path.join(dist, "version.json"), "utf8")) as { buildId: string };
+    let incomplete = false;
+    const server = createServer((_req, res) => {
+        if (incomplete) {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.write('{"extensionVersion":');
+        } else {
+            writeFileSync(path.join(dist, "concurrent.txt"), "changed");
+            res.end(JSON.stringify({ extensionVersion: { buildId } }));
+        }
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    t.after(() => {
+        server.closeAllConnections();
+        return new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    });
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    const options: Options = {
+        operation: "verify", checkout: process.cwd(), install, data,
+        receipt: path.join(root, "changed.json"), url: `http://127.0.0.1:${address.port}/?t=token`,
+    };
+    await assert.rejects(run(options), /Installed distribution hash mismatch/);
+    const changed = JSON.parse(readFileSync(options.receipt, "utf8")) as { error: string };
+    assert.match(changed.error, /hash mismatch/);
+    rmSync(path.join(dist, "concurrent.txt"));
+    incomplete = true;
+    const receipt = path.join(root, "timeout.json");
+    await assert.rejects(run({ ...options, receipt }), /timeout|abort/i);
+    const timedOut = JSON.parse(readFileSync(receipt, "utf8")) as { finishedAt: string; error: string; dataAfter: unknown };
+    assert.ok(timedOut.finishedAt);
+    assert.match(timedOut.error, /timeout|abort/i);
+    assert.ok(timedOut.dataAfter);
+});
+
 test("deploy rejects a distribution stale against checkout sources", async (t) => {
     const root = mkdtempSync(path.join(os.tmpdir(), "self-review-freshness-test-"));
     t.after(() => rmSync(root, { recursive: true, force: true }));
