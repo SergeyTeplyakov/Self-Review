@@ -11,6 +11,8 @@ import { hunkExcerpt, selectedLines } from "./diff.mjs";
 import { ReviewError, isRecord } from "../web/contracts.mjs";
 import { parseReviewCommand } from "../web/review-commands.mjs";
 import { checkBatchImageBudget, commentImageIds } from "./comment-images.mjs";
+import { readGitBlob } from "./git-process.mjs";
+import { IMAGE_TYPES, imageType, MAX_IMAGE_BYTES } from "./image-format.mjs";
 export { ReviewError } from "../web/contracts.mjs";
 import type { Log, ReviewScope, DeliveryChoice } from "../../types/contracts.js";
 import type { Store } from "./store.mjs";
@@ -813,6 +815,21 @@ export class ReviewService extends EventEmitter {
         const snapshot = await this.store.readSnapshot(reviewId, rev);
         if (!snapshot) throw notFound(`Revision ${rev} not found for review ${reviewId}.`);
         return snapshot;
+    }
+
+    async getDiffImage(reviewId: string, revisionId: string, filePath: string | null, side: string | null) {
+        if (side !== "old" && side !== "new") throw invalid("Expected an old or new image side.");
+        const snapshot = await this.getSnapshot(reviewId, revisionId);
+        const file = snapshot.files.find((entry) => entry.path === filePath);
+        const oid = file?.imageSides?.[side];
+        if (!file || !oid) throw notFound("No image on this side of the reviewed change.");
+        const { repoRoot } = await this.getReview(reviewId);
+        let bytes = file.untracked ? null : await readGitBlob(repoRoot, oid, MAX_IMAGE_BYTES);
+        // Git computes the worktree blob ID for diff without necessarily storing that blob.
+        if (!bytes && side === "new") bytes = await this.git.readMatchingWorkingImage(repoRoot, file, oid);
+        const type = bytes && imageType(bytes);
+        if (!bytes || !type) throw notFound("Image unavailable in this revision, unsupported, or over 2 MB.");
+        return { bytes, mimeType: IMAGE_TYPES[type] };
     }
 
     // Validate gaps against the saved base as well as hunks so newer edits cannot leak into an older revision.

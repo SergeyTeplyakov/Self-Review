@@ -1,5 +1,6 @@
 // Unified diff parsing into a compact, render-friendly structure.
 // Row shape: { t: "ctx" | "add" | "del", o: oldLine | null, n: newLine | null, s: text }
+import { imagePath } from "./image-format.mjs";
 const HUNK_HEADER = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/;
 function stripCr(line) {
     return line.endsWith("\r") ? line.slice(0, -1) : line;
@@ -40,8 +41,11 @@ function sameSidePath(rest) {
 function newFile() {
     return { path: null, oldPath: null, status: "modified", binary: false, untracked: false, additions: 0, deletions: 0, hunks: [] };
 }
-export function parseUnifiedDiff(text) {
+// Parses each patch on its own, so a type change stays a deletion plus an addition until mergeTypeChanges joins them.
+// textImageIds receives Git's old/new blob IDs for image paths diffed as text; only their bytes can show whether they are images.
+export function parseDiffPatches(text, textImageIds) {
     const files = [];
+    const blobs = new WeakMap();
     let file = null;
     let hunk = null;
     let oldRemaining = 0;
@@ -123,11 +127,15 @@ export function parseUnifiedDiff(text) {
             file.oldMode = line.slice("old mode ".length);
         else if (line.startsWith("new mode "))
             file.newMode = line.slice("new mode ".length);
-        else if (/^index \S+ \d{6}$/.test(line)) {
-            if (file.status !== "added")
-                file.oldMode = line.slice(-6);
-            if (file.status !== "deleted")
-                file.newMode = line.slice(-6);
+        else if (line.startsWith("index ")) {
+            const index = /^index ([a-f0-9]+)\.\.([a-f0-9]+)(?: (\d{6}))?$/.exec(line);
+            if (index) {
+                blobs.set(file, [index[1], index[2]]);
+                if (index[3] && file.status !== "added")
+                    file.oldMode = index[3];
+                if (index[3] && file.status !== "deleted")
+                    file.newMode = index[3];
+            }
         }
         else if (line.startsWith("rename from ")) {
             file.status = "renamed";
@@ -156,9 +164,28 @@ export function parseUnifiedDiff(text) {
             f.path = f.oldPath;
         if (f.status === "added")
             f.oldPath = null;
+        const ids = blobs.get(f);
+        if (!ids || !(imagePath(f.path) || imagePath(f.oldPath)))
+            continue;
+        if (f.binary) {
+            f.imageSides = {
+                ...(f.status !== "added" && { old: ids[0] }),
+                ...(f.status !== "deleted" && { new: ids[1] }),
+            };
+        }
+        else
+            textImageIds?.set(f, ids);
     }
-    // Git splits a type change (regular file <-> symlink) into a deletion and addition.
-    // Consumers identify files by path, so expose the complete replacement as one change.
+    // A well-formed Git header always supplies a path. Keep the historical
+    // parser representation for malformed input without changing its output.
+    return files;
+}
+export function parseUnifiedDiff(text) {
+    return mergeTypeChanges(parseDiffPatches(text));
+}
+// Git splits a type change (regular file <-> symlink) into a deletion and addition.
+// Consumers identify files by path, so expose the complete replacement as one change.
+export function mergeTypeChanges(files) {
     const normalized = [];
     const byPath = new Map();
     for (const f of files) {
@@ -170,6 +197,7 @@ export function parseUnifiedDiff(text) {
             Object.assign(previous, {
                 status: "modified", typeChanged: true, newMode: f.newMode,
                 binary: previous.binary || f.binary, additions: newLines,
+                ...((previous.imageSides || f.imageSides) && { imageSides: { ...previous.imageSides, ...f.imageSides } }),
                 hunks: rows.length ? [{
                         header: `@@ -${oldLines ? 1 : 0},${oldLines} +${newLines ? 1 : 0},${newLines} @@`,
                         section: "", oldStart: oldLines ? 1 : 0, oldLines, newStart: newLines ? 1 : 0, newLines, rows,
@@ -177,11 +205,8 @@ export function parseUnifiedDiff(text) {
             });
         }
         else {
-            // A well-formed Git header always supplies a path. Keep the historical
-            // parser representation for malformed input without changing its output.
-            const parsed = f;
-            normalized.push(parsed);
-            byPath.set(f.path, parsed);
+            normalized.push(f);
+            byPath.set(f.path, f);
         }
     }
     return normalized;
