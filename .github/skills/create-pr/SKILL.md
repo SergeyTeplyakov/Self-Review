@@ -1,23 +1,47 @@
 ---
 name: create-pr
-description: "Create or finish a pull request end to end: validate the change, review and address Copilot feedback, verify CI, and merge automatically when every safety gate passes. USE FOR: create PR, open a pull request, finish this PR, address PR review comments, get this change merged."
+description: "Create or finish a pull request end to end: validate the change, review and address Copilot feedback, verify CI, and merge according to the resolved merge mode (auto by default, after every safety gate passes). USE FOR: create PR, open a pull request, finish this PR, address PR review comments, get this change merged."
 ---
 
 # Create a pull request
 
-When the user asks to create a PR or invokes this skill, treat that as
-authorization for the routine workflow below, including merging when the
-default auto-merge gates pass. Do not pause for redundant approvals at each
-stage. This skill does not authorize merging an existing PR unless the user
-invokes it for that PR or clearly delegates that work. An explicit no-merge
-request (for example, "create a PR but don't merge it") opts out of merging.
+This skill is the single authoritative procedure from a local change to a merged
+PR. Personal skills and instructions overlay it by setting the inputs below;
+they point here instead of restating its steps.
 
-The user may also request **manual mode** or **no merge**. In either case,
-create or update the PR and complete review and validation, then hand off
-without merging. An explicit user restriction, higher-priority instruction,
-native permission or confirmation gate, branch protection, or repository policy
-always wins. If another applicable instruction requires separate merge
-approval, do not bypass it; report the conflict and wait for that approval.
+## Authorization inputs
+
+Resolve each input before step 1, in this order: the user's explicit words in the
+current request, then applicable personal instructions or skill overlays, then
+the default. Invoking this skill authorizes every stage the resolved inputs
+allow, so routine stages need no further approval.
+
+| Input | Values | Default |
+| --- | --- | --- |
+| `merge` | `auto`: merge the verified head once every gate in section 3 passes. `ask`: hand off with the evidence and merge only after the user approves that head. `none`: never merge. | `auto` |
+| `agentic-review` | `authorized`: run the Self-Review multi-model review with the user's saved settings (it may consume credits). `skip`: use the canvas for human-led inspection only. | `skip` |
+
+An explicit no-merge request ("create a PR but don't merge it", "manual mode")
+sets `merge` to `none`. An explicit user restriction, higher-priority
+instruction, native permission or confirmation gate, branch protection, or
+repository policy always wins; when one conflicts with an input, report the
+conflict and wait. This skill does not authorize merging an existing PR unless
+the user invokes it for that PR or clearly delegates that work.
+
+## Honor a terminal decision
+
+The workflow ends when the user's latest decision settles the PR: "stop",
+"done", "we're good", "nothing more needed", or a merge or close they performed.
+Before proposing or taking any next action, including in a later turn, refresh
+the facts: re-read the user's latest decision and the live PR state
+(`gh pr view <number> --json state,mergedAt,headRefOid,reviewRequests`). Then
+act on them:
+
+- The user declined further work: report the final state in one message and end.
+- The PR is merged or closed: the only remaining work is the cleanup in
+  section 4, unless the user declined it.
+- A new user request starts a new run with freshly resolved inputs; earlier
+  approvals, including a merge approval, apply only to the head they named.
 
 ## 1. Establish the exact change
 
@@ -35,11 +59,16 @@ approval, do not bypass it; report the conflict and wait for that approval.
    cover every required check.
 4. Open the Self-Review canvas on the explicit checkout and the whole intended
    branch comparison (`all`) against the verified target. Preserve existing
-   filters and user review state. Use configured agentic-review settings when
-   available; never choose paid models or change saved settings on the user's
-   behalf. Validate findings against the change and baseline. Fix only
-   confirmed, actionable, in-scope issues. If the review or required capability
-   is unavailable, state that limitation; do not claim it ran.
+   filters and user review state. With `agentic-review` set to `authorized`, run
+   the multi-model review with the user's saved settings (the canvas's suggested
+   models when none are saved); report an unavailable model or host capability
+   as a blocker instead of substituting. With `skip`, use the canvas for diff
+   inspection only. Choose paid models and change saved settings only when the
+   user asks. Validate each finding against the change, baseline, callers, and
+   tests. Fix confirmed, actionable, in-scope issues, reply in each addressed
+   canvas thread with the change and verification, and resolve only findings
+   confirmed fixed. If the review or a required capability is unavailable, state
+   that limitation; do not claim it ran.
 
 ## 2. Create or update the PR
 
@@ -100,7 +129,7 @@ the replacement run covers the same required validation and that the failed
 evidence is no longer applicable. Never waive required checks, bypass branch
 protection, or merge on a green subset.
 
-Unusual signals that block automatic merge include reproducible, flaky, or
+Unusual signals that block merging include reproducible, flaky, or
 unexplained failures; unresolved or conflicting in-scope feedback; uncertain
 findings; security concerns; unexpected commits or file changes; merge
 conflicts; changed requirements; or any missing verification. Stop before
@@ -111,19 +140,27 @@ review or validation is unknown.
 
 ## 4. Merge or hand off
 
-In the default mode, once every gate above is satisfied, merge the exact
-verified head using the repository's merge convention and an exact-head guard
-such as `gh pr merge --match-head-commit <verified-sha>`. If repository policy
-requires GitHub auto-merge or a merge queue, use it only after the gates pass;
-do not use it to bypass checks or to queue an unverified head. Never force a
-merge or bypass policy.
+Act on the resolved `merge` input once every gate above is satisfied:
+
+- `auto`: merge the exact verified head using the repository's merge
+  convention and an exact-head guard such as
+  `gh pr merge --match-head-commit <verified-sha>`.
+- `ask`: summarize the evidence (head SHA, validation, review state, CI per job)
+  and ask the user whether to merge that head. Merge only after explicit
+  approval, with the same exact-head guard. Leave auto-merge unarmed unless the
+  user asks for it.
+- `none`: leave the PR open and report its exact status.
+
+If repository policy requires GitHub auto-merge or a merge queue, use it only
+after the gates pass; do not use it to bypass checks or to queue an unverified
+head. Never force a merge or bypass policy.
 
 After the merge command, verify the PR's actual merged state and merged commit
 before reporting success. If the head changed or the guard rejects the merge,
-restart verification for the new state. In manual/no-merge mode, or when any
-gate is blocked, leave the PR open and report its exact status, completed
-validation, review state, and the reason it was not merged. Never claim a PR is
-merged based only on a command exit or a queued merge.
+restart verification for the new state. When any gate is blocked, leave the PR
+open and report its exact status, completed validation, review state, and the
+reason it was not merged. Never claim a PR is merged based only on a command
+exit or a queued merge.
 
 After GitHub confirms the PR is merged:
 
