@@ -186,6 +186,11 @@ async function addImageSides(repoRoot: string, baseCommit: string, patches: Diff
     }
 }
 
+// Refresh stores a new revision only when the fingerprint changes. Bump this when capture records data that Git's diff
+// output does not show, so the next refresh of an existing review stores that data rather than keeping the revision
+// captured without it. Version 2 added image sides, which a pure rename or mode change gains with an unchanged diff.
+const CAPTURE_VERSION = 2;
+
 // scope "all" diffs the working tree against the merge-base with `base` (the whole branch or PR);
 // scope "pending" diffs it against HEAD, so committed work is left out.
 export async function captureSnapshot({ repoRoot, base, paths, exclude, includeUntracked = true, contextLines = 5, scope = "all" }: CaptureOptions): Promise<Snapshot> {
@@ -209,7 +214,7 @@ export async function captureSnapshot({ repoRoot, base, paths, exclude, includeU
     const patches = parseDiffPatches(diff.stdout, textImageIds);
     await addImageSides(repoRoot, baseCommit, patches, textImageIds);
     const files = mergeTypeChanges(patches);
-    const hash = createHash("sha256").update(baseCommit).update("\0").update(diff.stdout);
+    const hash = createHash("sha256").update(`capture v${CAPTURE_VERSION}\0`).update(baseCommit).update("\0").update(diff.stdout);
 
     if (includeUntracked) {
         const list = await runGit(repoRoot, ["ls-files", "--others", "--exclude-standard", "-z", "--", ...pathspec]);

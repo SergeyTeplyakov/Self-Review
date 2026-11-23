@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -101,18 +102,39 @@ test("pure image renames and mode-only changes preview the unchanged blob on bot
     await chmod(path.join(repo, "b.png"), 0o755);
     await git("update-index", "--chmod=+x", "b.png");
 
-    const service = new ReviewService({ store: new Store(path.join(tmp, "reviews")) });
+    const store = new Store(path.join(tmp, "reviews"));
+    const service = new ReviewService({ store });
     const review = await service.ensureReview({ repoPath: repo, base: "main", scope: "pending" });
-    const { files } = await service.getSnapshot(review);
-    for (const [name, status, bytes] of [["renamed.png", "renamed", png(1)], ["b.png", "modified", png(2)]] as const) {
-        const file = files.find((entry) => entry.path === name);
-        assert.ok(file, name);
-        assert.equal(file.status, status);
-        assert.equal(file.hunks.length, 0);
-        for (const side of ["old", "new"]) {
-            assert.deepEqual((await service.getDiffImage(review, "r1", name, side)).bytes, bytes, `${name} ${side}`);
+    const expectPreviews = async (revisionId: string) => {
+        const { files } = await service.getSnapshot(review);
+        for (const [name, status, bytes] of [["renamed.png", "renamed", png(1)], ["b.png", "modified", png(2)]] as const) {
+            const file = files.find((entry) => entry.path === name);
+            assert.ok(file, name);
+            assert.equal(file.status, status);
+            assert.equal(file.hunks.length, 0);
+            for (const side of ["old", "new"]) {
+                assert.deepEqual((await service.getDiffImage(review, revisionId, name, side)).bytes, bytes, `${name} ${side}`);
+            }
         }
-    }
+    };
+    await expectPreviews("r1");
+
+    // A provider without image previews stored no image sides, and fingerprinted only the base commit and Git's diff,
+    // which these changes leave exactly as it was. Refresh must still store a revision that previews them.
+    const legacy = await store.readSnapshot(review, "r1");
+    assert.ok(legacy);
+    const diff = await git("diff", "--no-color", "--no-ext-diff", "--no-textconv", "--find-renames", "--src-prefix=a/",
+        "--dst-prefix=b/", "-U5", legacy.baseCommit, "--");
+    const fingerprint = createHash("sha256").update(legacy.baseCommit).update("\0").update(diff.stdout).digest("hex");
+    await store.writeSnapshot(review, "r1", { ...legacy, fingerprint, files: legacy.files.map(({ imageSides, ...file }) => file) });
+    await store.updateReview(review, (current) => {
+        assert.ok(current);
+        current.revisions[0].fingerprint = fingerprint;
+        return { review: current };
+    });
+    await assert.rejects(service.getDiffImage(review, "r1", "renamed.png", "new"));
+    assert.equal((await service.refresh(review)).revisionId, "r2");
+    await expectPreviews("r2");
 });
 
 // A valid 1x1 JPEG; jpeg() prefixes a comment so long that Git sees no NUL in the first 8000 bytes and diffs it as text.
