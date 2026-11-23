@@ -249,4 +249,11 @@ export class SettingsService {
             settings.repos[identity.key] = { ...entry, name: identity.name, updatedAt: new Date().toISOString() };
         });
     }
+
+    async withInstructionMappings<T>(
+        repoRoot: string,
+        action: (mappings: InstructionMapping[]) => Promise<T>,
+    ): Promise<T> {
+        return this.store.lock("settings", async () => action((await this.get(repoRoot)).instructionMappings));
+    }
 }

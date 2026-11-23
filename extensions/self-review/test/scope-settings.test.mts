@@ -432,6 +432,84 @@ test("concurrent instruction-mapping updates preserve additions from different r
     );
 });
 
+test("auto-save holds the settings lock until its mapped write is complete", async (t) => {
+    const { store } = fresh();
+    const settings = new SettingsService({ store });
+    const service = new ReviewService({ store, settings, autoSaveLearnedRules: async (root) => (await settings.get(root)).autoSaveLearnedRules });
+    const otherSettings = new SettingsService({ store: new Store(store.root) });
+    const mapping = { pathPrefix: "", instructionRoot: "", splitLanguageSpecific: false };
+    await settings.update(repo, { autoSaveLearnedRules: true, instructionMappings: [mapping] });
+    const { reviewId, thread, message } = await commentThread(service);
+    const file = path.join(repo, ".github", "copilot-instructions.md");
+    t.after(() => rm(path.join(repo, ".github"), { recursive: true, force: true }));
+    let entered!: () => void;
+    let release!: () => void;
+    const waiting = new Promise<void>(resolve => { entered = resolve; });
+    const released = new Promise<void>(resolve => { release = resolve; });
+    const originalLock = store.lock.bind(store);
+    store.lock = async <T,>(key: string, action: () => Promise<T>): Promise<T> => {
+        if (key.startsWith("guideline-root:")) { entered(); await released; }
+        return originalLock(key, action);
+    };
+    const save = agentReply(service, reviewId, thread, {
+        inReplyTo: message.messageId,
+        lessons: [{ rule: "Keep error paths explicit.", status: "proposed", destination: { kind: "general" } }],
+    });
+    await Promise.race([waiting, save.then(() => { throw new Error("Auto-save did not reach the instruction-root lock."); })]);
+    try {
+        const settingsLock = path.join(store.root, "locks", `${createHash("sha256").update("settings").digest("hex")}.lock`);
+        await access(settingsLock);
+        const remove = otherSettings.update(repo, { instructionMappings: [] });
+        release();
+        await Promise.all([save, remove]);
+        assert.match(await readFile(file, "utf8"), /Keep error paths explicit\./);
+        assert.deepEqual((await settings.get(repo)).instructionMappings, []);
+        const lesson = required((await service.getReview(reviewId)).lessons[0]);
+        assert.deepEqual([lesson.status, lesson.savedTo], ["saved", ".github/copilot-instructions.md"]);
+    } finally {
+        release();
+        await save;
+    }
+});
+
+test("auto-save uses the current mapping when removal wins the settings lock", async (t) => {
+    const { store } = fresh();
+    const settings = new SettingsService({ store });
+    const otherSettings = new SettingsService({ store: new Store(store.root) });
+    const service = new ReviewService({ store, settings, autoSaveLearnedRules: async (root) => (await settings.get(root)).autoSaveLearnedRules });
+    await settings.update(repo, {
+        autoSaveLearnedRules: true,
+        instructionMappings: [{ pathPrefix: "", instructionRoot: "", splitLanguageSpecific: false }],
+    });
+    const { reviewId, thread, message } = await commentThread(service);
+    const file = path.join(repo, ".github", "copilot-instructions.md");
+    t.after(() => rm(path.join(repo, ".github"), { recursive: true, force: true }));
+    let entered!: () => void;
+    let release!: () => void;
+    const waiting = new Promise<void>(resolve => { entered = resolve; });
+    const released = new Promise<void>(resolve => { release = resolve; });
+    const originalLock = store.lock.bind(store);
+    store.lock = async <T,>(key: string, action: () => Promise<T>): Promise<T> => {
+        if (key === "settings") { entered(); await released; }
+        return originalLock(key, action);
+    };
+    const save = agentReply(service, reviewId, thread, {
+        inReplyTo: message.messageId,
+        lessons: [{ rule: "Keep error paths explicit.", status: "proposed", destination: { kind: "general" } }],
+    });
+    await Promise.race([waiting, save.then(() => { throw new Error("Auto-save did not reach the settings lock."); })]);
+    try {
+        await otherSettings.update(repo, { instructionMappings: [] });
+    } finally {
+        release();
+        await save;
+    }
+    await assert.rejects(readFile(file), { code: "ENOENT" });
+    const lesson = required((await service.getReview(reviewId)).lessons[0]);
+    assert.equal(lesson.status, "proposed");
+    assert.match(lesson.saveError ?? "", /Choose an instruction destination/);
+});
+
 test("case-equivalent mapping confirmation replaces the existing entry on case-insensitive hosts",
     { skip: process.platform !== "win32" && process.platform !== "darwin" }, async (t) => {
         const { store, service } = fresh();

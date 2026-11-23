@@ -65,6 +65,7 @@ export interface SettingsDocument {
 export interface SettingsStore {
     readSettings(): Promise<SettingsDocument>;
     updateSettings<T>(mutate: (settings: SettingsDocument) => T | Promise<T>): Promise<T>;
+    lock<T>(key: string, action: () => Promise<T>): Promise<T>;
 }
 
 export interface GitRunner {

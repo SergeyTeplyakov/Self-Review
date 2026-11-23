@@ -244,4 +244,7 @@ export class SettingsService {
             settings.repos[identity.key] = { ...entry, name: identity.name, updatedAt: new Date().toISOString() };
         });
     }
+    async withInstructionMappings(repoRoot, action) {
+        return this.store.lock("settings", async () => action((await this.get(repoRoot)).instructionMappings));
+    }
 }

@@ -246,23 +246,26 @@ async function saveRule(store, repoRoot, lesson, settings, confirmedNewFile = fa
     }
     if (!personal) {
         const reviewedPath = lesson.reviewedPath;
-        const mapping = reviewedPath === undefined ? undefined : confirmedMapping
-            ?? (settings ? selectInstructionMapping((await settings.get(repoRoot)).instructionMappings, reviewedPath) : undefined);
-        if (reviewedPath === undefined || !mapping) {
-            lesson.saveError = "Choose an instruction destination before saving this repository guideline.";
-            return false;
-        }
-        const destination = lesson.destination ?? inferRuleDestination(reviewedPath);
-        const result = await saveRepositoryRule(repoRoot, mapping, reviewedPath, destination, lesson.rule, confirmedNewFile, (key, action) => store.lock(key, action), expectedSavedTo);
-        if (result.needsConfirmation) {
-            lesson.saveError = `Confirm creating ${result.savedTo} before saving this guideline.`;
-            return false;
-        }
-        lesson.status = "saved";
-        lesson.savedTo = result.savedTo;
-        lesson.updatedAt = nowIso();
-        delete lesson.saveError;
-        return true;
+        const saveWithMapping = async (mapping) => {
+            if (reviewedPath === undefined || !mapping) {
+                lesson.saveError = "Choose an instruction destination before saving this repository guideline.";
+                return false;
+            }
+            const destination = lesson.destination ?? inferRuleDestination(reviewedPath);
+            const result = await saveRepositoryRule(repoRoot, mapping, reviewedPath, destination, lesson.rule, confirmedNewFile, (key, action) => store.lock(key, action), expectedSavedTo);
+            if (result.needsConfirmation) {
+                lesson.saveError = `Confirm creating ${result.savedTo} before saving this guideline.`;
+                return false;
+            }
+            lesson.status = "saved";
+            lesson.savedTo = result.savedTo;
+            lesson.updatedAt = nowIso();
+            delete lesson.saveError;
+            return true;
+        };
+        if (confirmedMapping || !settings || reviewedPath === undefined)
+            return saveWithMapping(confirmedMapping);
+        return settings.withInstructionMappings(repoRoot, (mappings) => saveWithMapping(selectInstructionMapping(mappings, reviewedPath)));
     }
     const root = await realpath(os.homedir());
     const folder = path.join(root, ".copilot");
