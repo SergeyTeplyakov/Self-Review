@@ -85,7 +85,8 @@ function newFile(): ParsedFile {
     return { path: null, oldPath: null, status: "modified", binary: false, untracked: false, additions: 0, deletions: 0, hunks: [] };
 }
 
-export function parseUnifiedDiff(text: string): DiffFile[] {
+// textImageIds receives Git's old/new blob IDs for image paths diffed as text; only their bytes can show whether they are images.
+export function parseUnifiedDiff(text: string, textImageIds?: Map<DiffFile, [string, string]>): DiffFile[] {
     const files: ParsedFile[] = [];
     const blobs = new WeakMap<ParsedFile, [string, string]>();
     let file: ParsedFile | null = null;
@@ -196,12 +197,13 @@ export function parseUnifiedDiff(text: string): DiffFile[] {
         if (!f.path) f.path = f.oldPath;
         if (f.status === "added") f.oldPath = null;
         const ids = blobs.get(f);
-        if (f.binary && ids && (imagePath(f.path) || imagePath(f.oldPath))) {
+        if (!ids || !(imagePath(f.path) || imagePath(f.oldPath))) continue;
+        if (f.binary) {
             f.imageSides = {
                 ...(f.status !== "added" && { old: ids[0] }),
                 ...(f.status !== "deleted" && { new: ids[1] }),
             };
-        }
+        } else textImageIds?.set(f as DiffFile, ids);
     }
     // Git splits a type change (regular file <-> symlink) into a deletion and addition.
     // Consumers identify files by path, so expose the complete replacement as one change.

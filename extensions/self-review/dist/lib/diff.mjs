@@ -41,7 +41,8 @@ function sameSidePath(rest) {
 function newFile() {
     return { path: null, oldPath: null, status: "modified", binary: false, untracked: false, additions: 0, deletions: 0, hunks: [] };
 }
-export function parseUnifiedDiff(text) {
+// textImageIds receives Git's old/new blob IDs for image paths diffed as text; only their bytes can show whether they are images.
+export function parseUnifiedDiff(text, textImageIds) {
     const files = [];
     const blobs = new WeakMap();
     let file = null;
@@ -163,12 +164,16 @@ export function parseUnifiedDiff(text) {
         if (f.status === "added")
             f.oldPath = null;
         const ids = blobs.get(f);
-        if (f.binary && ids && (imagePath(f.path) || imagePath(f.oldPath))) {
+        if (!ids || !(imagePath(f.path) || imagePath(f.oldPath)))
+            continue;
+        if (f.binary) {
             f.imageSides = {
                 ...(f.status !== "added" && { old: ids[0] }),
                 ...(f.status !== "deleted" && { new: ids[1] }),
             };
         }
+        else
+            textImageIds?.set(f, ids);
     }
     // Git splits a type change (regular file <-> symlink) into a deletion and addition.
     // Consumers identify files by path, so expose the complete replacement as one change.
