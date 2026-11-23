@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { lstat, mkdir, mkdtemp, open, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { inferRuleDestination, previewRepositoryRuleDestination, saveRepositoryRule, Store } from "./modules.mjs";
@@ -145,6 +146,66 @@ test("split-off overview rules use an existing scoped file only if it covers the
         { kind: "language", language: "typescript", applyTo: "**/*.ts" })).savedTo, ".github/copilot-instructions.md");
 });
 
+test("a destination that changes before the file lock is rejected without writing", async (t) => {
+    for (const expected of [undefined, ".github/copilot-instructions.md"]) {
+        const repo = await fixture(t);
+        const mapping: InstructionMapping = { pathPrefix: "", instructionRoot: "", splitLanguageSpecific: false };
+        const scoped = path.join(repo, ".github", "instructions", "csharp.instructions.md");
+        const general = path.join(repo, ".github", "copilot-instructions.md");
+        const lock = async <T,>(key: string, action: () => Promise<T>): Promise<T> => {
+            if (key.startsWith("guideline-file:")) {
+                await mkdir(path.dirname(scoped), { recursive: true });
+                await writeFile(scoped, `---\napplyTo: "**/*.cs"\n---\n`);
+            }
+            return action();
+        };
+        await assert.rejects(
+            saveRepositoryRule(repo, mapping, "src/Rules.cs", language, "Use explicit guards.", false, lock, expected),
+            /destination changed to \.github\/instructions\/csharp\.instructions\.md/,
+        );
+        await assert.rejects(readFile(general), { code: "ENOENT" });
+        assert.doesNotMatch(await readFile(scoped, "utf8"), /Use explicit guards/);
+    }
+});
+
+test("cooperating saves resolve destinations serially under the instruction-root lock", async (t) => {
+    const repo = await fixture(t);
+    const stores = [new Store(path.join(repo, "store")), new Store(path.join(repo, "store"))];
+    let firstEntered!: () => void;
+    let releaseFirst!: () => void;
+    let secondObserved!: () => void;
+    const entered = new Promise<void>(resolve => { firstEntered = resolve; });
+    const released = new Promise<void>(resolve => { releaseFirst = resolve; });
+    const observed = new Promise<void>(resolve => { secondObserved = resolve; });
+    const keys: string[] = [];
+    const firstLock = <T,>(key: string, action: () => Promise<T>) => stores[0].lock(key, async () => {
+        if (key.startsWith("guideline-root:")) { keys[0] = key; firstEntered(); await released; }
+        return action();
+    });
+    const secondLock = <T,>(key: string, action: () => Promise<T>) => {
+        if (key.startsWith("guideline-root:")) { keys[1] = key; secondObserved(); }
+        return stores[1].lock(key, action);
+    };
+    const mapping = { pathPrefix: "", instructionRoot: "", splitLanguageSpecific: true };
+    const first = saveRepositoryRule(repo, mapping, "src/Rules.cs", language, "Use explicit guards.", true, firstLock);
+    await entered;
+    const second = saveRepositoryRule(repo, { ...mapping, splitLanguageSpecific: false },
+        "src/Rules.cs", language, "Keep errors explicit.", false, secondLock);
+    try {
+        await observed;
+        assert.equal(keys[0], keys[1]);
+        const lockFile = path.join(stores[0].root, "locks", `${createHash("sha256").update(keys[1]).digest("hex")}.lock`);
+        await assert.rejects(open(lockFile, "wx"), { code: "EEXIST" });
+    } finally {
+        releaseFirst();
+    }
+    const [created, appended] = await Promise.all([first, second]);
+    assert.equal(created.savedTo, ".github/instructions/csharp.instructions.md");
+    assert.equal(appended.savedTo, created.savedTo);
+    assert.match(await readFile(path.join(repo, created.savedTo), "utf8"), /Keep errors explicit\./);
+    await assert.rejects(readFile(path.join(repo, ".github", "copilot-instructions.md")), { code: "ENOENT" });
+});
+
 test("instruction roots may begin with two dots without traversing", async (t) => {
     const repo = await fixture(t);
     const mapping: InstructionMapping = { pathPrefix: "", instructionRoot: "..notes", splitLanguageSpecific: false };
@@ -167,10 +228,12 @@ test("case-alias destinations share a file lock across stores", { skip: process.
     const observed = new Promise<void>(resolve => { secondObserved = resolve; });
     const keys: string[] = [];
     const firstLock = <T,>(key: string, action: () => Promise<T>) => {
+        if (key.startsWith("guideline-root:")) return action();
         keys[0] = key;
         return stores[0].lock(key, async () => { firstEntered(); await released; return action(); });
     };
     const secondLock = <T,>(key: string, action: () => Promise<T>) => {
+        if (key.startsWith("guideline-root:")) return action();
         keys[1] = key;
         secondObserved();
         return stores[1].lock(key, action);
@@ -186,6 +249,8 @@ test("case-alias destinations share a file lock across stores", { skip: process.
     try {
         await observed;
         assert.equal(keys[0], keys[1], "the same physical destination must use one cross-process lock");
+        const lockFile = path.join(stores[0].root, "locks", `${createHash("sha256").update(keys[1]).digest("hex")}.lock`);
+        await assert.rejects(open(lockFile, "wx"), { code: "EEXIST" });
     } finally {
         releaseFirst();
         await Promise.all([first, second]);
@@ -286,8 +351,8 @@ test("split-off save rejects a selected scoped file narrowed below the rule's ap
     const file = path.join(repo, ".github", "instructions", "typescript-guidance.instructions.md");
     await mkdir(path.dirname(file), { recursive: true });
     await writeFile(file, `---\napplyTo: "**/*.ts,**/*.tsx"\n---\n`);
-    const competingWriter = async <T,>(_key: string, action: () => Promise<T>): Promise<T> => {
-        await writeFile(file, `---\napplyTo: "**/*.ts"\n---\n`);
+    const competingWriter = async <T,>(key: string, action: () => Promise<T>): Promise<T> => {
+        if (key.startsWith("guideline-file:")) await writeFile(file, `---\napplyTo: "**/*.ts"\n---\n`);
         return action();
     };
 
@@ -304,8 +369,8 @@ test("split-off save rejects a selected scoped file whose applyTo changed while 
     const file = path.join(repo, ".github", "instructions", "csharp-documentation.instructions.md");
     await mkdir(path.dirname(file), { recursive: true });
     await writeFile(file, `---\napplyTo: "**/*.cs"\n---\n`);
-    const competingWriter = async <T,>(_key: string, action: () => Promise<T>): Promise<T> => {
-        await writeFile(file, `---\napplyTo: "**/*.ts"\n---\n`);
+    const competingWriter = async <T,>(key: string, action: () => Promise<T>): Promise<T> => {
+        if (key.startsWith("guideline-file:")) await writeFile(file, `---\napplyTo: "**/*.ts"\n---\n`);
         return action();
     };
 
@@ -322,8 +387,8 @@ test("split-off save rejects a selected scoped file deleted while waiting for th
     const file = path.join(repo, ".github", "instructions", "csharp-documentation.instructions.md");
     await mkdir(path.dirname(file), { recursive: true });
     await writeFile(file, `---\napplyTo: "**/*.cs"\n---\n`);
-    const competingWriter = async <T,>(_key: string, action: () => Promise<T>): Promise<T> => {
-        await rm(file);
+    const competingWriter = async <T,>(key: string, action: () => Promise<T>): Promise<T> => {
+        if (key.startsWith("guideline-file:")) await rm(file);
         return action();
     };
 
@@ -338,9 +403,11 @@ test("a concurrent scoped-file creator cannot bypass applyTo validation", async 
     const repo = await fixture(t);
     const mapping: InstructionMapping = { pathPrefix: "", instructionRoot: "", splitLanguageSpecific: true };
     const file = path.join(repo, ".github", "instructions", "csharp.instructions.md");
-    const competingWriter = async <T,>(_key: string, action: () => Promise<T>): Promise<T> => {
-        await mkdir(path.dirname(file), { recursive: true });
-        await writeFile(file, `---\napplyTo: "**/*.ts"\n---\n`);
+    const competingWriter = async <T,>(key: string, action: () => Promise<T>): Promise<T> => {
+        if (key.startsWith("guideline-file:")) {
+            await mkdir(path.dirname(file), { recursive: true });
+            await writeFile(file, `---\napplyTo: "**/*.ts"\n---\n`);
+        }
         return action();
     };
 

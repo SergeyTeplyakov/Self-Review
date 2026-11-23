@@ -259,40 +259,47 @@ export async function previewRepositoryRuleDestination(repoRoot, mapping, review
     return { savedTo: resolved.savedTo, needsConfirmation: resolved.createScopedFile };
 }
 export async function saveRepositoryRule(repoRoot, mapping, reviewedPath, destination, rule, confirmedNewFile, lock, expectedSavedTo) {
-    const resolved = await resolveRepositoryRuleDestination(repoRoot, mapping, reviewedPath, destination, false);
-    if (resolved.createScopedFile && !confirmedNewFile)
-        return { savedTo: resolved.savedTo, needsConfirmation: true };
-    if (expectedSavedTo !== undefined && expectedSavedTo !== resolved.savedTo) {
-        throw new ReviewError("conflict", `The instruction destination changed to ${resolved.savedTo}. Review and confirm the updated destination.`);
-    }
-    const file = resolved.file;
-    const lockFile = path.join(await realpath(repoRoot), ...safeRelativePath(resolved.savedTo));
-    await lock(`guideline-file:${pathKey(lockFile)}`, async () => {
-        await ensureSafeDirectory(repoRoot, path.posix.dirname(resolved.savedTo));
-        const current = await readInstructionFile(file);
-        if (resolved.validateScopedFile) {
-            if (current === null && !resolved.createScopedFile) {
-                throw new ReviewError("conflict", `The instruction destination changed to ${resolved.savedTo}. Review and confirm the updated destination.`);
-            }
-            if (current !== null && !scopedFileApplies(applyToFrom(current), reviewedPath, destination.applyTo)) {
-                throw scopedFileMismatch(resolved.savedTo, reviewedPath, destination.applyTo);
-            }
+    const root = path.join(await realpath(repoRoot), ...safeRelativePath(mapping.instructionRoot));
+    return await lock(`guideline-root:${pathKey(root)}`, async () => {
+        const resolved = await resolveRepositoryRuleDestination(repoRoot, mapping, reviewedPath, destination, false);
+        if (resolved.createScopedFile && !confirmedNewFile)
+            return { savedTo: resolved.savedTo, needsConfirmation: true };
+        if (expectedSavedTo !== undefined && expectedSavedTo !== resolved.savedTo) {
+            throw new ReviewError("conflict", `The instruction destination changed to ${resolved.savedTo}. Review and confirm the updated destination.`);
         }
-        const text = current ?? "";
-        const containsRule = text.split(/\r?\n/).some((line) => line.trim().replace(/^(?:[-*+]|\d+\.)\s+/, "") === rule);
-        if (!containsRule) {
-            const newline = text.includes("\r\n") ? "\r\n" : "\n";
-            if (resolved.createScopedFile && current === null) {
-                await appendFile(file, `---${newline}applyTo: "${destination.applyTo}"${newline}---${newline}${newline}- ${rule}${newline}`, "utf8");
+        const file = resolved.file;
+        const lockFile = path.join(await realpath(repoRoot), ...safeRelativePath(resolved.savedTo));
+        await lock(`guideline-file:${pathKey(lockFile)}`, async () => {
+            await ensureSafeDirectory(repoRoot, path.posix.dirname(resolved.savedTo));
+            const current = await readInstructionFile(file);
+            if (resolved.validateScopedFile) {
+                if (current === null && !resolved.createScopedFile) {
+                    throw new ReviewError("conflict", `The instruction destination changed to ${resolved.savedTo}. Review and confirm the updated destination.`);
+                }
+                if (current !== null && !scopedFileApplies(applyToFrom(current), reviewedPath, destination.applyTo)) {
+                    throw scopedFileMismatch(resolved.savedTo, reviewedPath, destination.applyTo);
+                }
             }
-            else {
-                await appendFile(file, `${text ? (text.endsWith("\n") ? newline : newline + newline) : ""}- ${rule}${newline}`, "utf8");
+            const currentDestination = await resolveRepositoryRuleDestination(repoRoot, mapping, reviewedPath, destination, false);
+            if (currentDestination.savedTo !== resolved.savedTo) {
+                throw new ReviewError("conflict", `The instruction destination changed to ${currentDestination.savedTo}. Review and confirm the updated destination.`);
             }
-        }
-        const saved = await readFile(file, "utf8");
-        if (!saved.split(/\r?\n/).some((line) => line.trim().replace(/^(?:[-*+]|\d+\.)\s+/, "") === rule)) {
-            throw new ReviewError("conflict", "Could not verify the saved guideline.");
-        }
+            const text = current ?? "";
+            const containsRule = text.split(/\r?\n/).some((line) => line.trim().replace(/^(?:[-*+]|\d+\.)\s+/, "") === rule);
+            if (!containsRule) {
+                const newline = text.includes("\r\n") ? "\r\n" : "\n";
+                if (resolved.createScopedFile && current === null) {
+                    await appendFile(file, `---${newline}applyTo: "${destination.applyTo}"${newline}---${newline}${newline}- ${rule}${newline}`, "utf8");
+                }
+                else {
+                    await appendFile(file, `${text ? (text.endsWith("\n") ? newline : newline + newline) : ""}- ${rule}${newline}`, "utf8");
+                }
+            }
+            const saved = await readFile(file, "utf8");
+            if (!saved.split(/\r?\n/).some((line) => line.trim().replace(/^(?:[-*+]|\d+\.)\s+/, "") === rule)) {
+                throw new ReviewError("conflict", "Could not verify the saved guideline.");
+            }
+        });
+        return { savedTo: resolved.savedTo, needsConfirmation: false };
     });
-    return { savedTo: resolved.savedTo, needsConfirmation: false };
 }

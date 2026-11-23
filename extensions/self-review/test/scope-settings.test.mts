@@ -432,6 +432,66 @@ test("concurrent instruction-mapping updates preserve additions from different r
     );
 });
 
+test("case-equivalent mapping confirmation replaces the existing entry on case-insensitive hosts",
+    { skip: process.platform !== "win32" && process.platform !== "darwin" }, async (t) => {
+        const { store, service } = fresh();
+        const settings = new SettingsService({ store });
+        const old = { pathPrefix: "a.cs", instructionRoot: "", splitLanguageSpecific: false };
+        const selected = { pathPrefix: "A.CS", instructionRoot: "", splitLanguageSpecific: false };
+        await settings.update(repo, { instructionMappings: [old] });
+        await assert.rejects(settings.update(repo, { instructionMappings: [old, selected] }),
+            (error) => errorHasCode(error, "invalid_input"));
+        await assert.rejects(settings.updateInstructionMappings(repo, (mappings) => [...mappings, selected]),
+            (error) => errorHasCode(error, "invalid_input"));
+        const { reviewId, thread, message } = await commentThread(service);
+        await agentReply(service, reviewId, thread, {
+            inReplyTo: message.messageId, lessons: [{ rule: "Keep error paths explicit.", status: "proposed" }],
+        });
+        const lesson = required((await service.getReview(reviewId)).lessons[0]);
+        t.after(() => rm(path.join(repo, ".github"), { recursive: true, force: true }));
+        const saved = await service.saveLesson(reviewId, lesson.lessonId, {
+            rule: lesson.rule, scope: "repo", mapping: selected, destination: { kind: "general" },
+        });
+        assert.equal(saved.status, "saved");
+        assert.deepEqual((await settings.get(repo)).instructionMappings, [selected]);
+    });
+
+test("case-alias conflicts are rejected before saving a guideline on case-insensitive hosts",
+    { skip: process.platform !== "win32" && process.platform !== "darwin" }, async (t) => {
+        const { store, service } = fresh();
+        const settings = new SettingsService({ store });
+        const original = { pathPrefix: "a.cs", instructionRoot: "", splitLanguageSpecific: false };
+        const changed = { ...original, instructionRoot: "other" };
+        const selected = { ...original, pathPrefix: "A.CS" };
+        const { reviewId, thread, message } = await commentThread(service);
+        await agentReply(service, reviewId, thread, {
+            inReplyTo: message.messageId, lessons: [{ rule: "Keep error paths explicit.", status: "proposed" }],
+        });
+        const lesson = required((await service.getReview(reviewId)).lessons[0]);
+        const general = path.join(repo, ".github", "copilot-instructions.md");
+        t.after(() => rm(path.join(repo, ".github"), { recursive: true, force: true }));
+        await settings.update(repo, { instructionMappings: [changed] });
+        await assert.rejects(service.saveLesson(reviewId, lesson.lessonId, {
+            rule: lesson.rule, scope: "repo", mapping: selected, destination: { kind: "general" },
+            expectedInstructionMappings: [original],
+        }), (error) => errorHasCode(error, "conflict"));
+        await assert.rejects(readFile(general), { code: "ENOENT" });
+
+        const { key } = await repoIdentity(repo);
+        const aliases = [
+            { pathPrefix: "other", instructionRoot: "", splitLanguageSpecific: false },
+            { pathPrefix: "OTHER", instructionRoot: "", splitLanguageSpecific: false },
+        ];
+        await store.updateSettings((document) => {
+            document.repos[key].instructionMappings = aliases;
+        });
+        await assert.rejects(service.saveLesson(reviewId, lesson.lessonId, {
+            rule: lesson.rule, scope: "repo", mapping: selected, destination: { kind: "general" },
+        }), (error) => errorHasCode(error, "invalid_input"));
+        await assert.rejects(readFile(general), { code: "ENOENT" });
+        assert.deepEqual((await settings.get(repo)).instructionMappings, aliases);
+    });
+
 test("instruction-mapping updates reject a merged list over the settings limit without persisting it", async () => {
     const { store } = fresh();
     const settings = new SettingsService({ store });

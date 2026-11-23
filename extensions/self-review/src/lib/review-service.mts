@@ -12,7 +12,7 @@ import { ReviewError, isRecord, settingsPatch } from "../web/contracts.mjs";
 import { parseReviewCommand } from "../web/review-commands.mjs";
 import { checkBatchImageBudget, commentImageIds } from "./comment-images.mjs";
 import { inferRuleDestination, previewRepositoryRuleDestination, saveRepositoryRule, type RuleDestination } from "./learned-rules.mjs";
-import { selectInstructionMapping, type SettingsService } from "./settings.mjs";
+import { pathKey, selectInstructionMapping, validateMappingPrefixes, type SettingsService } from "./settings.mjs";
 import { readGitBlob } from "./git-process.mjs";
 import { IMAGE_TYPES, imageType, MAX_IMAGE_BYTES } from "./image-format.mjs";
 export { ReviewError } from "../web/contracts.mjs";
@@ -431,10 +431,11 @@ function mappingsWithConfirmedChoice(
         const selected = settingsPatch({ instructionMappings: [value] }).instructionMappings?.[0];
         if (!selected) throw invalid("Provide one valid instruction mapping.");
         confirmed = selected;
-        next = mappings.filter((item) => item.pathPrefix !== selected.pathPrefix);
+        next = mappings.filter((item) => pathKey(item.pathPrefix) !== pathKey(selected.pathPrefix));
         next.push(selected);
         // Validate the list that will be stored before any rule is written, e.g. the mapping count limit.
         next = settingsPatch({ instructionMappings: next }).instructionMappings!;
+        validateMappingPrefixes(next);
     }
     const mapping = selectInstructionMapping(next, reviewedPath);
     if (!mapping) throw invalid("Choose an instruction destination before saving this repository guideline.");
@@ -1236,8 +1237,8 @@ export class ReviewService extends EventEmitter {
                 const selection = mappingsWithConfirmedChoice(stored, mapping, proposal.reviewedPath ?? "");
                 if (expectedMappings) {
                     const prefix = selection.mapping.pathPrefix;
-                    const current = stored.find((item) => item.pathPrefix === prefix);
-                    if (!sameMapping(current, expectedMappings.find((item) => item.pathPrefix === prefix))
+                    const current = stored.find((item) => pathKey(item.pathPrefix) === pathKey(prefix));
+                    if (!sameMapping(current, expectedMappings.find((item) => pathKey(item.pathPrefix) === pathKey(prefix)))
                         && !sameMapping(current, selection.mapping)) {
                         throw new ReviewError("conflict", "Repository instruction mappings changed after this guideline was shown. Review the current destination and save again.");
                     }

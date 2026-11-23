@@ -79,6 +79,11 @@ export function pathCaseSensitive(platform = process.platform) {
 export function pathKey(p, platform = process.platform) {
     return pathCaseSensitive(platform) ? p : p.toLowerCase();
 }
+export function validateMappingPrefixes(mappings) {
+    if (new Set(mappings.map((mapping) => pathKey(mapping.pathPrefix))).size !== mappings.length) {
+        throw new ReviewError("invalid_input", "Instruction mapping path prefixes must be unique.");
+    }
+}
 export function selectInstructionMapping(mappings, reviewedPath) {
     const file = pathKey(reviewedPath.replace(/\\/g, "/").replace(/^\.\/+/, ""));
     return [...mappings]
@@ -218,6 +223,7 @@ export class SettingsService {
             if (patch.dismissed !== undefined)
                 entry.promptDismissed = patch.dismissed;
             if (patch.instructionMappings !== undefined) {
+                validateMappingPrefixes(patch.instructionMappings);
                 if (patch.expectedInstructionMappings !== undefined
                     && JSON.stringify(storedInstructionMappings(entry)) !== JSON.stringify(patch.expectedInstructionMappings)) {
                     throw new ReviewError("conflict", "Repository instruction mappings changed while Settings was open. Reopen Settings and reapply the changes.");
@@ -233,6 +239,7 @@ export class SettingsService {
         await this.store.updateSettings(async (settings) => {
             const entry = { ...settings.repos[identity.key] };
             const mappings = await update(storedInstructionMappings(entry));
+            validateMappingPrefixes(mappings);
             entry.instructionMappings = settingsPatch({ instructionMappings: mappings }).instructionMappings;
             settings.repos[identity.key] = { ...entry, name: identity.name, updatedAt: new Date().toISOString() };
         });
