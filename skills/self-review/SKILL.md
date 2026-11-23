@@ -61,6 +61,8 @@ publication.
    - `pending`: only uncommitted work (staged, unstaged, and untracked files),
      which is the working tree against HEAD.
 2. Read repository instructions and inspect Git state without modifying it.
+   When the repository has `.github/REVIEW.md`, read it at the start of every
+   review and follow its checklist alongside the repository instructions.
    Preserve unrelated edits and include only the selected scope.
 3. Capture a review revision with the repository identity, base commit, target
    commit when applicable, and a content fingerprint for local changes. Include

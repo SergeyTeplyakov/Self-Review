@@ -175,9 +175,13 @@ The built-in review approach draws on [Addy's evidence-based review and simplifi
 | [`extensions/self-review/`](extensions/self-review/) | The canvas: diff view, threads, comment delivery, and the actions the agent uses to reply. |
 | [`skills/self-review/`](skills/self-review/) | The skill that tells the agent how to run the review loop: open the right comparison, process comments, reply, and propose reusable guidelines. |
 | [`.github/skills/create-pr/`](.github/skills/create-pr/) | A repository-local workflow for creating or finishing a PR, addressing review feedback, verifying CI, and guarded automatic merging. |
+| [`.github/REVIEW.md`](.github/REVIEW.md) | This repository's self-review checklist: check the change against its source issue (Spec) and documented rules (Standards), find open issues it solves, and choose `Closes`/`Refs` links for the PR. |
+
+Any repository can add its own `.github/REVIEW.md`; the self-review skill reads it at the start of every review and follows it alongside the repository instructions.
 
 Canvases are a GitHub Copilot app feature. The skill loads in Copilot CLI too, but without the canvas there is nothing to comment on.
 Ask Copilot **"create PR"** to run the workflow; it merges only when its review and CI gates pass and no unusual signals remain. Say **"manual mode"** or **"no merge"** to leave the PR open.
+The PR body uses `Closes #N` for a completed issue on a default-branch PR. A partial fix or a PR to another branch uses `Refs #N` and says what remains.
 After every push or PR creation, the workflow reuses a verified matching
 Self-Review canvas or opens one automatically, preserving the user's existing
 review and filters while showing the whole PR on the correct checkout and base.

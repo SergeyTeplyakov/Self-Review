@@ -60,8 +60,10 @@ act on them:
    project instructions and CI workflow rather than assuming these commands
    cover every required check.
 4. Open the Self-Review canvas on the explicit checkout and the whole intended
-   branch comparison (`all`) against the verified target. Preserve existing
-   filters and user review state. With `agentic-review` set to `authorized`, run
+   branch comparison (`all`) against the verified target, and follow
+   [`REVIEW.md`](../../REVIEW.md), including its source-ticket and open-issue
+   checks. Preserve existing filters and user review state. With
+   `agentic-review` set to `authorized`, run
    the multi-model review with the user's saved or explicitly chosen models. When
    neither exists, ask which models to use before dispatching; canvas
    suggestions are not consent. Report an unavailable model or host capability
@@ -92,7 +94,14 @@ does not itself authorize a paid review.
    never force-push or push to the target branch.
 2. Create the PR or reuse the matching open PR for this branch and target.
    Verify the repository, PR number, base branch, head branch, and remote head
-   SHA. Do not silently retarget an existing PR.
+   SHA. Do not silently retarget an existing PR. Verify the repository's default
+   branch (`gh repo view --json defaultBranchRef`) and link the issues identified
+   in self-review. For a default-branch PR, use `Closes #N` for completed issues
+   and `Refs #N` plus what remains for partial fixes. Verify the published body
+   references and confirm `gh pr view <number> --json closingIssuesReferences`
+   lists exactly the issues meant to close. For another target, use `Refs #N`,
+   verify the references in the published body, and note that this merge won't
+   close those issues. Carry them to the eventual default-branch PR.
 3. Request GitHub Copilot review and verify the request in the PR timeline;
    a successful CLI exit alone is not proof that the review was requested.
 4. Inspect the complete PR review, including every inline thread and overview
@@ -142,6 +151,10 @@ and verified target:
 
 - The PR identity and target are correct, the remote head is the intended commit,
   and there is no unexpected local or remote drift.
+- Reassess issue coverage for each changed head. If a review fix deferred a
+  requirement, replace its `Closes` link with `Refs` and note what remains.
+  Immediately before merging, recheck the published links for the final head
+  and target as in section 2; the PR body can change without changing the SHA.
 - Applicable review is complete for the final changes. Relevant inline and
   overview-only feedback is addressed or explicitly reported as unresolved.
 - Every applicable CI workflow and matrix job has a successful result for that
@@ -195,7 +208,12 @@ open and report its exact status, completed validation, review state, and the
 reason it was not merged. Never claim a PR is merged based only on a command
 exit or a queued merge.
 
-After GitHub confirms the PR is merged:
+After GitHub confirms the PR is merged (including a merge performed by someone
+else), check issue closure before cleanup unless the user declined further work.
+For a default-branch merge, verify each intended closing issue from section 2
+is actually closed. On resumption, recover that list from the PR's closing
+references and body. Report any discrepancy; do not close issues yourself.
+Then clean up:
 
 1. Record the PR's merge commit, run `git fetch origin`, and verify that merge
    commit is an ancestor of `origin/main` (for example,
