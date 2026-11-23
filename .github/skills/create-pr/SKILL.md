@@ -60,8 +60,10 @@ act on them:
    project instructions and CI workflow rather than assuming these commands
    cover every required check.
 4. Open the Self-Review canvas on the explicit checkout and the whole intended
-   branch comparison (`all`) against the verified target. Preserve existing
-   filters and user review state. With `agentic-review` set to `authorized`, run
+   branch comparison (`all`) against the verified target, and follow
+   [`REVIEW.md`](../../REVIEW.md), including its source-ticket and open-issue
+   checks. Preserve existing filters and user review state. With
+   `agentic-review` set to `authorized`, run
    the multi-model review with the user's saved or explicitly chosen models. When
    neither exists, ask which models to use before dispatching; canvas
    suggestions are not consent. Report an unavailable model or host capability
@@ -92,7 +94,11 @@ does not itself authorize a paid review.
    never force-push or push to the target branch.
 2. Create the PR or reuse the matching open PR for this branch and target.
    Verify the repository, PR number, base branch, head branch, and remote head
-   SHA. Do not silently retarget an existing PR.
+   SHA. Do not silently retarget an existing PR. In the PR body, link the source
+   ticket and any issue found during self-review: `Closes #N` when the PR
+   completes the issue, otherwise `Refs #N` with the remaining items. Confirm
+   that `gh pr view <number> --json closingIssuesReferences` lists exactly the
+   issues meant to close.
 3. Request GitHub Copilot review and verify the request in the PR timeline;
    a successful CLI exit alone is not proof that the review was requested.
 4. Inspect the complete PR review, including every inline thread and overview
@@ -189,8 +195,10 @@ after the gates pass; do not use it to bypass checks or to queue an unverified
 head. Never force a merge or bypass policy.
 
 After the merge command, verify the PR's actual merged state and merged commit
-before reporting success. If the head changed or the guard rejects the merge,
-restart verification for the new state. When any gate is blocked, leave the PR
+before reporting success. For a merge into the default branch, also confirm that
+each issue in `closingIssuesReferences` is closed. If the head changed or the
+guard rejects the merge, restart verification for the new state. When any gate
+is blocked, leave the PR
 open and report its exact status, completed validation, review state, and the
 reason it was not merged. Never claim a PR is merged based only on a command
 exit or a queued merge.
