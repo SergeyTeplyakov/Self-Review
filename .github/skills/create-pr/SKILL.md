@@ -19,7 +19,7 @@ allow, so routine stages need no further approval.
 | Input | Values | Default |
 | --- | --- | --- |
 | `merge` | `auto`: merge the verified head once every gate in section 3 passes. `ask`: hand off with the evidence and merge only after the user approves that head. `none`: never merge. | `auto` |
-| `agentic-review` | `authorized`: run the Self-Review multi-model review with the user's saved settings (it may consume credits). `skip`: use the canvas for human-led inspection only. | `skip` |
+| `agentic-review` | `authorized`: run the Self-Review multi-model review with the user's saved or explicitly chosen models (it may consume credits). `skip`: use the canvas for human-led inspection only. | `skip` |
 
 An explicit no-merge request ("create a PR but don't merge it", "manual mode")
 sets `merge` to `none`. An explicit user restriction, higher-priority
@@ -38,8 +38,10 @@ the facts: re-read the user's latest decision and the live PR state
 act on them:
 
 - The user declined further work: report the final state in one message and end.
-- The PR is merged or closed: the only remaining work is the cleanup in
+- The PR is merged: the only remaining work is the post-merge cleanup in
   section 4, unless the user declined it.
+- The PR is closed without merging: report that state and end. Keep the branch
+  and worktree unless the user asks for cleanup.
 - A new user request starts a new run with freshly resolved inputs; earlier
   approvals, including a merge approval, apply only to the head they named.
 
@@ -60,11 +62,12 @@ act on them:
 4. Open the Self-Review canvas on the explicit checkout and the whole intended
    branch comparison (`all`) against the verified target. Preserve existing
    filters and user review state. With `agentic-review` set to `authorized`, run
-   the multi-model review with the user's saved settings (the canvas's suggested
-   models when none are saved); report an unavailable model or host capability
+   the multi-model review with the user's saved or explicitly chosen models. When
+   neither exists, ask which models to use before dispatching; canvas
+   suggestions are not consent. Report an unavailable model or host capability
    as a blocker instead of substituting. With `skip`, use the canvas for diff
-   inspection only. Choose paid models and change saved settings only when the
-   user asks. Validate each finding against the change, baseline, callers, and
+   inspection only. Change saved settings only when the user asks. Validate each
+   finding against the change, baseline, callers, and
    tests. Fix confirmed, actionable, in-scope issues, reply in each addressed
    canvas thread with the change and verification, and resolve only findings
    confirmed fixed. If the review or a required capability is unavailable, state
