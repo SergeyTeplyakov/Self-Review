@@ -37,7 +37,7 @@ function disjoint(a: string, b: string): boolean {
 
 function snapshot(root: string): Snapshot {
     if (!existsSync(root)) return { exists: false, files: {} };
-    const files: Manifest = {};
+    const files: Manifest = Object.create(null);
     function walk(directory: string): void {
         const info = lstatSync(directory);
         if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`Expected a real directory: ${directory}`);

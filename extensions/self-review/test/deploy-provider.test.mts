@@ -19,16 +19,18 @@ test("deploy, verify and restore preserve data and record manifests", async (t) 
     mkdirSync(path.join(data, "reviews"), { recursive: true });
     writeFileSync(path.join(dist, "version.json"), JSON.stringify({ buildId: "old" }));
     writeFileSync(path.join(dist, "old.txt"), "old");
+    writeFileSync(path.join(dist, "__proto__"), "special name");
     writeFileSync(path.join(data, "reviews", "review.json"), "review");
     writeFileSync(path.join(data, "settings.json"), "settings");
     writeFileSync(path.join(data, "lessons.jsonl"), "lesson");
     const options: Options = { operation: "deploy", checkout, install, data, backup, receipt: path.join(root, "deploy.json") };
     await run(options, () => {});
     assert.equal(readFileSync(path.join(backup, "dist", "old.txt"), "utf8"), "old");
-    const receipt = JSON.parse(readFileSync(options.receipt, "utf8")) as { buildIdBefore: string; buildIdAfter: string; dataChanged: boolean; dataBefore: unknown; dataAfter: unknown };
+    const receipt = JSON.parse(readFileSync(options.receipt, "utf8")) as { buildIdBefore: string; buildIdAfter: string; dataChanged: boolean; dataBefore: unknown; dataAfter: unknown; installedBefore: { files: Record<string, string> } };
     assert.equal(receipt.buildIdBefore, "old");
     assert.notEqual(receipt.buildIdAfter, "old");
     assert.equal(receipt.dataChanged, false);
+    assert.match(receipt.installedBefore.files["__proto__"], /^[a-f0-9]{64}$/);
     assert.deepEqual(receipt.dataBefore, receipt.dataAfter);
     assert.equal(readFileSync(path.join(data, "settings.json"), "utf8"), "settings");
 
