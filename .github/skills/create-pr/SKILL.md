@@ -82,9 +82,10 @@ automatically only if no matching panel is open. Preserve the user's selected
 review, base, path filters, exclusions, threads, and settings. If the active
 panel is Pending or narrower than the whole PR, use a separate full-PR panel
 without changing it. Never retarget a panel another session owns; coordinate
-with its owner. Confirm the canvas captured the pushed head and intended diff.
-If the canvas cannot be opened or verified, report the limitation rather than
-claiming success. This checkpoint does not itself authorize a paid review.
+with its owner. Confirm the canvas captured the pushed head and intended diff,
+and exercise the behavior the change touches. If the canvas cannot be opened or
+verified, report the limitation rather than claiming success. This checkpoint
+does not itself authorize a paid review.
 
 1. Commit only the intended changes, following repository conventions. Before
    pushing, verify the commit and working tree. Push the feature branch normally;
@@ -106,12 +107,35 @@ claiming success. This checkpoint does not itself authorize a paid review.
 ## 3. Prove the final head is ready
 
 For each pushed commit, verify the PR's remote head is exactly that SHA, and
-check validation for that exact head. If further changes are needed, make the
-smallest in-scope fix, rerun relevant local validation, push normally, and
-start a new verification cycle for the new SHA. A new PR head invalidates prior
-Copilot review evidence. Request a review for each changed head and verify that
-the completed review is associated with that exact SHA before treating the
-review gate as satisfied.
+check validation for that exact head:
+
+- **Head.** Confirm the repository, checkout path, branch, and PR number.
+  `gh pr view <number> --json headRefOid,headRefName,baseRefName` must show the
+  pushed SHA (`git rev-parse HEAD`), the PR branch, and the intended target. Then
+  `git fetch origin <baseRefName>` so comparisons use the target's current tip.
+- **Local validation.** In a clean checkout at that commit, run
+  `npm run typecheck` and `npm test` (it builds first). Then
+  `git status --porcelain --untracked-files=all -- extensions/self-review/dist`
+  must print nothing; CI enforces the same freshness gate.
+- **CI.** List the runs for that SHA with
+  `gh run list --commit <sha> --json databaseId,workflowName,status,conclusion`,
+  inspect each with `gh run view <id> --json jobs`, or wait with
+  `gh pr checks <number> --watch`.
+- **Live build checks.** Run the "Live build checks" section below.
+
+Results belong to the SHA they ran on. When the branch moves, including through
+another session, run the checks again for the new head. Verifying a head never
+blocks pushing an authorized fix: push it even when a check failed, is pending,
+or could not run, and report that state. Report each check as passed, failed,
+pending, or blocked, and call the head verified only when every check passed.
+
+Outside a `create-pr` run, the checks above only verify and report; fixing,
+pushing, requesting a review, and merging need their own authorization. In a
+`create-pr` run, if further changes are needed, make the smallest in-scope fix,
+rerun relevant local validation, push normally, and start a new verification
+cycle for the new SHA. A new PR head invalidates prior Copilot review evidence.
+Request a review for each changed head and verify that the completed review is
+associated with that exact SHA before treating the review gate as satisfied.
 
 Before any merge, verify all of the following against the same current PR head
 and verified target:
@@ -135,11 +159,17 @@ protection, or merge on a green subset.
 Unusual signals that block merging include reproducible, flaky, or
 unexplained failures; unresolved or conflicting in-scope feedback; uncertain
 findings; security concerns; unexpected commits or file changes; merge
-conflicts; changed requirements; or any missing verification. Stop before
-merging and give the user a concise account of the decision needed or evidence
-still outstanding. Ordinary pending review or CI is a wait state: continue
-monitoring without interrupting the user, but do not arm auto-merge while any
-review or validation is unknown.
+conflicts in handwritten files; changed requirements; or any missing
+verification. Stop before merging and give the user a concise account of the
+decision needed or evidence still outstanding. Ordinary pending review or CI is
+a wait state: continue monitoring without interrupting the user, but do not arm
+auto-merge while any review or validation is unknown.
+
+Branches that both change `extensions/self-review/dist/` conflict in generated
+files, because `version.json`'s `buildId` hashes the distribution. Resolve
+source, test, and README conflicts first, run `npm run build`, and commit the
+regenerated `dist/` instead of hand-merging it; the CI freshness gate verifies
+the result.
 
 ## 4. Merge or hand off
 
@@ -191,3 +221,38 @@ After GitHub confirms the PR is merged:
 5. Reopen or refresh this worktree's Self-Review canvas with the explicit
    repository path, scope `all`, and base `origin/main`. Verify it shows the
    fresh `origin/main` HEAD and no leftover PR changes, then report that HEAD.
+
+## Live build checks
+
+Run these after every push to a PR branch, whatever the change, and before
+reporting a UI change done. A UI change is done when the user can see it in the
+live canvas; tests and screenshots do not count.
+
+1. **Build and validate.** In the checkout being verified, run
+   `npm run build`, `npm run typecheck`, and the relevant tests, and keep
+   `extensions/self-review/dist/` consistent with the sources. Provider identity
+   compares existing `dist` files, so a stale `dist` passes it without serving
+   the edited sources. This applies to an unpushed UI change too.
+2. **Provider identity.** In the checkout being verified, run
+   `npm run deploy:provider -- verify --receipt <new-receipt.json> --url <provider-url>`.
+   The receipt must be a file that does not exist yet, outside the checkout and
+   the installation and data directories; the command rejects any other path.
+   The open canvas's URL works as `<provider-url>`, but it carries an
+   authentication token, so keep it out of PRs, comments, and shared output.
+   After a push the checkout must be clean at the pushed commit, and the
+   receipt's `commit` must equal the pushed SHA. `dataChanged` must be `false`.
+   A matching build needs no deploy or reload.
+3. **Mismatch.** Report it. A mismatch does not authorize replacing or reloading
+   the user-wide provider (`~/.copilot/extensions/self-review` by default),
+   which changes every session; that needs explicit authorization, either the
+   user's request or a standing personal instruction. When authorized, follow
+   the README's `deploy:provider` procedure: `deploy` with a new `--backup`,
+   reload the provider through the host (or ask the session's owner), then
+   `verify` again. If the new build fails verification, `restore` from the
+   backup, reload, and `verify --backup`. Preserve stored reviews, settings, and
+   other user data.
+4. **Canvas.** Run the section 2 canvas checkpoint on the verified head. Before a
+   PR exists, compare against `origin/main`.
+
+If a step cannot be completed, report which and why. Claim the live UI changed
+only after all four pass.
