@@ -1,8 +1,10 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import fs from "node:fs";
 import { access, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import http from "node:http";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -884,7 +886,8 @@ test("local repository settings survive a junction alias and preserve existing e
     await runGit(tmp, ["init", "-q", "-b", "main", other]);
     await symlink(actual, alias, process.platform === "win32" ? "junction" : "dir");
     const { store } = fresh();
-    const legacyKey = `local:${pathKey(path.join(alias, ".git"))}`;
+    const aliasGitDir = path.join(alias, ".git");
+    const legacyKey = `local:${process.platform === "win32" || process.platform === "darwin" ? aliasGitDir.toLowerCase() : aliasGitDir}`;
     const mapping = { pathPrefix: "src", instructionRoot: "src", splitLanguageSpecific: true };
     await store.updateSettings((document) => {
         document.repos[legacyKey] = { autoSaveLearnedRules: true, instructionMappings: [mapping] };
@@ -894,15 +897,17 @@ test("local repository settings survive a junction alias and preserve existing e
     assert.deepEqual((await reopened.get(actual)).instructionMappings, [mapping]);
     assert.equal((await reopened.get(actual)).autoSaveLearnedRules, true);
     assert.deepEqual((await reopened.get(other)).instructionMappings, []);
-    const canonicalKey = `local:${pathKey(path.join(await realpath(actual), ".git"))}`;
+    const physicalGitDir = path.join(await realpath(actual), ".git");
+    const canonicalKey = process.platform === "darwin" ? `local-real:${physicalGitDir}` : `local:${pathKey(physicalGitDir)}`;
     await reopened.update(actual, { delivery: "batch" });
     assert.equal((await reopened.get(alias)).delivery, "batch");
     await reopened.updateInstructionMappings(alias, (mappings) => [...mappings, { pathPrefix: "docs", instructionRoot: "", splitLanguageSpecific: false }]);
     assert.equal((await reopened.get(actual)).instructionMappings.length, 2);
     assert.deepEqual(Object.keys((await store.readSettings()).repos), [canonicalKey]);
     await rm(alias);
-    assert.equal((await reopened.get(actual)).instructionMappings.length, 2);
-    assert.equal((await reopened.get(actual)).autoSaveLearnedRules, true);
+    const restarted = new SettingsService({ store: new Store(store.root) });
+    assert.equal((await restarted.get(actual)).instructionMappings.length, 2);
+    assert.equal((await restarted.get(actual)).autoSaveLearnedRules, true);
     await symlink(actual, alias, process.platform === "win32" ? "junction" : "dir");
 
     const invalidKey = "local:\0unresolvable";
@@ -918,6 +923,93 @@ test("local repository settings survive a junction alias and preserve existing e
     await assert.rejects(reopened.get(actual), /Multiple settings entries/);
     await assert.rejects(reopened.update(alias, { delivery: "ask" }), /Multiple settings entries/);
     assert.equal((await store.readSettings()).repos[legacyKey].delivery, "immediate");
+});
+
+test("local settings resolve the physical path before applying macOS identity case folding", async (t) => {
+    const mixedCaseRepo = path.join(tmp, "UpperCaseRepository");
+    const alias = path.join(tmp, "UpperCaseAlias");
+    await runGit(tmp, ["init", "-q", "-b", "main", mixedCaseRepo]);
+    await symlink(mixedCaseRepo, alias, process.platform === "win32" ? "junction" : "dir");
+    const { store } = fresh();
+    const legacyKey = `local:${path.join(alias, ".git").toLowerCase()}`;
+    const mapping = { pathPrefix: "src", instructionRoot: "src", splitLanguageSpecific: true };
+    await store.updateSettings((document) => {
+        document.repos[legacyKey] = { autoSaveLearnedRules: true, instructionMappings: [mapping] };
+    });
+    const settings = new SettingsService({ store });
+    const descriptor = Object.getOwnPropertyDescriptor(process, "platform");
+    assert.ok(descriptor);
+    const realpathSpy = t.mock.method(fs.promises, "realpath");
+    syncBuiltinESMExports();
+    Object.defineProperty(process, "platform", { ...descriptor, value: "darwin" });
+    try {
+        assert.deepEqual((await settings.get(mixedCaseRepo)).instructionMappings, [mapping]);
+        await settings.update(mixedCaseRepo, { delivery: "batch" });
+        const reopened = new SettingsService({ store: new Store(store.root) });
+        assert.equal((await reopened.get(mixedCaseRepo)).autoSaveLearnedRules, true);
+        assert.deepEqual((await reopened.get(mixedCaseRepo)).instructionMappings, [mapping]);
+        assert.equal((await reopened.get(alias)).delivery, "batch");
+        assert.equal(Object.keys((await store.readSettings()).repos).length, 1);
+        assert.notEqual(Object.keys((await store.readSettings()).repos)[0], legacyKey);
+        assert.ok(realpathSpy.mock.calls.some((call) => call.arguments[0] === path.join(mixedCaseRepo, ".git")));
+        assert.ok(realpathSpy.mock.calls.some((call) => call.arguments[0] === path.join(alias, ".git")));
+    } finally {
+        Object.defineProperty(process, "platform", descriptor);
+        realpathSpy.mock.restore();
+        syncBuiltinESMExports();
+    }
+});
+
+test("case-sensitive macOS repositories have separate settings and ambiguous legacy keys are not assigned", async (t) => {
+    const parent = path.join(tmp, "case-sensitive-identities");
+    const upper = path.join(parent, "Repo");
+    const lower = path.join(parent, "repo");
+    await mkdir(upper, { recursive: true });
+    try {
+        await mkdir(lower);
+    } catch (error) {
+        if (error instanceof Error && "code" in error && error.code === "EEXIST") {
+            t.skip("The test directory is on a case-insensitive filesystem.");
+            return;
+        }
+        throw error;
+    }
+    await runGit(parent, ["init", "-q", "-b", "main", upper]);
+    await runGit(parent, ["init", "-q", "-b", "main", lower]);
+    const { store } = fresh();
+    const settings = new SettingsService({ store });
+    const descriptor = Object.getOwnPropertyDescriptor(process, "platform");
+    assert.ok(descriptor);
+    Object.defineProperty(process, "platform", { ...descriptor, value: "darwin" });
+    try {
+        await settings.update(upper, { delivery: "batch" });
+        await settings.update(lower, { delivery: "ask" });
+        const restarted = new SettingsService({ store: new Store(store.root) });
+        assert.equal((await restarted.get(upper)).delivery, "batch");
+        assert.equal((await restarted.get(lower)).delivery, "ask");
+        const key = `local:${path.join(upper, ".git").toLowerCase()}`;
+        await store.updateSettings((document) => { document.repos[key] = { delivery: "immediate" }; });
+        const before = await store.readSettings();
+        await assert.rejects(restarted.get(upper), /legacy repository settings path is ambiguous/);
+        await assert.rejects(restarted.update(lower, { delivery: "immediate" }), /legacy repository settings path is ambiguous/);
+        assert.deepEqual(await store.readSettings(), before);
+        const originalRealpath = fs.promises.realpath;
+        const realpathSpy = t.mock.method(fs.promises, "realpath", async (value: fs.PathLike, options?: fs.ObjectEncodingOptions | BufferEncoding | null) => {
+            if (String(value) === path.join(lower, ".git")) throw Object.assign(new Error("access denied"), { code: "EACCES" });
+            return originalRealpath(value, options);
+        });
+        syncBuiltinESMExports();
+        try {
+            await assert.rejects(restarted.get(upper), /could not be fully resolved/);
+            await assert.rejects(restarted.update(upper, { delivery: "immediate" }), /could not be fully resolved/);
+            assert.deepEqual(await store.readSettings(), before);
+        } finally {
+            realpathSpy.mock.restore();
+            syncBuiltinESMExports();
+        }
+    } finally {
+        Object.defineProperty(process, "platform", descriptor);
+    }
 });
 
 test("local-only separate-Git-directory worktrees honor core.worktree and otherwise keep the checkout fallback", async () => {

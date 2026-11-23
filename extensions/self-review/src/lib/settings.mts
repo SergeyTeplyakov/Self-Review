@@ -1,7 +1,7 @@
 // @ts-check
 // Per-repository user settings, kept in the extension's user-local data and never written into the repository.
 import path from "node:path";
-import { realpath } from "node:fs/promises";
+import { readdir, realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import * as gitDefault from "./git-process.mjs";
 import { agentReviewDefaults, settingsPatch, isCommentConcurrency, isDeliveryMode, isRecord, ReviewError } from "../web/contracts.mjs";
@@ -126,7 +126,7 @@ function remoteName(url: string): string {
 // The origin remote identifies a repository so a setting follows it across branches and worktrees;
 // without a remote the shared git directory stands in.
 /** @param {string} repoRoot @param {import("../../types/contracts.js").GitRunner} [git] */
-export async function repoIdentity(repoRoot: string, git: GitRunner = gitDefault): Promise<{ key: string; name: string }> {
+async function resolveRepoIdentity(repoRoot: string, git: GitRunner): Promise<{ key: string; name: string; localPath?: string }> {
     const remote = await git.runGit(repoRoot, ["config", "--get", "remote.origin.url"], { allowFail: true });
     const url = remote.ok ? remote.stdout.trim() : "";
     if (url) {
@@ -149,24 +149,82 @@ export async function repoIdentity(repoRoot: string, git: GitRunner = gitDefault
         }
     }
     const name = path.basename(nameRoot);
-    return { key: `local:${pathKey(root)}`, name };
+    return { key: `local:${pathKey(root)}`, name, localPath: root };
 }
 
-async function settingsKey(settings: SettingsDocument, key: string, log: Log): Promise<{ key: string; existingKey: string }> {
-    if (!key.startsWith("local:")) return { key, existingKey: key };
-    const target = pathKey(await realpath(key.slice("local:".length)));
+export async function repoIdentity(repoRoot: string, git: GitRunner = gitDefault): Promise<{ key: string; name: string }> {
+    const { key, name } = await resolveRepoIdentity(repoRoot, git);
+    return { key, name };
+}
+
+function missingPath(error: unknown): boolean {
+    return error instanceof Error && "code" in error && (error.code === "ENOENT" || error.code === "ENOTDIR");
+}
+
+async function legacyLocalPaths(key: string): Promise<{ paths: string[]; error?: unknown }> {
+    const stored = key.slice("local:".length);
+    if (stored.includes("\0")) throw new Error("Stored repository settings path contains a null character.");
+    if (process.platform !== "darwin") return { paths: [await realpath(stored)] };
+    const absolute = path.resolve(stored);
+    const root = path.parse(absolute).root;
+    let candidates = [root];
+    let recoveryError: unknown;
+    for (const part of absolute.slice(root.length).split(path.sep).filter(Boolean)) {
+        const next: string[] = [];
+        for (const parent of candidates) {
+            try {
+                for (const name of await readdir(parent)) {
+                    if (pathKey(name) === pathKey(part)) next.push(path.join(parent, name));
+                }
+            } catch (error) {
+                if (!missingPath(error)) recoveryError ??= error;
+            }
+        }
+        if (next.length > 128) throw new ReviewError("conflict", "A legacy repository settings path has too many case-equivalent matches.");
+        candidates = next;
+        if (!candidates.length) return { paths: [], error: recoveryError };
+    }
+    const resolved: string[] = [];
+    for (const candidate of candidates) {
+        try {
+            resolved.push(await realpath(candidate));
+        } catch (error) {
+            if (!missingPath(error)) recoveryError ??= error;
+        }
+    }
+    return { paths: [...new Set(resolved)], error: recoveryError };
+}
+
+async function settingsKey(settings: SettingsDocument, identity: { key: string; localPath?: string }, log: Log): Promise<{ key: string; existingKey: string }> {
+    if (!identity.localPath) return { key: identity.key, existingKey: identity.key };
+    const physical = await realpath(identity.localPath);
+    const target = process.platform === "darwin" ? physical : pathKey(physical);
+    const canonical = `${process.platform === "darwin" ? "local-real:" : "local:"}${target}`;
     const matches: string[] = [];
     for (const candidate of Object.keys(settings.repos)) {
-        if (!candidate.startsWith("local:")) continue;
+        const isPhysical = candidate.startsWith("local-real:");
+        if (!isPhysical && !candidate.startsWith("local:")) continue;
+        if (candidate === canonical || (process.platform !== "darwin" && candidate === identity.key)) {
+            matches.push(candidate);
+            continue;
+        }
         try {
-            if (pathKey(await realpath(candidate.slice("local:".length))) === target) matches.push(candidate);
+            const recovery = isPhysical ? { paths: [await realpath(candidate.slice("local-real:".length))] } : await legacyLocalPaths(candidate);
+            const { paths, error } = recovery;
+            const resolved = paths.map((value) => process.platform === "darwin" ? value : pathKey(value));
+            if (resolved.includes(target)) {
+                if (error) throw new ReviewError("conflict", "A legacy repository settings path could not be fully resolved; resolve the settings entry before changing it.");
+                if (new Set(resolved).size > 1) throw new ReviewError("conflict", "A legacy repository settings path is ambiguous; resolve the settings entries before changing them.");
+                matches.push(candidate);
+            }
+            if (error) log(`Could not resolve a stored repository settings path: ${error instanceof Error ? error.message : String(error)}`, "warning");
         } catch (error) {
-            if (error instanceof Error && "code" in error && (error.code === "ENOENT" || error.code === "ENOTDIR")) continue;
+            if (error instanceof ReviewError && error.code === "conflict") throw error;
+            if (missingPath(error)) continue;
             log(`Could not resolve a stored repository settings path: ${error instanceof Error ? error.message : String(error)}`, "warning");
         }
     }
     if (matches.length > 1) throw new ReviewError("conflict", "Multiple settings entries refer to the same repository; resolve them before changing settings.");
-    const canonical = `local:${target}`;
     return { key: canonical, existingKey: matches[0] ?? canonical };
 }
 
@@ -206,7 +264,7 @@ export class SettingsService {
     // An unreadable settings file never enables automatic writes.
     /** @param {string} repoRoot @returns {Promise<import("../../types/contracts.js").RepoSettings>} */
     async get(repoRoot: string): Promise<RepoSettings> {
-        const identity = await repoIdentity(repoRoot, this.git);
+        const identity = await resolveRepoIdentity(repoRoot, this.git);
         let entry: StoredRepoSettings | null = null;
         let settings: SettingsDocument | null = null;
         try {
@@ -214,7 +272,7 @@ export class SettingsService {
         } catch (err) {
             this.log(`settings unreadable: ${err instanceof Error ? err.message : String(err)}`);
         }
-        if (settings) entry = settings.repos[(await settingsKey(settings, identity.key, this.log)).existingKey] ?? null;
+        if (settings) entry = settings.repos[(await settingsKey(settings, identity, this.log)).existingKey] ?? null;
         const autoSave = storedAutoSave(entry);
         const instructionMappings = storedInstructionMappings(entry);
         return {
@@ -232,9 +290,9 @@ export class SettingsService {
     /** @param {string} repoRoot @param {unknown} [input] */
     async update(repoRoot: string, input: unknown = {}): Promise<RepoSettings> {
         const patch = settingsPatch(input);
-        const identity = await repoIdentity(repoRoot, this.git);
+        const identity = await resolveRepoIdentity(repoRoot, this.git);
         await this.store.updateSettings(async (settings) => {
-            const { key, existingKey } = await settingsKey(settings, identity.key, this.log);
+            const { key, existingKey } = await settingsKey(settings, identity, this.log);
             const entry = { ...settings.repos[existingKey] };
             const autoSave = patch.autoSaveLearnedRules ?? storedAutoSave(entry);
             if (autoSave !== undefined) {
@@ -263,9 +321,9 @@ export class SettingsService {
         repoRoot: string,
         update: (mappings: InstructionMapping[]) => InstructionMapping[] | Promise<InstructionMapping[]>,
     ): Promise<void> {
-        const identity = await repoIdentity(repoRoot, this.git);
+        const identity = await resolveRepoIdentity(repoRoot, this.git);
         await this.store.updateSettings(async (settings) => {
-            const { key, existingKey } = await settingsKey(settings, identity.key, this.log);
+            const { key, existingKey } = await settingsKey(settings, identity, this.log);
             const entry = { ...settings.repos[existingKey] };
             const mappings = await update(storedInstructionMappings(entry));
             validateMappingPrefixes(mappings);
