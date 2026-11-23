@@ -109,9 +109,10 @@ does not itself authorize a paid review.
 For each pushed commit, verify the PR's remote head is exactly that SHA, and
 check validation for that exact head:
 
-- **Head.** `gh pr view <number> --json headRefOid,headRefName,baseRefName`
-  shows the pushed SHA (`git rev-parse HEAD`), the PR branch, and the verified
-  target.
+- **Head.** Confirm the repository, checkout path, branch, and PR number.
+  `gh pr view <number> --json headRefOid,headRefName,baseRefName` must show the
+  pushed SHA (`git rev-parse HEAD`), the PR branch, and the intended target. Then
+  `git fetch origin <baseRefName>` so comparisons use the target's current tip.
 - **Local validation.** In a clean checkout at that commit, run
   `npm run typecheck` and `npm test` (it builds first). Then
   `git status --porcelain --untracked-files=all -- extensions/self-review/dist`
