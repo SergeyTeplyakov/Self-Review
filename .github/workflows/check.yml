@@ -10,6 +10,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       matrix:
         node: ["22.12.0", "22"]
@@ -26,3 +27,16 @@ jobs:
           status="$(git status --porcelain --untracked-files=all -- extensions/self-review/dist)"
           printf '%s\n' "$status"
           test -z "$status"
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci --ignore-scripts --omit=optional
+      - run: npm run typecheck
+      - run: npm test

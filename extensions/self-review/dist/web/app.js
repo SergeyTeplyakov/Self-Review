@@ -53,6 +53,8 @@ function isDiffFile(value) {
         && (value.status === "modified" || value.status === "added" || value.status === "deleted" || value.status === "renamed")
         && typeof value.additions === "number" && typeof value.deletions === "number"
         && typeof value.binary === "boolean" && isOptionalString(value.note)
+        && (value.imageSides === undefined || (isRecord(value.imageSides)
+            && isOptionalString(value.imageSides.old) && isOptionalString(value.imageSides.new)))
         && (value.untracked === undefined || typeof value.untracked === "boolean")
         && isOptionalString(value.oldMode) && isOptionalString(value.newMode)
         && (value.typeChanged === undefined || typeof value.typeChanged === "boolean")
@@ -2492,6 +2494,19 @@ function lessonsView() {
     const rows = [...lessons].reverse().map((l) => `<tr><td><span class="badge">${esc(l.scope)}</span></td><td>${lessonBadge(l)}</td><td>${inline(l.rule)}</td><td class="mono muted">${esc(l.savedTo ?? "")}</td><td><button class="link" data-action="jump" data-thread="${esc(l.threadId)}">thread</button><div class="muted">${esc(ago(l.createdAt))}</div></td></tr>`).join("");
     return `<h2>Lessons learned (${lessons.length})</h2><table class="lessons-table"><thead><tr><th>Scope</th><th>Status</th><th>Rule</th><th>Saved to</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
 }
+function imageDiffHtml(file) {
+    const rev = state.snapshot?.revisionId;
+    const reviewId = state.review?.reviewId;
+    if (!rev || !reviewId || !file.imageSides)
+        return "";
+    const figures = ["old", "new"].filter(side => file.imageSides?.[side]).map(side => {
+        const label = side === "old" ? "Before" : "After";
+        const name = side === "old" ? file.oldPath ?? file.path : file.path;
+        const url = `/api/diff-image/${encodeURIComponent(rev)}?review=${encodeURIComponent(reviewId)}&path=${encodeURIComponent(file.path)}&side=${side}&t=${encodeURIComponent(TOKEN)}`;
+        return `<figure><figcaption class="${side}">${label}</figcaption><div class="image-stage"><img loading="lazy" decoding="async" src="${esc(url)}" alt="${esc(`${label}: ${name}`)}"></div></figure>`;
+    });
+    return figures.length ? `<div class="image-diff">${figures.join("")}</div>` : "";
+}
 function fileView(file, { stacked = false, folded = false } = {}) {
     const threads = (state.review?.threads ?? []).filter((t) => t.kind !== "overview" && t.location?.path === file.path);
     const placed = new Map();
@@ -2540,9 +2555,9 @@ function fileView(file, { stacked = false, folded = false } = {}) {
         html.push(`<div class="thread">${composerHtml(fileKey, { kind: "file", path: file.path, label: `Comment on ${file.path}`, alwaysOpen: true })}</div>`);
     }
     if (file.binary)
-        html.push(`<div class="card muted">${esc(file.note ?? "Binary file not shown.")}</div>`);
+        html.push(imageDiffHtml(file) || `<div class="card muted">${esc(file.note ?? "Binary file not shown.")}</div>`);
     if (!file.binary && !file.hunks.length)
-        html.push(`<div class="card muted">No textual changes (mode or rename only).</div>`);
+        html.push(`<div class="card muted">No textual changes (mode or rename only).</div>`, imageDiffHtml(file));
     if (!stacked && !file.full && needsContent(file)) {
         const entry = contentEntry(file);
         const why = entry.status === "unavailable"
@@ -3510,6 +3525,15 @@ function onMouseUp() {
     focusComposer(`line:${file.path}:${r.side}:${r.startLine}-${r.endLine}`);
 }
 // ---------- Boot ----------
+document.addEventListener("error", (event) => {
+    const image = event.target;
+    if (image instanceof HTMLImageElement && image.closest(".image-diff")) {
+        const message = document.createElement("p");
+        message.className = "muted";
+        message.textContent = "Preview unavailable. The image may have changed since this revision, be unsupported, or exceed 2 MB. Refresh to compare the latest version.";
+        image.replaceWith(message);
+    }
+}, true);
 document.addEventListener("click", onClick);
 document.addEventListener("auxclick", (e) => {
     if (e.button === 1)

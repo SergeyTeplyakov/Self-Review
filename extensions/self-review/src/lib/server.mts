@@ -283,6 +283,11 @@ export async function startReviewServer({
         const parts = url.pathname.split("/").filter(Boolean).slice(1);
 
         if (req.method === "GET") {
+            if (parts[0] === "diff-image" && parts.length === 2) {
+                if (url.searchParams.get("review") !== reviewId) throw new HttpError(404, "not_found", "Not found.");
+                const { bytes, mimeType } = await service.getDiffImage(reviewId, parts[1], url.searchParams.get("path"), url.searchParams.get("side"));
+                return send(res, 200, bytes, mimeType);
+            }
             if (parts[0] === "comment-images" && parts.length === 2) {
                 if (url.searchParams.get("review") !== reviewId) throw new HttpError(404, "not_found", "Not found.");
                 const { bytes, mimeType } = await readCommentImage(service.store, reviewId, parts[1]);

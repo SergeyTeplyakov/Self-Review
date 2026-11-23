@@ -17,6 +17,7 @@ const settings = await loadModule<typeof import("../src/lib/settings.mjs")>("../
 const settingsActionsModule = await loadModule<typeof import("../src/lib/settings-actions.mjs")>("../dist/lib/settings-actions.mjs");
 const settingsHttp = await loadModule<typeof import("../src/lib/settings-http.mjs")>("../dist/lib/settings-http.mjs");
 const store = await loadModule<typeof import("../src/lib/store.mjs")>("../dist/lib/store.mjs");
+const gitProcess = await loadModule<typeof import("../src/lib/git-process.mjs")>("../dist/lib/git-process.mjs");
 const contracts = await loadModule<typeof import("../src/web/contracts.mjs")>("../dist/web/contracts.mjs");
 const settingsApi = await loadModule<typeof import("../src/web/settings-api.mjs")>("../dist/web/settings-api.mjs");
 const reviewCommands = await loadModule<typeof import("../src/web/review-commands.mjs")>("../dist/web/review-commands.mjs");
@@ -30,6 +31,7 @@ export const { parseUnifiedDiff, synthesizeAddedFile, hunkAnchorRange, selectedL
 export const git = gitModule;
 export const { runGit, captureSnapshot, readWorkingFile, safeJoin } = gitModule;
 export const { inferRuleDestination, previewRepositoryRuleDestination, saveRepositoryRule } = learnedRules;
+export const { readGitBlobPrefixes } = gitProcess;
 export const { buildCommentPrompt, buildBatchPrompt, marker } = prompt;
 export const { findOpenPullRequest } = pullRequest;
 export const { ReviewService, computeReviewId, scopeOf } = reviewService;
