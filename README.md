@@ -267,7 +267,10 @@ The SDK package is a **development-only** source of its public canvas types, pin
 for reproducible checking; the installed Copilot runtime still supplies the SDK at
 run time. No extension-local SDK installation is needed. If `tsc` or SDK declarations
 are missing, run the install command above rather than substituting ambient stubs.
-CI runs the same type checks and regression suite on Node 22.12.0 and current Node 22.
+CI runs the same type checks and regression suite on Ubuntu with Node 22.12.0
+and current Node 22, and on Windows with current Node 22. Each CI job times out
+after 15 minutes, including builds and cleanup; locally, the two-minute timeout
+applies to individual tests rather than the whole run.
 
 All handwritten implementation code is TypeScript: the provider and backend live
 in `src/`, including the renderer in `src/web/app.ts`; tests, development scripts,
