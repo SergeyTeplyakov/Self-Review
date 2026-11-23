@@ -61,13 +61,24 @@ try {
     const staged = path.join(stagingRoot, "dist");
     const stagedTools = path.join(stagingRoot, "tools");
     build(staged);
-    cpSync(staged, stagedTools, { recursive: true });
-    const entry = path.join(stagingRoot, "extension.mjs");
-    copyFileSync(path.join(extensionRoot, "extension.mjs"), entry);
-    const toolsEntry = path.join(toolsDistributionRoot, "extension.mjs");
-    if (!existsSync(toolsEntry) || !readFileSync(entry).equals(readFileSync(toolsEntry))) renameSync(entry, toolsEntry);
-    publishDirectory(stagedTools, path.join(toolsDistributionRoot, "dist"));
-    publishDirectory(staged, distributionRoot);
+    if (process.argv.includes("--check")) {
+        const relativeFiles = (root: string) => distributionFiles(root)
+            .map((file) => path.relative(root, file)).sort();
+        const expected = relativeFiles(staged);
+        const actual = existsSync(distributionRoot) ? relativeFiles(distributionRoot) : [];
+        if (JSON.stringify(expected) !== JSON.stringify(actual) ||
+            expected.some((file) => !readFileSync(path.join(staged, file)).equals(readFileSync(path.join(distributionRoot, file))))) {
+            throw new Error("Checkout distribution is missing or stale; run npm run build.");
+        }
+    } else {
+        cpSync(staged, stagedTools, { recursive: true });
+        const entry = path.join(stagingRoot, "extension.mjs");
+        copyFileSync(path.join(extensionRoot, "extension.mjs"), entry);
+        const toolsEntry = path.join(toolsDistributionRoot, "extension.mjs");
+        if (!existsSync(toolsEntry) || !readFileSync(entry).equals(readFileSync(toolsEntry))) renameSync(entry, toolsEntry);
+        publishDirectory(stagedTools, path.join(toolsDistributionRoot, "dist"));
+        publishDirectory(staged, distributionRoot);
+    }
 } finally {
     rmSync(stagingRoot, { recursive: true, force: true });
 }

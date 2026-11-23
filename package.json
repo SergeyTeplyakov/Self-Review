@@ -5,6 +5,7 @@
   "scripts": {
     "build:tools": "tsc -p tsconfig.tools.json",
     "build": "npm run build:tools && node .build/extensions/self-review/scripts/build.mjs",
+    "deploy:provider": "npm run build:tools && node .build/extensions/self-review/scripts/deploy-provider.mjs",
     "typecheck": "tsc -p tsconfig.node.json && tsc -p tsconfig.web.json && tsc -p tsconfig.tools.json --noEmit",
     "check-skill-updates": "npm run build:tools && node .build/extensions/self-review/scripts/check-bundled-skill-updates.mjs",
     "eval:parallel-comments": "npm run build && node --test --test-timeout=60000 .build/extensions/self-review/test/parallel-comments*.test.mjs",
