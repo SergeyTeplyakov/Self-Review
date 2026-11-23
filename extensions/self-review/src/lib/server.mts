@@ -451,6 +451,10 @@ export async function startReviewServer({
         if (parts[0] === "refresh" && parts.length === 1) {
             return send(res, 200, await service.refresh(reviewId));
         }
+        if (parts[0] === "lessons" && parts.length === 3 && parts[2] === "destination") {
+            if (pageReview !== reviewId) throw new HttpError(409, "conflict", "Refresh the canvas before resolving a guideline destination.");
+            return send(res, 200, await service.previewLessonDestination(reviewId, parts[1], body));
+        }
         if (parts[0] === "lessons" && parts.length === 3 && parts[2] === "save") {
             if (pageReview !== reviewId) throw new HttpError(409, "conflict", "Refresh the canvas before saving a guideline.");
             return send(res, 200, await service.saveLesson(reviewId, parts[1], body));

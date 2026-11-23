@@ -25,6 +25,39 @@ after(async () => {
     await rm(tmp, { recursive: true, force: true });
 });
 
+test("reply action schema accepts a suggested general instruction destination", async () => {
+    await loadExtension();
+    const canvas = required(host.canvases[0]);
+    const reply = required(canvas.actions?.find((action) => action.name === "reply"));
+    const inputSchema = reply.inputSchema as {
+        properties?: {
+            lessons?: {
+                items?: {
+                    properties?: {
+                        destination?: {
+                            properties?: {
+                                kind?: { enum?: string[] };
+                                pathPrefix?: unknown;
+                                instructionRoot?: unknown;
+                                language?: unknown;
+                                applyTo?: unknown;
+                            };
+                            required?: string[];
+                            additionalProperties?: boolean;
+                        };
+                    };
+                };
+            };
+        };
+    };
+    const destination = inputSchema.properties?.lessons?.items?.properties?.destination;
+    assert.deepEqual(destination?.required, ["kind"]);
+    assert.deepEqual(destination?.properties && Object.keys(destination.properties).sort(), ["applyTo", "instructionRoot", "kind", "language", "pathPrefix"]);
+    assert.ok(destination?.properties?.kind?.enum?.includes("general"));
+    assert.ok(destination?.properties?.kind?.enum?.includes("language"));
+    assert.equal(destination?.additionalProperties, false);
+});
+
 test("reopening a retired commit review without a usable origin keeps its path filters", async () => {
     const repo = path.join(tmp, "proj");
     await runGit(tmp, ["init", "-q", "-b", "main", repo]);

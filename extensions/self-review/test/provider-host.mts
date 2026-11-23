@@ -5,7 +5,7 @@ import type { SendOptions } from "../src/lib/delivery.mjs";
 interface TestCanvas {
     open(ctx: { instanceId: string; input: Record<string, unknown>; session: { workingDirectory: string } }): Promise<{ url: string }>;
     onClose(ctx: { instanceId: string }): Promise<void>;
-    actions: { name: string; handler(ctx: { instanceId: string; input: Record<string, unknown> }): unknown }[];
+    actions: { name: string; inputSchema?: unknown; handler(ctx: { instanceId: string; input: Record<string, unknown> }): unknown }[];
 }
 
 export const host = {

@@ -22,6 +22,7 @@ interface MockNode {
     dataset?: Record<string, string>;
     closest?: (selector: string) => MockNode | null;
     querySelector?: (selector: string) => unknown;
+    querySelectorAll?: (selector: string) => MockNode[];
     contains?: (node: MockNode | null) => boolean;
     classList?: { toggle: (name: string, force?: boolean) => boolean };
 }
@@ -39,6 +40,8 @@ interface DialogState {
     error?: string;
     autoSaveLearnedRules?: boolean;
     delivery?: string;
+    commentConcurrency?: number;
+    instructionMappings?: Array<{ pathPrefix: string; instructionRoot: string; splitLanguageSpecific: boolean }>;
     revisionId?: string;
     model?: string;
 }
@@ -149,7 +152,7 @@ const reviewFixture = (overrides: Record<string, unknown> = {}) => ({
     threads: [], lessons: [],
     ...overrides,
 });
-const settingsFixture = (overrides: Record<string, unknown> = {}) => ({ repoName: "repo", autoSaveLearnedRules: false, delivery: "immediate", configured: false, dismissed: false, ...overrides });
+const settingsFixture = (overrides: Record<string, unknown> = {}) => ({ repoName: "repo", autoSaveLearnedRules: false, delivery: "immediate", instructionMappings: [], configured: false, dismissed: false, ...overrides });
 
 test("agent reply renders Markdown issue links as external anchors", async () => {
     const app = await loadApp();
@@ -159,6 +162,17 @@ test("agent reply renders Markdown issue links as external anchors", async () =>
     const html = app.run(`messageHtml(${JSON.stringify(message)})`);
     assert.ok(html.includes('<a href="https://github.com/SergeyTeplyakov/Self-Review/issues/31" target="_blank" rel="noopener noreferrer" data-markdown-link>#31</a>'));
     assert.ok(html.includes('<a href="http://example.test/a(b)?x=1&amp;y=2" target="_blank" rel="noopener noreferrer" data-markdown-link><strong>docs &amp; notes</strong></a>'));
+});
+
+test("state and lessons from an older server need no learned-rule destination fields", async () => {
+    const app = await loadApp();
+    const legacyLesson = {
+        lessonId: "lesson", messageId: "message", scope: "repo", rule: "Keep pull requests focused.",
+        savedTo: null, threadId: "thread", createdAt: "2026-01-01T00:00:00Z",
+    };
+    const legacyReview = reviewFixture({ lessons: [legacyLesson] });
+    assert.equal(app.run(`isLesson(${JSON.stringify(legacyLesson)})`), true);
+    assert.equal(app.run(`isStateResponse(${JSON.stringify({ review: legacyReview })})`), true);
 });
 
 test("reply Markdown respects matching code delimiters and escaped URL punctuation", async () => {
@@ -371,9 +385,10 @@ test("a reload queued during failed state or snapshot requests is retried automa
 
 test("refresh progress and load failure preserve the current view and composer DOM until a successful retry", async () => {
     let failed = false;
+    let failureMessage = "offline <now>";
     let refresh: { status: string; error?: string } = { status: "refreshing" };
     const app = await loadApp({ fetch: async (url) => {
-        if (failed) throw new Error("offline <now>");
+        if (failed) throw new Error(failureMessage);
         if (url === "/api/state") return jsonResponse({ review: reviewFixture(), refresh });
         throw new Error(`Unexpected request ${url}`);
     } });
@@ -395,6 +410,11 @@ test("refresh progress and load failure preserve the current view and composer D
     failed = true;
     await assert.rejects(app.run<Promise<void>>("loadState()"), /offline/);
     assert.match(app.node("#review-status").innerHTML, /Could not load the current review.*offline &lt;now&gt;.*Retry/);
+    failureMessage = "Invalid repository settings response.";
+    await assert.rejects(app.run<Promise<void>>("loadState()"), /Invalid repository settings response/);
+    const status = app.node("#review-status").innerHTML;
+    assert.match(status, /Invalid repository settings response\. Showing the last loaded data/);
+    assert.doesNotMatch(status, /response\.\./);
     assert.equal(app.node("#review-status").hidden, false);
     assert.equal(app.document.activeElement, composer);
     assert.equal(app.localStorage.getItem("sr:r:draft:overview:new"), "Keep this draft");
@@ -1710,13 +1730,20 @@ test("the Configure dialog is an accessible modal with auto-save off by default 
     const app = await loadApp();
     assert.equal(app.run("dialogHtml()"), "", "closed by default");
     app.state.settings = settingsFixture({ repoName: "Org/Repo <x>", configured: true });
-    app.state.dialog = { autoSaveLearnedRules: false, delivery: "batch", saving: false, error: "" };
+    app.state.dialog = {
+        autoSaveLearnedRules: false, delivery: "batch",
+        instructionMappings: [{ pathPrefix: "src/Area", instructionRoot: "src/Area", splitLanguageSpecific: true }],
+        saving: false, error: "",
+    };
     const html = app.run("dialogHtml()");
     assert.match(html, /role="dialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby="dialog-desc"/);
     assert.match(html, /<h2 id="dialog-title">Review settings<\/h2>/);
     assert.match(html, /<p id="dialog-desc" class="muted">Settings for Org\/Repo &lt;x&gt;\. /);
     assert.match(html, /<legend>Guidelines<\/legend><label><input type="checkbox" name="autoSaveLearnedRules"> Auto-save learned rules<\/label>/);
     assert.match(html, /When off, review and save proposed guidelines yourself\./);
+    assert.match(html, /Repository instruction destinations/);
+    assert.match(html, /name="mapping-prefix" data-index="0" value="src\/Area"/);
+    assert.match(html, /name="mapping-split" data-index="0" checked/);
     assert.deepEqual(
         [...html.matchAll(/<input type="radio" name="delivery" value="(\w+)"( checked)?>/g)].map((m) => [m[1], Boolean(m[2])]),
         [["immediate", false], ["batch", true], ["ask", false]],
@@ -1725,7 +1752,7 @@ test("the Configure dialog is an accessible modal with auto-save off by default 
     assert.doesNotMatch(html, /role="alert"|\sdisabled[\s>]/);
     assert.match(html, /data-action="dialog-save">Save<\/button>/);
 
-    app.state.dialog = { autoSaveLearnedRules: true, saving: true, error: "Could not save <b>" };
+    app.state.dialog = { autoSaveLearnedRules: true, instructionMappings: [], saving: true, error: "Could not save <b>" };
     const busy = app.run("dialogHtml()");
     assert.match(busy, /<div class="modal-error" role="alert">Could not save &lt;b&gt;<\/div>/);
     assert.match(busy, /data-action="dialog-cancel" disabled>/);
@@ -1734,6 +1761,752 @@ test("the Configure dialog is an accessible modal with auto-save off by default 
 
     app.state.settings = settingsFixture({ repoName: undefined });
     assert.match(app.run("dialogHtml()"), /Settings for this repository\./);
+});
+
+test("repository guideline proposals show an editable mapping and destination preview", async () => {
+    const app = await loadApp();
+    app.state.settings = settingsFixture({
+        instructionMappings: [{ pathPrefix: "src/Area", instructionRoot: "src/Area", splitLanguageSpecific: true }],
+    });
+    app.state.review = reviewFixture({
+        lessons: [{
+            lessonId: "lesson/route", threadId: "t1", scope: "repo", rule: "Use typed guards.",
+            status: "proposed", reviewedPath: "src/Area/Rules.cs",
+            destination: { kind: "language", language: "csharp", applyTo: "**/*.cs" }, createdAt: "2026-01-01T00:00:00Z",
+        }],
+    });
+    const html = app.run("messageHtml({ messageId: 'm', author: 'agent', body: 'Done', createdAt: '2026-01-02T00:00:00Z', lessonIds: ['lesson/route'] })");
+    assert.match(html, /Reviewed file: <code>src\/Area\/Rules\.cs<\/code>/);
+    assert.match(html, /name="pathPrefix" value="src\/Area"/);
+    assert.match(html, /name="instructionRoot" value="src\/Area"/);
+    assert.match(html, /name="destinationKind"><option value="language" selected>/);
+    assert.match(html, /Actual destination: <code data-destination-preview>Resolving actual destination…<\/code>/);
+    assert.match(html, /Confirm destination and save guideline/);
+});
+
+test("legacy repository proposals infer language from their recovered reviewed path", async () => {
+    const app = await loadApp();
+    app.state.settings = settingsFixture();
+    app.state.review = reviewFixture({
+        threads: [{
+            threadId: "t1", kind: "line",
+            location: { path: "src/Area/Rules.cs" }, anchor: null, status: "active", messages: [],
+        }],
+        lessons: [{
+            lessonId: "lesson/legacy", threadId: "t1", scope: "repo", rule: "Use typed guards.",
+            status: "proposed", savedTo: null, createdAt: "2026-01-01T00:00:00Z",
+        }],
+    });
+
+    const html = app.run(`messageHtml(${JSON.stringify({
+        messageId: "m", author: "agent", body: "Learned rule", createdAt: "2026-01-02T00:00:00Z", lessonIds: ["lesson/legacy"],
+    })})`);
+    assert.match(html, /Reviewed file: <code>src\/Area\/Rules\.cs<\/code>/);
+    assert.match(html, /name="destinationKind"><option value="language" selected>/);
+    assert.match(html, /name="applyTo" value="\*\*\/\*\.cs"/);
+});
+
+test("legacy Go proposals infer a language-specific destination", async () => {
+    const app = await loadApp();
+    app.state.settings = settingsFixture();
+    app.state.review = reviewFixture({
+        threads: [{
+            threadId: "t-go", kind: "line",
+            location: { path: "src/Area/check.go" }, anchor: null, status: "active", messages: [],
+        }],
+        lessons: [{
+            lessonId: "lesson/go", threadId: "t-go", scope: "repo", rule: "Keep errors explicit.",
+            status: "proposed", savedTo: null, createdAt: "2026-01-01T00:00:00Z",
+        }],
+    });
+
+    const html = app.run(`messageHtml(${JSON.stringify({
+        messageId: "m", author: "agent", body: "Learned rule", createdAt: "2026-01-02T00:00:00Z", lessonIds: ["lesson/go"],
+    })})`);
+    assert.match(html, /name="destinationKind"><option value="language" selected>/);
+    assert.match(html, /name="language" value="go"/);
+    assert.match(html, /name="applyTo" value="\*\*\/\*\.go"/);
+});
+
+test("overview proposals retain the configured repository-root mapping", async () => {
+    const app = await loadApp();
+    app.state.settings = settingsFixture({
+        instructionMappings: [{ pathPrefix: "", instructionRoot: "src/Area", splitLanguageSpecific: false }],
+    });
+    app.state.review = reviewFixture({
+        threads: [{ threadId: "overview", kind: "overview", location: null, anchor: null, status: "active", messages: [] }],
+        lessons: [{
+            lessonId: "lesson/overview", threadId: "overview", scope: "repo", rule: "Keep pull requests focused.",
+            status: "proposed", savedTo: null, createdAt: "2026-01-01T00:00:00Z",
+        }],
+    });
+
+    const html = app.run(`messageHtml(${JSON.stringify({
+        messageId: "m", author: "agent", body: "Learned rule", createdAt: "2026-01-02T00:00:00Z", lessonIds: ["lesson/overview"],
+    })})`);
+    assert.match(html, /name="pathPrefix" value=""/);
+    assert.match(html, /name="instructionRoot" value="src\/Area"/);
+    assert.doesNotMatch(html, /name="splitLanguageSpecific" checked/);
+});
+
+test("destination mapping selection follows the provider's path case policy", async () => {
+    const app = await loadApp();
+    const root = { pathPrefix: "", instructionRoot: "", splitLanguageSpecific: true };
+    const specific = { pathPrefix: "src/Foo", instructionRoot: "docs/Foo", splitLanguageSpecific: false };
+    app.state.settings = settingsFixture({ instructionMappings: [root, specific], pathCaseSensitive: true });
+    assert.equal(app.read<{ pathPrefix: string } | undefined>('mappingForPath("src/foo/Rules.cs")')?.pathPrefix, "");
+    assert.equal(app.read<{ pathPrefix: string } | undefined>('mappingForPath("src/Foo/Rules.cs")')?.pathPrefix, "src/Foo");
+
+    app.state.settings = settingsFixture({ instructionMappings: [root, specific], pathCaseSensitive: false });
+    assert.equal(app.read<{ pathPrefix: string } | undefined>('mappingForPath("src/foo/Rules.cs")')?.pathPrefix, "src/Foo");
+});
+
+test("destination edits and expanded state survive a main-content rerender", async () => {
+    const app = await loadApp();
+    app.state.settings = settingsFixture();
+    app.state.review = reviewFixture({
+        lessons: [{
+            lessonId: "lesson/draft", threadId: "t1", scope: "repo", rule: "Use typed guards.",
+            status: "proposed", reviewedPath: "src/Area/Rules.cs",
+            destination: { kind: "language", language: "csharp", applyTo: "**/*.cs" }, createdAt: "2026-01-01T00:00:00Z",
+        }],
+    });
+    const fields = new Map<string, MockElement>();
+    for (const [name, value, checked] of [
+        ["pathPrefix", "src/Area", false], ["instructionRoot", "docs/Area", false],
+        ["splitLanguageSpecific", "", false], ["destinationKind", "language", false],
+        ["language", "go", false], ["applyTo", "**/*.go", false],
+    ] as const) {
+        const field = new MockElement(name === "destinationKind" ? "SELECT" : "INPUT");
+        Object.assign(field, { name, value, checked });
+        fields.set(name, field);
+    }
+    const details = Object.assign(new MockElement("DETAILS"), { open: true });
+    const signature = JSON.stringify(["Use typed guards.", "repo", "src/Area/Rules.cs"]);
+    const form = Object.assign(new MockElement(), {
+        dataset: { lessonForm: "lesson/draft", lessonMessage: "m", lessonSignature: signature, destinationEdited: "true" },
+        querySelector: (selector: string) => selector === "details.lesson-destination"
+            ? details
+            : fields.get(selector.match(/name="([^"]+)"/)?.[1] ?? "") ?? null,
+    });
+    const main = Object.assign(new MockElement(), { querySelectorAll: () => [form] });
+
+    app.run<(main: MockElement) => void>("captureDestinationFormDrafts")(main);
+    const html = app.run(`messageHtml(${JSON.stringify({
+        messageId: "m", author: "agent", body: "Learned rule", createdAt: "2026-01-02T00:00:00Z", lessonIds: ["lesson/draft"],
+    })})`);
+    assert.match(html, /<details class="lesson-destination" open>/);
+    assert.match(html, /name="instructionRoot" value="docs\/Area"/);
+    assert.match(html, /name="language" value="go"/);
+    assert.match(html, /name="applyTo" value="\*\*\/\*\.go"/);
+    assert.doesNotMatch(html, /name="splitLanguageSpecific" checked/);
+});
+
+test("browser destination suggestions recognize TypeScript module extensions", async () => {
+    const app = await loadApp();
+    for (const extension of ["mts", "cts"]) {
+        const destination = app.run<{ kind: string; language?: string; applyTo?: string }>(
+            `suggestedDestination({ reviewedPath: "src/Rules.${extension}" })`,
+        );
+        assert.deepEqual(
+            { kind: destination.kind, language: destination.language, applyTo: destination.applyTo },
+            { kind: "language", language: "typescript", applyTo: `**/*.${extension}` },
+        );
+    }
+});
+
+test("untouched proposal destinations follow Configure mapping updates", async () => {
+    const app = await loadApp();
+    const oldMapping = { pathPrefix: "src/Area", instructionRoot: "old/Area", splitLanguageSpecific: true };
+    const newMapping = { pathPrefix: "src/Area", instructionRoot: "new/Area", splitLanguageSpecific: false };
+    app.state.settings = settingsFixture({ instructionMappings: [oldMapping] });
+    app.state.review = reviewFixture({
+        lessons: [{
+            lessonId: "lesson/untouched", threadId: "t1", scope: "repo", rule: "Use typed guards.",
+            status: "proposed", reviewedPath: "src/Area/Rules.cs",
+            destination: { kind: "language", language: "csharp", applyTo: "**/*.cs" }, createdAt: "2026-01-01T00:00:00Z",
+        }],
+    });
+    const fields = new Map<string, MockElement>();
+    for (const [name, value, checked] of [
+        ["pathPrefix", oldMapping.pathPrefix, false], ["instructionRoot", oldMapping.instructionRoot, false],
+        ["splitLanguageSpecific", "", oldMapping.splitLanguageSpecific], ["destinationKind", "language", false],
+        ["language", "csharp", false], ["applyTo", "**/*.cs", false],
+    ] as const) {
+        const field = new MockElement(name === "destinationKind" ? "SELECT" : "INPUT");
+        Object.assign(field, { name, value, checked });
+        fields.set(name, field);
+    }
+    const details = Object.assign(new MockElement("DETAILS"), { open: true });
+    const signature = JSON.stringify(["Use typed guards.", "repo", "src/Area/Rules.cs"]);
+    const form = Object.assign(new MockElement(), {
+        dataset: { lessonForm: "lesson/untouched", lessonMessage: "m", lessonSignature: signature },
+        querySelector: (selector: string) => selector === "details.lesson-destination"
+            ? details
+            : fields.get(selector.match(/name="([^"]+)"/)?.[1] ?? "") ?? null,
+    });
+    const main = Object.assign(new MockElement(), { querySelectorAll: () => [form] });
+
+    app.state.settings = settingsFixture({ instructionMappings: [newMapping] });
+    app.run<(main: MockElement) => void>("captureDestinationFormDrafts")(main);
+    const html = app.run(`messageHtml(${JSON.stringify({
+        messageId: "m", author: "agent", body: "Learned rule", createdAt: "2026-01-02T00:00:00Z", lessonIds: ["lesson/untouched"],
+    })})`);
+
+    assert.match(html, /<details class="lesson-destination" open>/, "expanded state survives the rerender");
+    assert.match(html, /name="pathPrefix" value="src\/Area"/);
+    assert.match(html, /name="instructionRoot" value="new\/Area"/, "the current mapping replaces the untouched old default");
+    assert.doesNotMatch(html, /name="instructionRoot" value="old\/Area"/);
+    assert.doesNotMatch(html, /name="splitLanguageSpecific" checked/, "the current split setting replaces the untouched old default");
+});
+
+test("duplicate proposal cards keep destination edits separate", async () => {
+    const app = await loadApp();
+    app.state.settings = settingsFixture({
+        instructionMappings: [{ pathPrefix: "src/Area", instructionRoot: "configured/Area", splitLanguageSpecific: true }],
+    });
+    app.state.review = reviewFixture({
+        lessons: [{
+            lessonId: "lesson/shared", threadId: "t1", scope: "repo", rule: "Use typed guards.",
+            status: "proposed", reviewedPath: "src/Area/Rules.cs",
+            destination: { kind: "language", language: "csharp", applyTo: "**/*.cs" }, createdAt: "2026-01-01T00:00:00Z",
+        }],
+    });
+    const signature = JSON.stringify(["Use typed guards.", "repo", "src/Area/Rules.cs"]);
+    const createForm = (messageId: string, instructionRoot: string, detailsOpen: boolean) => {
+        const fields = new Map<string, MockElement>();
+        for (const [name, value, checked] of [
+            ["pathPrefix", "src/Area", false], ["instructionRoot", instructionRoot, false],
+            ["splitLanguageSpecific", "", true], ["destinationKind", "language", false],
+            ["language", "csharp", false], ["applyTo", "**/*.cs", false],
+        ] as const) {
+            const field = new MockElement(name === "destinationKind" ? "SELECT" : "INPUT");
+            Object.assign(field, { name, value, checked });
+            fields.set(name, field);
+        }
+        const details = Object.assign(new MockElement("DETAILS"), { open: detailsOpen });
+        const form = Object.assign(new MockElement(), {
+            dataset: { lessonForm: "lesson/shared", lessonMessage: messageId, lessonSignature: signature },
+            querySelector: (selector: string) => selector === "details.lesson-destination"
+                ? details
+                : fields.get(selector.match(/name="([^"]+)"/)?.[1] ?? "") ?? null,
+        });
+        const root = fields.get("instructionRoot");
+        assert.ok(root);
+        root.closest = (selector: string) => selector === "[data-lesson-form]" ? form : null;
+        return { form, root };
+    };
+    const edited = createForm("m1", "edited/Area", true);
+    const untouched = createForm("m2", "configured/Area", false);
+    const firstMessage = {
+        messageId: "m1", author: "agent", body: "Original proposal.", createdAt: "2026-01-02T00:00:00Z",
+        lessonIds: ["lesson/shared"],
+    };
+    const secondMessage = {
+        messageId: "m2", author: "agent", body: "Refined proposal.", createdAt: "2026-01-03T00:00:00Z",
+        lessonIds: ["lesson/shared"],
+    };
+    assert.match(app.run(`messageHtml(${JSON.stringify(firstMessage)})`), /data-lesson-message="m1"/);
+    assert.match(app.run(`messageHtml(${JSON.stringify(secondMessage)})`), /data-lesson-message="m2"/);
+
+    app.run("onInput")({ target: edited.root });
+    const main = Object.assign(new MockElement(), { querySelectorAll: () => [edited.form, untouched.form] });
+    app.run<(main: MockElement) => void>("captureDestinationFormDrafts")(main);
+
+    const firstHtml = app.run(`messageHtml(${JSON.stringify(firstMessage)})`);
+    const secondHtml = app.run(`messageHtml(${JSON.stringify(secondMessage)})`);
+    assert.match(firstHtml, /name="instructionRoot" value="edited\/Area"/);
+    assert.match(firstHtml, /<details class="lesson-destination" open>/);
+    assert.match(firstHtml, /data-destination-edited="true"/);
+    assert.match(secondHtml, /name="instructionRoot" value="configured\/Area"/);
+    assert.doesNotMatch(secondHtml, /data-destination-edited="true"/);
+});
+
+test("repository destination preview displays the provider-resolved file", async () => {
+    const calls: CapturedPost[] = [];
+    const app = await loadApp({ fetch: async (url, init) => {
+        calls.push([init?.method ?? "GET", url, requestBody(init)]);
+        return jsonResponse({ savedTo: "src/Area/.github/instructions/csharp-documentation.instructions.md", needsConfirmation: false });
+    } });
+    const fields = new Map<string, MockElement>();
+    for (const [name, value, checked] of [
+        ["pathPrefix", "src/Area", false], ["instructionRoot", "src/Area", false],
+        ["splitLanguageSpecific", "", false], ["destinationKind", "language", false],
+        ["language", "csharp", false], ["applyTo", "**/*.cs", false],
+    ] as const) {
+        const field = new MockElement("INPUT");
+        Object.assign(field, { name, value, checked });
+        fields.set(name, field);
+    }
+    const preview = new MockElement();
+    const form = Object.assign(new MockElement(), {
+        dataset: { lessonForm: "lesson/route" },
+        querySelector: (selector: string) => selector === "[data-destination-preview]"
+            ? preview
+            : fields.get(selector.match(/name="([^"]+)"/)?.[1] ?? "") ?? null,
+    });
+
+    const resolve = app.run<(form: MockElement) => Promise<{ savedTo: string; needsConfirmation: boolean } | null>>("updateDestinationPreview");
+    const result = await resolve(form);
+    assert.equal(result?.savedTo, "src/Area/.github/instructions/csharp-documentation.instructions.md");
+    assert.equal(result?.needsConfirmation, false);
+    assert.equal(preview.textContent, "src/Area/.github/instructions/csharp-documentation.instructions.md");
+    assert.deepEqual(calls, [["POST", "/api/lessons/lesson%2Froute/destination", {
+        mapping: { pathPrefix: "src/Area", instructionRoot: "src/Area", splitLanguageSpecific: false },
+        destination: { kind: "language", language: "csharp", applyTo: "**/*.cs" },
+    }]]);
+});
+
+test("an older A preview cannot overwrite the latest result after A-to-B-to-A edits", async () => {
+    const responses: Array<(value: unknown) => void> = [];
+    const app = await loadApp({ fetch: () => new Promise((resolve) => responses.push(resolve)) });
+    const fields = new Map<string, MockElement>();
+    for (const [name, value, checked] of [
+        ["pathPrefix", "", false], ["instructionRoot", "", false],
+        ["splitLanguageSpecific", "", true], ["destinationKind", "language", false],
+        ["language", "csharp", false], ["applyTo", "**/*.cs", false],
+    ] as const) {
+        const field = new MockElement("INPUT");
+        Object.assign(field, { name, value, checked });
+        fields.set(name, field);
+    }
+    const preview = new MockElement();
+    const form = Object.assign(new MockElement(), {
+        dataset: { lessonForm: "lesson/race" },
+        querySelector: (selector: string) => selector === "[data-destination-preview]"
+            ? preview
+            : fields.get(selector.match(/name="([^"]+)"/)?.[1] ?? "") ?? null,
+    });
+    const resolve = app.run<(form: MockElement) => Promise<{ savedTo: string; needsConfirmation: boolean } | null>>("updateDestinationPreview");
+
+    const first = resolve(form);
+    fields.get("applyTo")!.value = "**/*.ts";
+    const second = resolve(form);
+    fields.get("applyTo")!.value = "**/*.cs";
+    const latest = resolve(form);
+    responses[2](jsonResponse({ savedTo: "latest-A.md", needsConfirmation: false }));
+    await latest;
+    responses[0](jsonResponse({ savedTo: "stale-A.md", needsConfirmation: false }));
+    await first;
+    responses[1](jsonResponse({ savedTo: "B.md", needsConfirmation: false }));
+    await second;
+
+    assert.equal(preview.textContent, "latest-A.md");
+});
+
+test("a failed destination preview can be retried on the same form", async () => {
+    let attempts = 0;
+    const app = await loadApp({ fetch: async () => {
+        attempts++;
+        if (attempts === 1) throw new Error("offline");
+        return jsonResponse({ savedTo: ".github/instructions/csharp.instructions.md", needsConfirmation: true });
+    } });
+    const fields = new Map<string, MockElement>();
+    for (const [name, value, checked] of [
+        ["pathPrefix", "", false], ["instructionRoot", "", false],
+        ["splitLanguageSpecific", "", true], ["destinationKind", "language", false],
+        ["language", "csharp", false], ["applyTo", "**/*.cs", false],
+    ] as const) {
+        const field = new MockElement("INPUT");
+        Object.assign(field, { name, value, checked });
+        fields.set(name, field);
+    }
+    const preview = new MockElement();
+    const form = Object.assign(new MockElement(), {
+        dataset: { lessonForm: "lesson/retry" },
+        querySelector: (selector: string) => selector === "[data-destination-preview]"
+            ? preview
+            : fields.get(selector.match(/name="([^"]+)"/)?.[1] ?? "") ?? null,
+    });
+    const resolve = app.run<(form: MockElement) => Promise<{ savedTo: string; needsConfirmation: boolean } | null>>("updateDestinationPreview");
+
+    assert.equal(await resolve(form), null);
+    const retried = await resolve(form);
+    assert.equal(retried?.savedTo, ".github/instructions/csharp.instructions.md");
+    assert.equal(retried?.needsConfirmation, true);
+    assert.equal(attempts, 2);
+    assert.equal(preview.textContent, ".github/instructions/csharp.instructions.md (new file; confirmation required)");
+});
+
+test("saving during destination resolution only refreshes the preview", async () => {
+    let resolveFetch!: (value: unknown) => void;
+    const response = new Promise<unknown>((resolve) => { resolveFetch = resolve; });
+    const calls: CapturedPost[] = [];
+    const app = await loadApp({ fetch: async (url, init) => {
+        calls.push([init?.method ?? "GET", url, requestBody(init)]);
+        return response;
+    } });
+    app.state.review = reviewFixture({
+        lessons: [{
+            lessonId: "lesson/pending", threadId: "t1", scope: "repo", rule: "Use typed guards.",
+            status: "proposed", savedTo: null, createdAt: "2026-01-01T00:00:00Z",
+        }],
+    });
+    const fields = new Map<string, MockElement>();
+    for (const [name, value, checked] of [
+        ["pathPrefix", "", false], ["instructionRoot", "", false],
+        ["splitLanguageSpecific", "", true], ["destinationKind", "language", false],
+        ["language", "csharp", false], ["applyTo", "**/*.cs", false],
+    ] as const) {
+        const field = new MockElement("INPUT");
+        Object.assign(field, { name, value, checked });
+        fields.set(name, field);
+    }
+    const preview = new MockElement();
+    const form = Object.assign(new MockElement(), {
+        dataset: { lessonForm: "lesson/pending" },
+        querySelector: (selector: string) => selector === "[data-destination-preview]"
+            ? preview
+            : fields.get(selector.match(/name="([^"]+)"/)?.[1] ?? "") ?? null,
+    });
+    const button = new MockElement("BUTTON");
+    button.dataset = { action: "save-lesson", lesson: "lesson/pending" };
+    button.closest = (selector: string) => selector === "[data-lesson-form]" ? form : button;
+
+    const saving = app.run("onClick")({ target: button });
+    resolveFetch(jsonResponse({ savedTo: ".github/instructions/csharp.instructions.md", needsConfirmation: true }));
+    await saving;
+
+    assert.equal(calls.length, 1, "the only request is the destination preview");
+    assert.equal(calls[0][1], "/api/lessons/lesson%2Fpending/destination");
+    assert.equal(preview.textContent, ".github/instructions/csharp.instructions.md (new file; confirmation required)");
+});
+
+test("saving unrelated Configure settings omits an unchanged mapping snapshot", async () => {
+    const original = [{ pathPrefix: "src/Area", instructionRoot: "src/Area", splitLanguageSpecific: true }];
+    const concurrent = { pathPrefix: "src/Other", instructionRoot: "src/Other", splitLanguageSpecific: false };
+    const calls: CapturedPost[] = [];
+    const app = await loadApp({ fetch: async (url, init) => {
+        calls.push([init?.method ?? "GET", url, requestBody(init)]);
+        return jsonResponse(settingsFixture({
+            delivery: "batch", instructionMappings: [...original, concurrent], pathCaseSensitive: true,
+        }));
+    } });
+    app.state.settings = settingsFixture({ instructionMappings: original, pathCaseSensitive: true });
+    app.run("openConfigure()");
+    if (!app.state.dialog) throw new Error("Configure dialog did not open.");
+    app.state.dialog.delivery = "batch";
+
+    await app.run<Promise<void>>("saveConfigure()");
+
+    assert.deepEqual(calls, [["POST", "/api/settings", { autoSaveLearnedRules: false, delivery: "batch" }]]);
+    assert.deepEqual(app.read("state.settings.instructionMappings"), [...original, concurrent]);
+});
+
+test("Configure saves instruction mappings and comment concurrency together", async () => {
+    const original = [{ pathPrefix: "src/Area", instructionRoot: "src/Area", splitLanguageSpecific: true }];
+    const edited = [{ ...original[0], instructionRoot: "" }];
+    const calls: CapturedPost[] = [];
+    const app = await loadApp({ fetch: async (url, init) => {
+        calls.push([init?.method ?? "GET", url, requestBody(init)]);
+        return jsonResponse(settingsFixture({ instructionMappings: edited, commentConcurrency: 4 }));
+    } });
+    app.state.settings = settingsFixture({ instructionMappings: original, commentConcurrency: 2 });
+    app.run("openConfigure()");
+    if (!app.state.dialog) throw new Error("Configure dialog did not open.");
+    assert.equal(app.state.dialog.commentConcurrency, 2);
+    app.state.dialog.instructionMappings = edited;
+    app.state.dialog.commentConcurrency = 4;
+
+    await app.run<Promise<void>>("saveConfigure()");
+
+    assert.deepEqual(calls, [["POST", "/api/settings", {
+        autoSaveLearnedRules: false, delivery: "immediate", commentConcurrency: 4,
+        instructionMappings: edited, expectedInstructionMappings: original,
+    }]]);
+    assert.deepEqual(app.read("state.settings.instructionMappings"), edited);
+    assert.equal(app.read("state.settings.commentConcurrency"), 4);
+});
+
+test("repository save submits the rendered rule even if the review reloads during preview", async () => {
+    let resolvePreview!: (value: unknown) => void;
+    const previewResponse = new Promise<unknown>((resolve) => { resolvePreview = resolve; });
+    const calls: CapturedPost[] = [];
+    const nextReview = reviewFixture({
+        lessons: [{
+            lessonId: "lesson/clicked", threadId: "t1", scope: "repo", rule: "Revised rule.",
+            status: "proposed", reviewedPath: "src/Rules.cs",
+            destination: { kind: "language", language: "csharp", applyTo: "**/*.cs" }, createdAt: "2026-01-01T00:00:00Z",
+        }],
+    });
+    const app = await loadApp({ fetch: async (url, init) => {
+        calls.push([init?.method ?? "GET", url, requestBody(init)]);
+        if (url.endsWith("/destination")) return previewResponse;
+        if (url.endsWith("/save")) return jsonResponse({ status: "saved" });
+        if (url === "/api/state") return jsonResponse({ review: nextReview, settings: settingsFixture() });
+        if (url === "/api/snapshot/r1") return jsonResponse({ revisionId: "r1", files: [] });
+        throw new Error(`Unexpected request: ${url}`);
+    } });
+    const originalReview = reviewFixture({
+        lessons: [{
+            lessonId: "lesson/clicked", threadId: "t1", scope: "repo", rule: "Original rule.",
+            status: "proposed", reviewedPath: "src/Rules.cs",
+            destination: { kind: "language", language: "csharp", applyTo: "**/*.cs" }, createdAt: "2026-01-01T00:00:00Z",
+        }],
+    });
+    app.state.review = originalReview;
+    const fields = new Map<string, MockElement>();
+    for (const [name, value, checked] of [
+        ["pathPrefix", "", false], ["instructionRoot", "", false],
+        ["splitLanguageSpecific", "", true], ["destinationKind", "language", false],
+        ["language", "csharp", false], ["applyTo", "**/*.cs", false],
+    ] as const) {
+        const field = new MockElement("INPUT");
+        Object.assign(field, { name, value, checked });
+        fields.set(name, field);
+    }
+    const preview = new MockElement();
+    const proposal = {
+        mapping: { pathPrefix: "", instructionRoot: "", splitLanguageSpecific: true },
+        destination: { kind: "language", language: "csharp", applyTo: "**/*.cs" },
+    };
+    const form = Object.assign(new MockElement(), {
+        dataset: {
+            lessonForm: "lesson/clicked", rule: "Original rule.", scope: "repo",
+            destinationPreviewState: "ready", destinationPreviewKey: JSON.stringify(proposal),
+        },
+        querySelector: (selector: string) => selector === "[data-destination-preview]"
+            ? preview
+            : fields.get(selector.match(/name="([^"]+)"/)?.[1] ?? "") ?? null,
+    });
+    const button = Object.assign(new MockElement("BUTTON"), {
+        dataset: { action: "save-lesson", lesson: "lesson/clicked" },
+    });
+    button.closest = (selector: string) => selector === "[data-lesson-form]" ? form : button;
+
+    const saving = app.run("onClick")({ target: button });
+    (originalReview.lessons as Array<{ rule: string }>)[0].rule = "Revised rule.";
+    resolvePreview(jsonResponse({ savedTo: ".github/instructions/csharp.instructions.md", needsConfirmation: false }));
+    await saving;
+
+    const saved = calls.find(([, url]) => typeof url === "string" && url.endsWith("/save"));
+    assert.ok(saved);
+    assert.equal((saved[2] as { rule: string }).rule, "Original rule.");
+    assert.equal((saved[2] as { scope: string }).scope, "repo");
+});
+
+test("a failed repository save refreshes the destination before allowing another attempt", async () => {
+    const oldDestination = ".github/instructions/csharp.instructions.md";
+    const newDestination = "src/Rules/.github/instructions/csharp.instructions.md";
+    let previews = 0;
+    const requestOrder: string[] = [];
+    const saves: Record<string, unknown>[] = [];
+    const review = reviewFixture({
+        lessons: [{
+            lessonId: "lesson/clicked", threadId: "t1", scope: "repo", rule: "Keep pull requests focused.",
+            status: "proposed", reviewedPath: "src/Rules/Analyzer.cs",
+            destination: { kind: "language", language: "csharp", applyTo: "**/*.cs" }, createdAt: "2026-01-01T00:00:00Z",
+        }],
+    });
+    const app = await loadApp({ fetch: async (url, init) => {
+        if (url.endsWith("/destination")) {
+            previews++;
+            requestOrder.push("destination");
+            return jsonResponse({
+                savedTo: previews === 1 ? oldDestination : newDestination,
+                needsConfirmation: false,
+            });
+        }
+        if (url.endsWith("/save")) {
+            requestOrder.push("save");
+            saves.push(requestBody(init));
+            if (saves.length === 1) {
+                return jsonResponse({
+                    error: {
+                        message: `The instruction destination changed to ${newDestination}. Review and confirm the updated destination.`,
+                    },
+                }, 409);
+            }
+            return jsonResponse({ status: "saved" });
+        }
+        if (url === "/api/state") return jsonResponse({ review, settings: settingsFixture() });
+        if (url === "/api/snapshot/r1") return jsonResponse({ revisionId: "r1", files: [] });
+        throw new Error(`Unexpected request: ${url}`);
+    } });
+    app.state.review = review;
+    const fields = new Map<string, MockElement>();
+    for (const [name, value, checked] of [
+        ["pathPrefix", "src/Rules", false], ["instructionRoot", "src/Rules", false],
+        ["splitLanguageSpecific", "", true], ["destinationKind", "language", false],
+        ["language", "csharp", false], ["applyTo", "**/*.cs", false],
+    ] as const) {
+        const field = new MockElement("INPUT");
+        Object.assign(field, { name, value, checked });
+        fields.set(name, field);
+    }
+    const preview = new MockElement();
+    const proposal = {
+        mapping: { pathPrefix: "src/Rules", instructionRoot: "src/Rules", splitLanguageSpecific: true },
+        destination: { kind: "language", language: "csharp", applyTo: "**/*.cs" },
+    };
+    const form = Object.assign(new MockElement(), {
+        dataset: {
+            lessonForm: "lesson/clicked", rule: "Keep pull requests focused.", scope: "repo",
+            destinationPreviewState: "ready", destinationPreviewKey: JSON.stringify(proposal),
+        },
+        querySelector: (selector: string) => selector === "[data-destination-preview]"
+            ? preview
+            : fields.get(selector.match(/name="([^"]+)"/)?.[1] ?? "") ?? null,
+    });
+    const button = Object.assign(new MockElement("BUTTON"), {
+        dataset: { action: "save-lesson", lesson: "lesson/clicked" },
+    });
+    button.closest = (selector: string) => selector === "[data-lesson-form]" ? form : button;
+
+    await app.run("onClick")({ target: button });
+
+    assert.equal(previews, 2, "the failed save triggers a fresh destination request");
+    assert.equal(saves.length, 1, "the refreshed destination still requires another confirmation");
+    assert.equal(preview.textContent, newDestination);
+    assert.equal(saves[0].expectedSavedTo, oldDestination);
+    assert.equal(form.dataset.destinationPreviewKey, JSON.stringify(proposal));
+
+    await app.run("onClick")({ target: button });
+
+    assert.deepEqual(requestOrder.slice(0, 4), ["destination", "save", "destination", "save"]);
+    assert.equal(saves.length, 2);
+    assert.equal(saves[1].expectedSavedTo, newDestination);
+    assert.equal(saves[1].rule, "Keep pull requests focused.");
+    assert.equal(saves[1].scope, "repo");
+});
+
+test("a save conflict discards a destination edit made against mappings that changed since", async () => {
+    const oldMapping = { pathPrefix: "src/Area", instructionRoot: "old/Area", splitLanguageSpecific: true };
+    const newMapping = { pathPrefix: "src/Area", instructionRoot: "new/Area", splitLanguageSpecific: true };
+    const saves: Record<string, unknown>[] = [];
+    const review = reviewFixture({
+        lessons: [{
+            lessonId: "lesson/stale", threadId: "t1", scope: "repo", rule: "Use typed guards.",
+            status: "proposed", reviewedPath: "src/Area/Rules.cs",
+            destination: { kind: "language", language: "csharp", applyTo: "**/*.cs" }, createdAt: "2026-01-01T00:00:00Z",
+        }],
+    });
+    const app = await loadApp({ fetch: async (url, init) => {
+        if (url.endsWith("/destination")) return jsonResponse({ savedTo: "edited/Area/.github/instructions/csharp.instructions.md", needsConfirmation: false });
+        if (url.endsWith("/save")) {
+            saves.push(requestBody(init));
+            return jsonResponse({ error: { message: "Repository instruction mappings changed after this guideline was shown." } }, 409);
+        }
+        if (url === "/api/state") return jsonResponse({ review, settings: settingsFixture({ instructionMappings: [newMapping] }) });
+        if (url === "/api/snapshot/r1") return jsonResponse({ revisionId: "r1", files: [] });
+        throw new Error(`Unexpected request: ${url}`);
+    } });
+    app.state.settings = settingsFixture({ instructionMappings: [oldMapping] });
+    app.state.review = review;
+    app.run("renderRuler = () => {}");
+    const fields = new Map<string, MockElement>();
+    for (const [name, value, checked] of [
+        ["pathPrefix", "src/Area", false], ["instructionRoot", "edited/Area", false],
+        ["splitLanguageSpecific", "", true], ["destinationKind", "language", false],
+        ["language", "csharp", false], ["applyTo", "**/*.cs", false],
+    ] as const) {
+        const field = new MockElement(name === "destinationKind" ? "SELECT" : "INPUT");
+        Object.assign(field, { name, value, checked });
+        fields.set(name, field);
+    }
+    const details = Object.assign(new MockElement("DETAILS"), { open: true });
+    const preview = new MockElement();
+    const proposal = {
+        mapping: { pathPrefix: "src/Area", instructionRoot: "edited/Area", splitLanguageSpecific: true },
+        destination: { kind: "language", language: "csharp", applyTo: "**/*.cs" },
+    };
+    const signature = JSON.stringify(["Use typed guards.", "repo", "src/Area/Rules.cs"]);
+    const form = Object.assign(new MockElement(), {
+        dataset: {
+            lessonForm: "lesson/stale", lessonMessage: "m", lessonSignature: signature, destinationEdited: "true" as string | undefined,
+            expectedMappings: JSON.stringify([oldMapping]), rule: "Use typed guards.", scope: "repo",
+            destinationPreviewState: "ready", destinationPreviewKey: JSON.stringify(proposal),
+        },
+        querySelector: (selector: string) => selector === "details.lesson-destination"
+            ? details
+            : selector === "[data-destination-preview]" ? preview
+            : fields.get(selector.match(/name="([^"]+)"/)?.[1] ?? "") ?? null,
+    });
+    app.run<(main: MockElement) => void>("captureDestinationFormDrafts")(Object.assign(new MockElement(), { querySelectorAll: () => [form] }));
+    app.document.querySelectorAll = (selector: string) => selector === "#main [data-lesson-form]" ? [form] : [];
+    const button = Object.assign(new MockElement("BUTTON"), { dataset: { action: "save-lesson", lesson: "lesson/stale" } });
+    button.closest = (selector: string) => selector === "[data-lesson-form]" ? form : button;
+
+    await app.run("onClick")({ target: button });
+
+    assert.equal(saves.length, 1);
+    assert.deepEqual(saves[0].expectedInstructionMappings, [oldMapping], "the save carries the mappings the card was edited against");
+    assert.deepEqual(saves[0].mapping, proposal.mapping);
+    assert.equal(form.dataset.destinationEdited, undefined);
+    const html = app.run(`messageHtml(${JSON.stringify({
+        messageId: "m", author: "agent", body: "Learned rule", createdAt: "2026-01-02T00:00:00Z", lessonIds: ["lesson/stale"],
+    })})`);
+    assert.match(html, /name="instructionRoot" value="new\/Area"/, "the card shows the current stored mapping");
+    assert.doesNotMatch(html, /data-destination-edited="true"/);
+    assert.ok(html.includes(`data-expected-mappings="${JSON.stringify([newMapping]).replace(/"/g, "&quot;")}"`), "the next save is checked against the current mappings");
+});
+
+test("a save conflict on an untouched card shows the current stored mapping before the next attempt", async () => {
+    const oldMapping = { pathPrefix: "src/Area", instructionRoot: "old/Area", splitLanguageSpecific: true };
+    const newMapping = { pathPrefix: "src/Area", instructionRoot: "new/Area", splitLanguageSpecific: true };
+    const saves: Record<string, unknown>[] = [];
+    const review = reviewFixture({
+        lessons: [{
+            lessonId: "lesson/untouched", threadId: "t1", scope: "repo", rule: "Use typed guards.",
+            status: "proposed", reviewedPath: "src/Area/Rules.cs",
+            destination: { kind: "language", language: "csharp", applyTo: "**/*.cs" }, createdAt: "2026-01-01T00:00:00Z",
+        }],
+    });
+    const app = await loadApp({ fetch: async (url, init) => {
+        if (url.endsWith("/destination")) return jsonResponse({ savedTo: "old/Area/.github/instructions/csharp.instructions.md", needsConfirmation: false });
+        if (url.endsWith("/save")) {
+            saves.push(requestBody(init));
+            return jsonResponse({ error: { message: "Repository instruction mappings changed after this guideline was shown." } }, 409);
+        }
+        if (url === "/api/state") return jsonResponse({ review, settings: settingsFixture({ instructionMappings: [newMapping] }) });
+        if (url === "/api/snapshot/r1") return jsonResponse({ revisionId: "r1", files: [] });
+        throw new Error(`Unexpected request: ${url}`);
+    } });
+    app.state.settings = settingsFixture({ instructionMappings: [oldMapping] });
+    app.state.review = review;
+    app.run("renderRuler = () => {}");
+    const fields = new Map<string, MockElement>();
+    for (const [name, value, checked] of [
+        ["pathPrefix", "src/Area", false], ["instructionRoot", "old/Area", false],
+        ["splitLanguageSpecific", "", true], ["destinationKind", "language", false],
+        ["language", "csharp", false], ["applyTo", "**/*.cs", false],
+    ] as const) {
+        const field = new MockElement(name === "destinationKind" ? "SELECT" : "INPUT");
+        Object.assign(field, { name, value, checked });
+        fields.set(name, field);
+    }
+    const details = Object.assign(new MockElement("DETAILS"), { open: true });
+    const preview = new MockElement();
+    const proposal = {
+        mapping: oldMapping,
+        destination: { kind: "language", language: "csharp", applyTo: "**/*.cs" },
+    };
+    const form = Object.assign(new MockElement(), {
+        dataset: {
+            lessonForm: "lesson/untouched", lessonMessage: "m",
+            lessonSignature: JSON.stringify(["Use typed guards.", "repo", "src/Area/Rules.cs"]),
+            expectedMappings: JSON.stringify([oldMapping]), rule: "Use typed guards.", scope: "repo",
+            destinationPreviewState: "ready", destinationPreviewKey: JSON.stringify(proposal),
+        },
+        querySelector: (selector: string) => selector === "details.lesson-destination"
+            ? details
+            : selector === "[data-destination-preview]" ? preview
+            : fields.get(selector.match(/name="([^"]+)"/)?.[1] ?? "") ?? null,
+    });
+    app.run<(main: MockElement) => void>("captureDestinationFormDrafts")(Object.assign(new MockElement(), { querySelectorAll: () => [form] }));
+    app.document.querySelectorAll = (selector: string) => selector === "#main [data-lesson-form]" ? [form] : [];
+    const button = Object.assign(new MockElement("BUTTON"), { dataset: { action: "save-lesson", lesson: "lesson/untouched" } });
+    button.closest = (selector: string) => selector === "[data-lesson-form]" ? form : button;
+
+    await app.run("onClick")({ target: button });
+
+    assert.equal(saves.length, 1);
+    assert.deepEqual(saves[0].expectedInstructionMappings, [oldMapping]);
+    const html = app.run(`messageHtml(${JSON.stringify({
+        messageId: "m", author: "agent", body: "Learned rule", createdAt: "2026-01-02T00:00:00Z", lessonIds: ["lesson/untouched"],
+    })})`);
+    assert.match(html, /name="instructionRoot" value="new\/Area"/, "the card shows the current stored mapping");
+    assert.ok(html.includes(`data-expected-mappings="${JSON.stringify([newMapping]).replace(/"/g, "&quot;")}"`), "the next save is checked against the current mappings");
 });
 
 test("the Configure dialog opens on the saved mode, keeps the page inert behind it, traps Tab, and closes on Escape", async () => {
@@ -1779,7 +2552,9 @@ test("the Configure dialog opens on the saved mode, keeps the page inert behind 
     ];
     const querySelector = app.document.querySelector;
     app.document.querySelector = (selector: string) => (selector.includes("autoSaveLearnedRules") ? autoSaveCheckbox : querySelector(selector));
-    app.document.querySelectorAll = (selector: string) => (selector === '#dialog input[name="delivery"]' ? deliveryRadios : buttons);
+    app.document.querySelectorAll = (selector: string) => selector === '#dialog input[name="delivery"]'
+        ? deliveryRadios
+        : selector.includes("#dialog input:not([disabled])") ? [autoSaveCheckbox, ...deliveryRadios.slice(0, 1), ...buttons] : buttons;
     app.document.activeElement = buttons[1];
     press({ key: "Tab", shiftKey: false });
     app.document.activeElement = autoSaveCheckbox;
@@ -1936,7 +2711,7 @@ test("Save guideline posts the exact rendered lesson and leaves the proposal vis
     } });
     const rule = "Prefer <safe> & focused";
     app.state.review = reviewFixture({
-        lessons: [{ lessonId: "lesson/one", threadId: "t1", scope: "repo", rule, status: "proposed", createdAt: "2026-01-01T00:00:00Z" }],
+        lessons: [{ lessonId: "lesson/one", threadId: "t1", scope: "personal", rule, status: "proposed", createdAt: "2026-01-01T00:00:00Z" }],
     });
     const message = () => app.run("messageHtml({ messageId: 'm', author: 'agent', body: 'Done', createdAt: '2026-01-02T00:00:00Z', lessonIds: ['lesson/one'] })");
     const html = message();
@@ -1944,10 +2719,10 @@ test("Save guideline posts the exact rendered lesson and leaves the proposal vis
     const encodedProposal = required(html.match(/data-proposal="([^"]*)"/))[1];
     const renderedProposal = JSON.parse(encodedProposal
         .replaceAll("&quot;", '"').replaceAll("&#39;", "'").replaceAll("&gt;", ">").replaceAll("&lt;", "<").replaceAll("&amp;", "&")) as { rule: string; scope: string };
-    assert.deepEqual(renderedProposal, { rule, scope: "repo" });
+    assert.deepEqual(renderedProposal, { rule, scope: "personal" });
 
     await clicker(app)("save-lesson", { lesson: "lesson/one", proposal: JSON.stringify(renderedProposal) });
-    assert.deepEqual(calls, [["POST", "/api/lessons/lesson%2Fone/save", { rule, scope: "repo" }]]);
+    assert.deepEqual(calls, [["POST", "/api/lessons/lesson%2Fone/save", { rule, scope: "personal" }]]);
     assert.equal(app.node("#toast").textContent, "automatic save unavailable");
     assert.match(message(), /<span class="badge lesson-proposed"[^>]*>proposed<\/span> Prefer &lt;safe&gt; &amp; focused <button data-action="save-lesson"[^>]*>Save guideline<\/button>/);
 });

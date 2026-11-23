@@ -2,6 +2,7 @@
 // per-instance loopback server with the token from the URL.
 import { createSettingsApi } from "./settings-api.mjs";
 import { REVIEW_COMMANDS, reviewCommandSuggestions } from "./review-commands.mjs";
+import type { InstructionMapping } from "../../types/contracts.js";
 
 type Scope = "all" | "pending";
 type DiffSide = "old" | "new";
@@ -112,6 +113,8 @@ type Lesson = {
     scope: string;
     status?: string;
     rule: string;
+    reviewedPath?: string;
+    destination?: { kind: "general" | "language"; language?: string; applyTo?: string; pathPrefix?: string; instructionRoot?: string };
     savedTo?: string | null;
     saveError?: string;
     threadId: string;
@@ -217,7 +220,28 @@ type ContentEntry =
 type PendingComment = { clientRequestId: string; sending?: boolean; error?: string | null };
 type Selection = { path: string; hunk: number; anchor: number; from: number; to: number; full: boolean };
 type RowPosition = { path: string; h: number; i: number; full: boolean };
-type ConfigureDialog = { type: "configure"; autoSaveLearnedRules: boolean; delivery: DeliveryMode; commentConcurrency: number; saving: boolean; error: string };
+type ConfigureDialog = {
+    type: "configure";
+    autoSaveLearnedRules: boolean;
+    delivery: DeliveryMode;
+    commentConcurrency: number;
+    originalInstructionMappings: InstructionMapping[];
+    instructionMappings: InstructionMapping[];
+    saving: boolean;
+    error: string;
+};
+type DestinationFormDraft = {
+    signature: string;
+    edited: boolean;
+    pathPrefix: string;
+    instructionRoot: string;
+    splitLanguageSpecific: boolean;
+    destinationKind: "general" | "language";
+    language: string;
+    applyTo: string;
+    detailsOpen: boolean;
+    expectedMappings: string;
+};
 type AgentReviewDialog = {
     type: "agent-review";
     reviewId: string;
@@ -614,6 +638,8 @@ const state: State = {
 
 const FOLDER_VIEW_ROW_BUDGET = 3000;
 const settingsApi = createSettingsApi((method, path, body) => api(method, path, body));
+const destinationPreviewRequests = new WeakMap<HTMLElement, { key: string; requestId: symbol; promise: Promise<{ savedTo: string; needsConfirmation: boolean } | null> }>();
+const destinationFormDrafts = new Map<string, DestinationFormDraft>();
 
 const DELIVERY_MODES = ["immediate", "batch", "ask"] as const;
 type DeliveryMode = (typeof DELIVERY_MODES)[number];
@@ -1088,11 +1114,13 @@ function renderLoadStatus(): void {
     const pending = Boolean(loading) || reloadPending || refreshing || (!loadError && !refreshFailure && serverRefresh?.status === "refreshing");
     const error = loadError || refreshFailure;
     const failureLabel = loadError ? "Could not load the current review" : "Could not refresh from the working tree";
+    const errorText = error.trim();
+    const punctuation = /[.!?…]$/u.test(errorText) ? "" : ".";
     status.hidden = !pending && !error;
     status.className = error && !pending ? "review-status del" : "review-status muted";
     const message = pending
         ? state.review ? "Refreshing review and Overview... Showing the last loaded data." : "Loading review and Overview..."
-        : error ? `${failureLabel}: ${esc(error)}. ${state.review ? "Showing the last loaded data." : ""}` : "";
+        : error ? `${failureLabel}: ${esc(errorText)}${punctuation} ${state.review ? "Showing the last loaded data." : ""}` : "";
     const retry = error && !pending ? `<button type="button" data-action="refresh">Retry</button>` : "";
     const html = message ? `<span class="review-status-message">${message}</span>${retry}` : "";
     if (renderedStatusHtml !== html) {
@@ -1475,6 +1503,7 @@ function render() {
     renderBanner();
     renderSide();
     renderMain();
+    refreshDestinationPreviews();
     const outsideReplies = outsideDraftRepliesHtml();
     if (pinnedComposers.size || outsideReplies) {
         main.insertAdjacentHTML("afterbegin", outsideReplies + [...pinnedComposers].map(([key, options]) =>
@@ -1623,6 +1652,15 @@ function dialogHtml(): string {
         + `<h2 id="dialog-title">Review settings</h2>`
         + `<p id="dialog-desc" class="muted">Settings for ${esc(state.settings?.repoName ?? "this repository")}. They are stored on this machine only and never committed.</p>`
         + `<fieldset class="choices"><legend>Guidelines</legend><label><input type="checkbox" name="autoSaveLearnedRules"${d.autoSaveLearnedRules ? " checked" : ""}> Auto-save learned rules</label><p>When off, review and save proposed guidelines yourself.</p></fieldset>`
+        + `<fieldset class="choices instruction-mappings"><legend>Repository instruction destinations</legend>`
+        + `<p class="muted">Map a repository-relative path prefix to the folder that contains its .github instructions. The longest matching prefix wins; an empty prefix is the repository-root default. These mappings are per-user and shared across clones and worktrees.</p>`
+        + (d.instructionMappings.length ? d.instructionMappings.map((mapping, index) => `<div class="instruction-mapping" data-mapping-index="${index}">`
+            + `<label>Path prefix <input name="mapping-prefix" data-index="${index}" value="${esc(mapping.pathPrefix)}" placeholder="(repository root)"></label>`
+            + `<label>Instruction root <input name="mapping-root" data-index="${index}" value="${esc(mapping.instructionRoot)}" placeholder="(repository root)"></label>`
+            + `<label><input type="checkbox" name="mapping-split" data-index="${index}"${mapping.splitLanguageSpecific ? " checked" : ""}> Split language-specific rules into scoped files</label>`
+            + `<button data-action="mapping-remove" data-index="${index}">Remove mapping</button></div>`).join("")
+            : `<p class="muted">No mappings yet. Repository rules remain proposals until a destination is configured.</p>`)
+        + `<button data-action="mapping-add">Add destination mapping</button></fieldset>`
         + `<fieldset class="choices"><legend>Send comments to Copilot</legend>${choicesHtml("delivery", DELIVERY_MODES, DELIVERY, d.delivery)}</fieldset>`
         + `<fieldset class="choices"><legend>Comment processing</legend><label>Concurrent comments <select name="commentConcurrency" aria-describedby="comment-concurrency-hint">${
             [1, 2, 3, 4].map(n => `<option value="${n}"${n === (d.commentConcurrency ?? 1) ? " selected" : ""}>${n === 1 ? "1 (serial)" : n}</option>`).join("")
@@ -1667,8 +1705,14 @@ function renderDialog() {
 
 function openConfigure() {
     if (!state.settings || state.dialog) return;
-    state.dialog = { type: "configure", autoSaveLearnedRules: autoSaveLearnedRules(), delivery: deliveryRepoMode(),
-        commentConcurrency: state.settings.commentConcurrency ?? 1, saving: false, error: "" };
+    const mappings = state.settings.instructionMappings.map((mapping) => ({ ...mapping }));
+    state.dialog = {
+        type: "configure", autoSaveLearnedRules: autoSaveLearnedRules(), delivery: deliveryRepoMode(),
+        commentConcurrency: state.settings.commentConcurrency ?? 1,
+        originalInstructionMappings: mappings.map((mapping) => ({ ...mapping })),
+        instructionMappings: mappings,
+        saving: false, error: "",
+    };
     renderDialog();
     focusIn('#dialog input[name="autoSaveLearnedRules"]');
 }
@@ -1968,8 +2012,10 @@ function agentReviewsHtml(): string {
 // A delivery change alters every composer's buttons, so it needs a full render once a diff is shown.
 async function updateSettings(patch: import("../../types/contracts.js").SettingsPatch): Promise<void> {
     const before = deliveryMode();
+    const previousMappings = JSON.stringify(state.settings?.instructionMappings ?? []);
     state.settings = await settingsApi.update(patch);
-    if (deliveryMode() !== before && state.snapshot) {
+    const mappingsChanged = previousMappings !== JSON.stringify(state.settings.instructionMappings);
+    if ((deliveryMode() !== before && state.snapshot) || mappingsChanged) {
         render();
     } else {
         renderTop();
@@ -1985,8 +2031,15 @@ async function saveConfigure(): Promise<void> {
     d.error = "";
     renderDialog();
     try {
-        await updateSettings({ autoSaveLearnedRules: d.autoSaveLearnedRules, delivery: d.delivery,
-            ...(d.commentConcurrency !== (state.settings?.commentConcurrency ?? 1) ? { commentConcurrency: d.commentConcurrency } : {}) });
+        const mappingsChanged = JSON.stringify(d.instructionMappings) !== JSON.stringify(d.originalInstructionMappings);
+        await updateSettings({
+            autoSaveLearnedRules: d.autoSaveLearnedRules, delivery: d.delivery,
+            ...(d.commentConcurrency !== (state.settings?.commentConcurrency ?? 1) ? { commentConcurrency: d.commentConcurrency } : {}),
+            ...(mappingsChanged ? {
+                instructionMappings: d.instructionMappings,
+                expectedInstructionMappings: d.originalInstructionMappings,
+            } : {}),
+        });
         state.dialog = null;
         renderDialog();
         focusIn('[data-action="configure"]');
@@ -2005,11 +2058,11 @@ function trapTab(e: KeyboardEvent): void {
         const radios = Array.from(document.querySelectorAll<HTMLInputElement>(`#dialog input[name="${name}"]`));
         return radios.find((x) => x.checked) ?? radios[0];
     };
-    const stops: HTMLElement[] = state.dialog?.type === "agent-review"
+    const trapAllFocusable = state.dialog?.type === "agent-review" || state.dialog?.type === "configure";
+    const deliveryStop = trapAllFocusable ? undefined : groupStop("delivery");
+    const stops: HTMLElement[] = trapAllFocusable
         ? Array.from(document.querySelectorAll<HTMLElement>("#dialog input:not([disabled]), #dialog select:not([disabled]), #dialog textarea:not([disabled]), #dialog a[href], #dialog button:not([disabled])"))
-        : [document.querySelector<HTMLInputElement>('#dialog input[name="autoSaveLearnedRules"]'), groupStop("delivery"),
-            document.querySelector<HTMLSelectElement>('#dialog select[name="commentConcurrency"]'), ...Array.from(document.querySelectorAll<HTMLButtonElement>("#dialog button:not([disabled])"))]
-            .filter((el): el is HTMLInputElement | HTMLButtonElement => el instanceof HTMLInputElement || el instanceof HTMLButtonElement);
+        : [...(deliveryStop ? [deliveryStop] : []), ...Array.from(document.querySelectorAll<HTMLButtonElement>("#dialog button:not([disabled])"))];
     if (!stops.length) return;
     const first = stops[0];
     const last = stops[stops.length - 1];
@@ -2130,6 +2183,7 @@ function renderSide(): void {
 function renderMain(): void {
     const main = $("#main");
     if (!main) return;
+    captureDestinationFormDrafts(main);
     if (state.view.type === "file") {
         const file = displayFile(state.view.path);
         if (file) {
@@ -2314,8 +2368,206 @@ function deliveryHtml(m: ReviewMessage): string {
     }
 }
 
-function saveLessonButton(l: Lesson): string {
+function mappingForPath(reviewedPath: string): InstructionMapping | undefined {
+    const caseSensitive = state.settings?.pathCaseSensitive ?? true;
+    const normalize = (value: string) => {
+        const normalized = value.replace(/\\/g, "/").replace(/^\.\/+/, "");
+        return caseSensitive ? normalized : normalized.toLowerCase();
+    };
+    const file = normalize(reviewedPath);
+    return [...(state.settings?.instructionMappings ?? [])]
+        .filter((mapping) => {
+            const prefix = normalize(mapping.pathPrefix);
+            return !prefix || file === prefix || file.startsWith(`${prefix}/`);
+        })
+        .sort((a, b) => b.pathPrefix.length - a.pathPrefix.length)[0];
+}
+
+function reviewedPathForLesson(lesson: Lesson): string | undefined {
+    if (lesson.reviewedPath !== undefined) return lesson.reviewedPath;
+    const thread = state.review?.threads.find((item) => item.threadId === lesson.threadId);
+    if (thread?.kind === "overview") return "";
+    return thread?.location?.path ?? thread?.anchor?.path;
+}
+
+function suggestedDestination(lesson: Lesson, reviewedPath = lesson.reviewedPath): NonNullable<Lesson["destination"]> {
+    if (lesson.destination) return lesson.destination;
+    const extension = reviewedPath?.replace(/\\/g, "/").split(".").at(-1)?.toLowerCase() ?? "";
+    const names: Record<string, string> = {
+        cs: "csharp", js: "javascript", jsx: "javascript", mjs: "javascript", cjs: "javascript",
+        ts: "typescript", tsx: "typescript", mts: "typescript", cts: "typescript", py: "python", ps1: "powershell", go: "go",
+        rs: "rust", java: "java", rb: "ruby", php: "php", sh: "shell", sql: "sql",
+    };
+    const language = names[extension];
+    return language
+        ? { kind: "language", language, applyTo: `**/*.${extension}` }
+        : { kind: "general" };
+}
+
+function lessonDestinationSignature(lesson: Lesson, reviewedPath: string | undefined): string {
+    return JSON.stringify([lesson.rule, lesson.scope, reviewedPath ?? null]);
+}
+
+function destinationFormDraftKey(lessonId: string, messageId: string): string {
+    return JSON.stringify([lessonId, messageId]);
+}
+
+function captureDestinationFormDrafts(main: HTMLElement): void {
+    for (const form of Array.from(main.querySelectorAll<HTMLElement>("[data-lesson-form]"))) {
+        const lessonId = form.dataset.lessonForm;
+        const messageId = form.dataset.lessonMessage;
+        const signature = form.dataset.lessonSignature;
+        const input = (name: string) => form.querySelector<HTMLInputElement | HTMLSelectElement>(`[name="${name}"]`);
+        const pathPrefix = input("pathPrefix");
+        const instructionRoot = input("instructionRoot");
+        const splitLanguageSpecific = input("splitLanguageSpecific");
+        const destinationKind = input("destinationKind");
+        const language = input("language");
+        const applyTo = input("applyTo");
+        const details = form.querySelector<HTMLDetailsElement>("details.lesson-destination");
+        if (!lessonId || !messageId || !signature || !pathPrefix || !instructionRoot || !splitLanguageSpecific
+            || !destinationKind || !language || !applyTo || !details) continue;
+        destinationFormDrafts.set(destinationFormDraftKey(lessonId, messageId), {
+            signature,
+            edited: form.dataset.destinationEdited === "true",
+            pathPrefix: pathPrefix.value,
+            instructionRoot: instructionRoot.value,
+            splitLanguageSpecific: splitLanguageSpecific instanceof HTMLInputElement && splitLanguageSpecific.checked,
+            destinationKind: destinationKind.value === "language" ? "language" : "general",
+            language: language.value,
+            applyTo: applyTo.value,
+            detailsOpen: details.open,
+            expectedMappings: form.dataset.expectedMappings ?? currentMappingsSnapshot(),
+        });
+    }
+}
+
+function currentMappingsSnapshot(): string {
+    return JSON.stringify(state.settings?.instructionMappings ?? []);
+}
+
+// A failed save may follow a concurrent mapping change, so reload the stored mappings for the card and its next save.
+// An edited card keeps the mappings it was edited against; if they changed since, show the stored destination again.
+async function refreshDestinationAfterFailedSave(form: HTMLElement): Promise<void> {
+    const lessonId = form.dataset.lessonForm;
+    const messageId = form.dataset.lessonMessage;
+    if (!lessonId || !messageId) return;
+    await loadState();
+    if (form.dataset.destinationEdited !== "true") return;
+    const key = destinationFormDraftKey(lessonId, messageId);
+    const draft = destinationFormDrafts.get(key);
+    if (draft && draft.expectedMappings === currentMappingsSnapshot()) return;
+    destinationFormDrafts.delete(key);
+    for (const current of Array.from(document.querySelectorAll<HTMLElement>("#main [data-lesson-form]"))) {
+        if (current.dataset.lessonForm === lessonId && current.dataset.lessonMessage === messageId) delete current.dataset.destinationEdited;
+    }
+    render();
+}
+
+function destinationFormProposal(form: HTMLElement): { mapping: InstructionMapping; destination: NonNullable<Lesson["destination"]> } {
+    const input = (name: string) => form.querySelector<HTMLInputElement | HTMLSelectElement>(`[name="${name}"]`);
+    const root = input("instructionRoot")?.value.replace(/\/+$/, "") ?? "";
+    const kind = input("destinationKind")?.value === "language" ? "language" : "general";
+    const splitInput = input("splitLanguageSpecific");
+    const language = input("language")?.value.trim() ?? "";
+    const applyTo = input("applyTo")?.value.trim() ?? "";
+    return {
+        mapping: {
+            pathPrefix: input("pathPrefix")?.value ?? "",
+            instructionRoot: root,
+            splitLanguageSpecific: splitInput instanceof HTMLInputElement ? splitInput.checked : true,
+        },
+        destination: kind === "language" ? { kind, language, applyTo } : { kind: "general" },
+    };
+}
+
+async function updateDestinationPreview(form: HTMLElement): Promise<{ savedTo: string; needsConfirmation: boolean } | null> {
+    const lessonId = form.dataset.lessonForm;
+    const preview = form.querySelector<HTMLElement>("[data-destination-preview]");
+    if (!lessonId || !preview) return null;
+    const proposal = destinationFormProposal(form);
+    const key = JSON.stringify(proposal);
+    const existing = destinationPreviewRequests.get(form);
+    if (existing?.key === key) return existing.promise;
+    const requestId = Symbol();
+    form.dataset.destinationPreviewKey = key;
+    form.dataset.destinationPreviewState = "loading";
+    preview.textContent = "Resolving actual destination…";
+    const isCurrentRequest = () => form.dataset.destinationPreviewKey === key
+        && destinationPreviewRequests.get(form)?.requestId === requestId;
+    const promise = (async () => {
+        try {
+            const result: unknown = await api("POST", `lessons/${encodeURIComponent(lessonId)}/destination`, proposal);
+            if (!isRecord(result) || typeof result.savedTo !== "string" || typeof result.needsConfirmation !== "boolean") {
+                throw new Error("The provider returned an invalid destination preview.");
+            }
+            if (isCurrentRequest()) {
+                form.dataset.destinationPreviewState = "ready";
+                form.dataset.resolvedDestination = result.savedTo;
+                preview.textContent = `${result.savedTo}${result.needsConfirmation ? " (new file; confirmation required)" : ""}`;
+            }
+            return { savedTo: result.savedTo, needsConfirmation: result.needsConfirmation };
+        } catch (error: unknown) {
+            if (isCurrentRequest()) {
+                form.dataset.destinationPreviewState = "error";
+                preview.textContent = `Unable to resolve destination: ${errorMessage(error)}`;
+            }
+            if (destinationPreviewRequests.get(form)?.requestId === requestId) destinationPreviewRequests.delete(form);
+            return null;
+        }
+    })();
+    destinationPreviewRequests.set(form, { key, requestId, promise });
+    return promise;
+}
+
+function refreshDestinationPreviews(): void {
+    for (const form of Array.from(document.querySelectorAll<HTMLElement>("#main [data-lesson-form]"))) {
+        if (form.dataset.destinationPreviewState !== "ready") void updateDestinationPreview(form);
+    }
+}
+
+function lessonDestinationForm(lesson: Lesson, messageId: string): string {
+    const reviewedPath = reviewedPathForLesson(lesson);
+    const mapping = reviewedPath !== undefined ? mappingForPath(reviewedPath) : undefined;
+    const parent = reviewedPath?.replace(/\\/g, "/").split("/").slice(0, -1).join("/") ?? "";
+    const suggestion = suggestedDestination(lesson, reviewedPath);
+    const signature = lessonDestinationSignature(lesson, reviewedPath);
+    const draftKey = destinationFormDraftKey(lesson.lessonId, messageId);
+    const previousDraft = destinationFormDrafts.get(draftKey);
+    const draft = previousDraft?.signature === signature ? previousDraft : undefined;
+    if (previousDraft && !draft) destinationFormDrafts.delete(draftKey);
+    const editedDraft = draft?.edited ? draft : undefined;
+    const destination = editedDraft
+        ? { kind: editedDraft.destinationKind, language: editedDraft.language, applyTo: editedDraft.applyTo }
+        : suggestion;
+    const prefix = editedDraft?.pathPrefix ?? mapping?.pathPrefix ?? destination.pathPrefix ?? parent;
+    const root = editedDraft?.instructionRoot ?? mapping?.instructionRoot ?? destination.instructionRoot ?? parent;
+    const splitLanguageSpecific = editedDraft?.splitLanguageSpecific ?? mapping?.splitLanguageSpecific ?? true;
+    return `<details class="lesson-destination"${draft?.detailsOpen ? " open" : ""}><summary>Confirm repository destination</summary>`
+        + `<p class="muted">Reviewed file: <code>${esc(reviewedPath ?? "path unavailable")}</code>. This per-user mapping is shared by clones and worktrees of the same repository.</p>`
+        + `<label>Path prefix <input name="pathPrefix" value="${esc(prefix)}" placeholder="(repository root)"></label>`
+        + `<label>Instruction root <input name="instructionRoot" value="${esc(root)}" placeholder="(repository root)"></label>`
+        + `<label><input type="checkbox" name="splitLanguageSpecific"${splitLanguageSpecific ? " checked" : ""}> Split language-specific rules into scoped files</label>`
+        + `<label>Rule type <select name="destinationKind"><option value="language"${destination.kind === "language" ? " selected" : ""}>Language-specific</option><option value="general"${destination.kind === "general" ? " selected" : ""}>Repository-wide</option></select></label>`
+        + `<label>Language <input name="language" value="${esc(destination.language ?? "")}" placeholder="csharp"></label>`
+        + `<label>applyTo <input name="applyTo" value="${esc(destination.applyTo ?? "")}" placeholder="**/*.cs"></label>`
+        + `<p class="muted">Actual destination: <code data-destination-preview>Resolving actual destination…</code></p>`
+        + `<button data-action="save-lesson" data-lesson="${esc(lesson.lessonId)}">Confirm destination and save guideline</button>`
+        + `</details>`;
+}
+
+function saveLessonButton(l: Lesson, messageId: string): string {
     if (l.status !== "proposed" || (l.scope !== "repo" && l.scope !== "personal")) return "";
+    if (l.scope === "repo") {
+        const reviewedPath = reviewedPathForLesson(l);
+        const signature = lessonDestinationSignature(l, reviewedPath);
+        const draftKey = destinationFormDraftKey(l.lessonId, messageId);
+        const draft = destinationFormDrafts.get(draftKey);
+        const edited = draft?.signature === signature && draft.edited;
+        const expectedMappings = edited ? draft.expectedMappings : currentMappingsSnapshot();
+        return ` <span data-lesson-form="${esc(l.lessonId)}" data-lesson-message="${esc(messageId)}" data-lesson-signature="${esc(signature)}"${edited ? ' data-destination-edited="true"' : ""} data-expected-mappings="${esc(expectedMappings)}" data-rule="${esc(l.rule)}" data-scope="${esc(l.scope)}">`
+            + `${lessonDestinationForm(l, messageId)}${l.saveError ? ` <span role="status">${esc(l.saveError)}</span>` : ""}</span>`;
+    }
     return ` <button data-action="save-lesson" data-lesson="${esc(l.lessonId)}" data-proposal="${esc(JSON.stringify({ rule: l.rule, scope: l.scope }))}">Save guideline</button>`
         + (l.saveError ? ` <span role="status">${esc(l.saveError)}</span>` : "");
 }
@@ -2332,7 +2584,7 @@ function messageHtml(m: ReviewMessage): string {
         + (savedLesson ? `<span class="badge lesson-saved">Lesson learned</span>` : "")
         + `</div>${md(m.body)}${imagesHtml(m.imageIds ?? [])}`
         + (m.verification ? `<div class="verification">Verification: ${inline(m.verification)}</div>` : "")
-        + (lessons.length ? `<div class="lessons">Guidelines:<ul>${lessons.map((l) => `<li><span class="badge">${esc(l.scope)}</span> ${lessonBadge(l)} ${inline(l.rule)}${l.savedTo ? ` <span class="muted mono">→ ${esc(l.savedTo)}</span>` : ""}${saveLessonButton(l)}</li>`).join("")}</ul></div>` : "")
+        + (lessons.length ? `<div class="lessons">Guidelines:<ul>${lessons.map((l) => `<li><span class="badge">${esc(l.scope)}</span> ${lessonBadge(l)} ${inline(l.rule)}${l.savedTo ? ` <span class="muted mono">→ ${esc(l.savedTo)}</span>` : ""}${saveLessonButton(l, m.messageId)}</li>`).join("")}</ul></div>` : "")
         + `</div>`;
 }
 
@@ -3010,6 +3262,23 @@ async function onClick(e: MouseEvent): Promise<void> {
             case "dialog-save":
                 await saveConfigure();
                 break;
+            case "mapping-add":
+                if (state.dialog?.type === "configure") {
+                    state.dialog.instructionMappings.push({ pathPrefix: "", instructionRoot: "", splitLanguageSpecific: true });
+                    renderDialog();
+                    focusIn(`#dialog input[name="mapping-prefix"][data-index="${state.dialog.instructionMappings.length - 1}"]`);
+                }
+                break;
+            case "mapping-remove":
+                if (state.dialog?.type === "configure") {
+                    const index = Number(value("index"));
+                    if (Number.isInteger(index) && index >= 0 && index < state.dialog.instructionMappings.length) {
+                        state.dialog.instructionMappings.splice(index, 1);
+                        renderDialog();
+                        focusIn('#dialog [data-action="mapping-add"]');
+                    }
+                }
+                break;
             case "learning-set":
                 if (value("enabled") === "true" || value("enabled") === "false") {
                     await updateSettings({ autoSaveLearnedRules: value("enabled") === "true" });
@@ -3017,9 +3286,49 @@ async function onClick(e: MouseEvent): Promise<void> {
                 }
                 break;
             case "save-lesson":
-                await api("POST", `lessons/${encodeURIComponent(value("lesson"))}/save`, JSON.parse(value("proposal")));
-                await loadState();
-                toast("Guideline saved.");
+                {
+                    const lessonId = value("lesson");
+                    const candidate = target.closest<HTMLElement>("[data-lesson-form]");
+                    const form = candidate?.dataset?.lessonForm ? candidate : null;
+                    const renderedProposal = form
+                        ? { rule: dataValue(form, "rule"), scope: dataValue(form, "scope") }
+                        : { rule: value("rule"), scope: value("scope") };
+                    let proposal: unknown;
+                    if (form) {
+                        const currentKey = JSON.stringify(destinationFormProposal(form));
+                        const previewIsCurrent = form.dataset.destinationPreviewState === "ready"
+                            && form.dataset.destinationPreviewKey === currentKey;
+                        if (!previewIsCurrent) {
+                            const resolved = await updateDestinationPreview(form);
+                            if (!resolved) {
+                                toast("Could not resolve the actual repository destination. Review the error above before saving.", true);
+                                break;
+                            }
+                            const latestKey = JSON.stringify(destinationFormProposal(form));
+                            if (form.dataset.destinationPreviewState !== "ready" || form.dataset.destinationPreviewKey !== latestKey) {
+                                toast("The destination changed while it was resolving. Review the updated preview, then confirm the save.");
+                            } else {
+                                toast("Destination preview updated. Review it, then confirm the save.");
+                            }
+                            break;
+                        }
+                        const resolved = await updateDestinationPreview(form);
+                        if (!resolved) {
+                            toast("Could not resolve the actual repository destination. Review the error above before saving.", true);
+                            break;
+                        }
+                        proposal = {
+                            ...renderedProposal, ...destinationFormProposal(form),
+                            expectedSavedTo: resolved.savedTo,
+                            ...(form.dataset.expectedMappings ? { expectedInstructionMappings: JSON.parse(form.dataset.expectedMappings) as unknown } : {}),
+                        };
+                    } else {
+                        proposal = JSON.parse(value("proposal"));
+                    }
+                    const result: unknown = await api("POST", `lessons/${encodeURIComponent(lessonId)}/save`, proposal);
+                    await loadState();
+                    toast(isRecord(result) && result.status === "saved" ? "Guideline saved." : "Guideline remains proposed; review its destination and try again.", !(isRecord(result) && result.status === "saved"));
+                }
                 break;
             case "learning-dismiss":
                 await updateSettings({ dismissed: true });
@@ -3029,13 +3338,41 @@ async function onClick(e: MouseEvent): Promise<void> {
         }
     } catch (err: unknown) {
         if (action === "refresh") target.removeAttribute("disabled");
-        else toast(errorMessage(err), true);
+        else {
+            if (action === "save-lesson") {
+                const candidate = target.closest<HTMLElement>("[data-lesson-form]");
+                if (candidate?.dataset?.lessonForm) {
+                    destinationPreviewRequests.delete(candidate);
+                    await updateDestinationPreview(candidate);
+                    await refreshDestinationAfterFailedSave(candidate).catch(() => undefined);
+                }
+            }
+            toast(errorMessage(err), true);
+        }
     }
 }
 
 async function onChange(e: Event): Promise<void> {
     const el = e.target;
     if (!(el instanceof HTMLInputElement || el instanceof HTMLSelectElement)) return;
+    if (state.dialog?.type === "configure" && el.dataset?.index !== undefined) {
+        const index = Number(el.dataset.index);
+        const mapping = state.dialog.instructionMappings[index];
+        if (mapping) {
+            if (el.name === "mapping-prefix") mapping.pathPrefix = el.value;
+            else if (el.name === "mapping-root") mapping.instructionRoot = el.value;
+            else if (el.name === "mapping-split" && el instanceof HTMLInputElement) mapping.splitLanguageSpecific = el.checked;
+            return;
+        }
+    }
+    if (el.closest?.("[data-lesson-form]")) {
+        const candidate = el.closest<HTMLElement>("[data-lesson-form]");
+        const form = candidate?.dataset?.lessonForm ? candidate : null;
+        if (form) {
+            form.dataset.destinationEdited = "true";
+            void updateDestinationPreview(form);
+        }
+    }
     if (el instanceof HTMLInputElement && el.name === "review-skill-defaults" && state.dialog?.type === "agent-review") {
         state.dialog.saveSkillDefaults = el.checked;
         renderDialog();
@@ -3091,6 +3428,21 @@ function updateReviewCommands(textarea: HTMLTextAreaElement): void {
 function onInput(e: Event): void {
     const el = e.target;
     if (!(el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)) return;
+    if (state.dialog?.type === "configure" && el.dataset?.index !== undefined) {
+        const index = Number(el.dataset.index);
+        const mapping = state.dialog.instructionMappings[index];
+        if (mapping) {
+            if (el.name === "mapping-prefix") mapping.pathPrefix = el.value;
+            else if (el.name === "mapping-root") mapping.instructionRoot = el.value;
+            return;
+        }
+    }
+    const candidate = el.closest?.<HTMLElement>("[data-lesson-form]");
+    const form = candidate?.dataset?.lessonForm ? candidate : null;
+    if (form) {
+        form.dataset.destinationEdited = "true";
+        void updateDestinationPreview(form);
+    }
     if ((el.name === "review-models" || el.name === "review-intent") && state.dialog?.type === "agent-review") {
         state.dialog[el.name === "review-models" ? "models" : "intent"] = el.value;
         return;

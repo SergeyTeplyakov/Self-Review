@@ -182,7 +182,7 @@ test("resolveDelivery uses the repository mode and lets an ask-mode review decid
 test("SettingsService stores the delivery mode per repository without enabling rule auto-save", async () => {
     const { store } = fresh();
     const settings = new SettingsService({ store });
-    const initial = { repoName: "proj", autoSaveLearnedRules: false, delivery: "immediate", configured: false, dismissed: false };
+    const initial = { repoName: "proj", autoSaveLearnedRules: false, delivery: "immediate", instructionMappings: [], configured: false, dismissed: false };
     assert.deepEqual(await settings.update(repo, { delivery: "batch" }), { ...initial, delivery: "batch" }, "delivery alone leaves auto-save unconfigured");
     assert.deepEqual(await settings.update(repo, { autoSaveLearnedRules: false, delivery: "ask" }), { ...initial, delivery: "ask", configured: true });
     assert.deepEqual(await new SettingsService({ store }).get(repo), { ...initial, delivery: "ask", configured: true }, "the choice is stored, not cached");

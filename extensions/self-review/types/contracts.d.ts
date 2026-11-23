@@ -4,6 +4,12 @@ export type DeliveryChoice = Exclude<DeliveryMode, "ask"> | null;
 export type ReviewScope = "all" | "pending";
 export type ReviewFocus = "review" | "simplify" | "both";
 
+export interface InstructionMapping {
+    pathPrefix: string;
+    instructionRoot: string;
+    splitLanguageSpecific: boolean;
+}
+
 export interface AgentReviewOptions {
     models: string[];
     focus: ReviewFocus;
@@ -19,6 +25,8 @@ export interface RepoSettings {
     repoName: string;
     autoSaveLearnedRules: boolean;
     delivery: DeliveryMode;
+    instructionMappings: InstructionMapping[];
+    pathCaseSensitive?: boolean;
     commentConcurrency?: number;
     configured: boolean;
     dismissed: boolean;
@@ -29,6 +37,8 @@ export interface SettingsPatch {
     delivery?: DeliveryMode;
     commentConcurrency?: number;
     dismissed?: boolean;
+    instructionMappings?: InstructionMapping[];
+    expectedInstructionMappings?: InstructionMapping[];
 }
 
 // Historical files may lack delivery, and invalid mode strings are ignored when read.
@@ -38,6 +48,7 @@ export interface StoredRepoSettings {
     delivery?: unknown;
     commentConcurrency?: unknown;
     promptDismissed?: unknown;
+    instructionMappings?: unknown;
     name?: string;
     updatedAt?: string;
     [key: string]: unknown;
@@ -54,6 +65,7 @@ export interface SettingsDocument {
 export interface SettingsStore {
     readSettings(): Promise<SettingsDocument>;
     updateSettings<T>(mutate: (settings: SettingsDocument) => T | Promise<T>): Promise<T>;
+    lock<T>(key: string, action: () => Promise<T>): Promise<T>;
 }
 
 export interface GitRunner {

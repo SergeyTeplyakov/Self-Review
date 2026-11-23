@@ -31,6 +31,7 @@ const EXTENSION_VERSION_PATH = path.join(REPOSITORY_ROOT, "extensions", "self-re
 const OUT = path.join(HERE, "..", "images");
 const KEEP = process.argv.includes("--keep");
 const CHECK_REFRESH = process.argv.includes("--check-refresh-layout");
+const CHECK_SEED = process.argv.includes("--check-seed");
 const only = process.argv.find((arg) => arg.startsWith("--only="))?.slice("--only=".length).split(",");
 const WIDTH = 1320;
 const THEMES: Array<"light" | "dark"> = ["light", "dark"];
@@ -426,7 +427,9 @@ async function seed(tmp: string) {
     await git(repo, "push", "-q", "-u", "origin", "feature/retry-policy");
 
     const store = new Store(path.join(tmp, "data"));
-    const service: ReviewServiceContract = new ReviewService({ store });
+    const settings = new SettingsService({ store });
+    await settings.update(repo, { instructionMappings: [{ pathPrefix: "", instructionRoot: "", splitLanguageSpecific: false }] });
+    const service: ReviewServiceContract = new ReviewService({ store, settings });
     let reviewId = "";
     const delivery = new Delivery({
         service,
@@ -497,7 +500,9 @@ async function seed(tmp: string) {
         verification: "`npm test -- retry`: 5 passed",
         lessons: [{ scope: "repo", rule: jitterRule }],
     });
-    await service.saveLesson(reviewId, jitterReply.lessonIds![0], { scope: "repo", rule: jitterRule });
+    const savedJitter = await service.saveLesson(reviewId, jitterReply.lessonIds![0], { scope: "repo", rule: jitterRule });
+    assert.equal(savedJitter.status, "saved", savedJitter.saveError);
+    assert.equal(savedJitter.savedTo, ".github/copilot-instructions.md");
     await service.setThreadStatus(reviewId, jitter.threadId, "resolved");
 
     const clamp = await onLine(15, R2, "src/http/retry.ts", "const retryAfter = error instanceof HttpError",
@@ -510,7 +515,11 @@ async function seed(tmp: string) {
         verification: "`npm test -- retry`: 6 passed",
         lessons: [{ scope: "repo", rule: clampRule }],
     });
-    await service.saveLesson(reviewId, clampReply.lessonIds![0], { scope: "repo", rule: clampRule });
+    const savedClamp = await service.saveLesson(reviewId, clampReply.lessonIds![0], { scope: "repo", rule: clampRule });
+    assert.equal(savedClamp.status, "saved", savedClamp.saveError);
+    assert.equal(savedClamp.savedTo, ".github/copilot-instructions.md");
+    const instructions = await readFile(path.join(repo, ".github", "copilot-instructions.md"), "utf8");
+    assert.ok(instructions.includes(jitterRule) && instructions.includes(clampRule));
     await service.updateDescription(reviewId, { body: DESCRIPTION(true), expectedVersion: 1 });
 
     const idempotent = await onLine(3, R3, "src/http/retry.ts", "export async function withRetry",
@@ -821,45 +830,49 @@ let server: Awaited<ReturnType<typeof startReviewServer>> | undefined;
 let browser: Browser | undefined;
 try {
     const seeded = await seed(tmp);
-    const { service, delivery } = seeded;
-    const extensionVersion = parseExtensionVersion(JSON.parse(await readFile(EXTENSION_VERSION_PATH, "utf8")) as unknown);
-    let reviewId = seeded.reviewId;
-    const settings = new SettingsService({ store: seeded.store });
-    const reviewSkills = new ReviewSkills({ store: seeded.store });
-    const agentReview = new AgentReview({ service, settings, reviewSkills, sessionId: () => undefined, send: async () => {
-        throw new Error("The screenshot fixture cannot dispatch agent reviews.");
-    } });
-    // Every theme starts like a first run: the repository has no learning setting yet.
-    const resetLearning = () => rm(seeded.store.settingsFile(), { force: true });
-    server = await startReviewServer({
-        instanceId: "screenshots",
-        getReviewId: () => reviewId,
-        onReviewChange: (id: string) => {
-            reviewId = id;
-        },
-        service,
-        delivery,
-        extensionVersion,
-        settings,
-        agentReview,
-        reviewSkills,
-        webRoot: WEB_ROOT,
-    });
-    await mkdir(OUT, { recursive: true });
-    browser = await launchBrowser();
-    if (CHECK_REFRESH) {
-        await checkRefreshLayout(browser, server.url);
-        console.log("Refresh layout stable during progress, error, and retry.");
+    if (CHECK_SEED) {
+        console.log("Screenshot fixture lessons saved.");
     } else {
-        for (const theme of THEMES) {
-            console.log(`${theme}:`);
-            await capture(browser, server.url, theme, resetLearning);
-            if ((await service.getReview(seeded.reviewId)).agentReviews?.length) throw new Error("Screenshots must not start reviews.");
+        const { service, delivery } = seeded;
+        const extensionVersion = parseExtensionVersion(JSON.parse(await readFile(EXTENSION_VERSION_PATH, "utf8")) as unknown);
+        let reviewId = seeded.reviewId;
+        const settings = new SettingsService({ store: seeded.store });
+        const reviewSkills = new ReviewSkills({ store: seeded.store });
+        const agentReview = new AgentReview({ service, settings, reviewSkills, sessionId: () => undefined, send: async () => {
+            throw new Error("The screenshot fixture cannot dispatch agent reviews.");
+        } });
+        // Every theme starts like a first run: the repository has no learning setting yet.
+        const resetLearning = () => rm(seeded.store.settingsFile(), { force: true });
+        server = await startReviewServer({
+            instanceId: "screenshots",
+            getReviewId: () => reviewId,
+            onReviewChange: (id: string) => {
+                reviewId = id;
+            },
+            service,
+            delivery,
+            extensionVersion,
+            settings,
+            agentReview,
+            reviewSkills,
+            webRoot: WEB_ROOT,
+        });
+        await mkdir(OUT, { recursive: true });
+        browser = await launchBrowser();
+        if (CHECK_REFRESH) {
+            await checkRefreshLayout(browser, server.url);
+            console.log("Refresh layout stable during progress, error, and retry.");
+        } else {
+            for (const theme of THEMES) {
+                console.log(`${theme}:`);
+                await capture(browser, server.url, theme, resetLearning);
+                if ((await service.getReview(seeded.reviewId)).agentReviews?.length) throw new Error("Screenshots must not start reviews.");
+            }
         }
-    }
-    if (KEEP) {
-        console.log(`\nDemo review: ${server.url}\nRepo: ${path.join(tmp, "orders-api")}\nPress Ctrl+C to stop.`);
-        await new Promise(() => {});
+        if (KEEP) {
+            console.log(`\nDemo review: ${server.url}\nRepo: ${path.join(tmp, "orders-api")}\nPress Ctrl+C to stop.`);
+            await new Promise(() => {});
+        }
     }
 } finally {
     await browser?.close();

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -19,6 +19,7 @@ test("a busy canvas delivers a second independent reply while the first worker i
         await runGit(home, ["init", "-q", "-b", "main", repo]);
         await runGit(repo, ["-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-qm", "base"]);
         await writeFile(path.join(repo, "notes.txt"), "one\ntwo\n");
+        await writeFile(path.join(repo, "Rules.cs"), "class Rules {}\n");
         await loadExtension();
         const [canvas] = host.canvases;
         const page = new URL((await canvas.open({ instanceId, input: { repoPath: repo, scope: "pending" }, session: { workingDirectory: repo } })).url);
@@ -38,11 +39,11 @@ test("a busy canvas delivers a second independent reply while the first worker i
                 assert.ok(action, `provider registered ${name}`);
                 return await action.handler({ instanceId, input }) as T;
             }
-            async function startComment(body: string) {
+            async function startComment(body: string, file?: string) {
                 // Subscribe before the HTTP request: delivery can beat the POST response.
                 const [[options], comment] = await Promise.all([
                     once(host.events, "send", { signal: AbortSignal.any([t.signal, AbortSignal.timeout(15_000)]) }),
-                    api<{ threadId: string; messageId: string }>("threads", { kind: "overview", body }),
+                    api<{ threadId: string; messageId: string }>("threads", file ? { kind: "file", path: file, body } : { kind: "overview", body }),
                 ]);
                 const { mode, prompt }: SendOptions = options;
                 assert.equal(mode, "immediate", "a busy host must not queue this behind the current turn");
@@ -80,6 +81,30 @@ test("a busy canvas delivers a second independent reply while the first worker i
             checkThread(end.review, first, "The first line is one.");
             checkThread(end.review, second, "The second line is two.");
             assert.deepEqual(await invoke("take_comment_workers", { runId: first.runId }), { done: true, jobs: [] });
+
+            const action = canvas.actions.find(item => item.name === "finish_comment_worker");
+            assert.ok(action);
+            const schema = action.inputSchema as {
+                properties: { lessons: { items: { additionalProperties: boolean; properties: { destination?: unknown } } } };
+            };
+            assert.equal(schema.properties.lessons.items.additionalProperties, false);
+            assert.deepEqual(schema.properties.lessons.items.properties.destination,
+                (canvas.actions.find(item => item.name === "reply")?.inputSchema as typeof schema).properties.lessons.items.properties.destination);
+            assert.ok(schema.properties.lessons.items.properties.destination);
+            await api("settings", {
+                autoSaveLearnedRules: true,
+                instructionMappings: [{ pathPrefix: "", instructionRoot: "", splitLanguageSpecific: true }],
+            });
+            const third = await startComment("/learn Keep repository-wide instructions concise.", "Rules.cs");
+            await invoke("finish_comment_worker", {
+                runId: third.runId, jobId: third.jobId, outcome: "answered", body: "Recorded.",
+                lessons: [{ scope: "repo", rule: "Keep repository-wide instructions concise.", destination: { kind: "general" } }],
+            });
+            const lesson = (await state()).review.lessons.find(item => item.rule === "Keep repository-wide instructions concise.");
+            assert.deepEqual([lesson?.status, lesson?.destination, lesson?.savedTo],
+                ["saved", { kind: "general" }, ".github/copilot-instructions.md"]);
+            assert.match(await readFile(path.join(repo, ".github", "copilot-instructions.md"), "utf8"),
+                /Keep repository-wide instructions concise\./);
         } finally {
             await canvas.onClose({ instanceId });
         }

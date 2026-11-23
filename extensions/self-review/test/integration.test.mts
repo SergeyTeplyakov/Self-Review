@@ -5,7 +5,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { Delivery, ReviewService, Store, runGit, startReviewServer } from "./modules.mjs";
+import { Delivery, ReviewService, SettingsService, Store, runGit, startReviewServer } from "./modules.mjs";
 import type { FileContent, ReviewMessage, ReviewService as ReviewServiceType, ReviewThread } from "../src/lib/review-service.mjs";
 import type { SendOptions } from "../src/lib/delivery.mjs";
 import type { Store as StoreType } from "../src/lib/store.mjs";
@@ -17,6 +17,7 @@ const git = (cwd: string, ...args: string[]) => runGit(cwd, ["-c", "user.name=t"
 let tmp: string;
 let repo: string;
 let store: StoreType;
+let settings: InstanceType<typeof SettingsService>;
 let service: ReviewServiceType;
 let delivery: InstanceType<typeof Delivery>;
 let sent: SendOptions[];
@@ -68,7 +69,8 @@ before(async () => {
     await writeFile(path.join(repo, "agency.toml"), "excluded = true\n");
 
     store = new Store(path.join(tmp, "data"));
-    service = new ReviewService({ store });
+    settings = new SettingsService({ store });
+    service = new ReviewService({ store, settings });
     sent = [];
     delivery = new Delivery({
         service,
@@ -630,6 +632,7 @@ test("saving a refined batched /learn proposal requires the displayed wording an
     const file = path.join(repo, savedTo);
     await mkdir(path.dirname(file), { recursive: true });
     await writeFile(file, "# Existing instructions\n");
+    await settings.update(repo, { instructionMappings: [{ pathPrefix: "", instructionRoot: "", splitLanguageSpecific: true }] });
     const server = await startReviewServer({ instanceId: "save-rule", getReviewId: () => reviewId, service, delivery, webRoot: WEB_ROOT });
     try {
         const url = new URL(server.url);
@@ -701,6 +704,7 @@ test("a late batch reply can cite an individually retried /learn comment", async
 });
 
 test("a concurrent save cannot journal before the refinement it saves", async (t) => {
+    await settings.update(repo, { instructionMappings: [{ pathPrefix: "", instructionRoot: "", splitLanguageSpecific: true }] });
     const { thread, message } = await service.createThread(reviewId, { kind: "overview", body: "/learn Use explicit options." });
     const reply = await service.addMessage(reviewId, thread.threadId, {
         author: "agent", inReplyTo: message.messageId, body: "Use explicit options.", lessons: [{ rule: "Use explicit options." }],
@@ -736,6 +740,7 @@ test("a concurrent save cannot journal before the refinement it saves", async (t
 });
 
 test("retrying a saved guideline repairs its journal after an append failure", async (t) => {
+    await settings.update(repo, { instructionMappings: [{ pathPrefix: "", instructionRoot: "", splitLanguageSpecific: true }] });
     const { thread, message } = await service.createThread(reviewId, { kind: "overview", body: "/learn Prefer explicit limits." });
     const rule = "Prefer explicit limits.";
     const reply = await service.addMessage(reviewId, thread.threadId, {
@@ -757,7 +762,7 @@ test("auto-save verifies a personal guideline in the isolated home, not the repo
     const home = await realpath(await mkdtemp(path.join(os.tmpdir(), "self-review-personal-")));
     t.after(() => rm(home, { force: true, recursive: true }));
     t.mock.method(os, "homedir", () => home);
-    const auto = new ReviewService({ store, autoSaveLearnedRules: async () => true });
+    const auto = new ReviewService({ store, settings, autoSaveLearnedRules: async () => true });
     const rule = "Name reusable test fixtures by their purpose.";
     const { thread, message } = await auto.createThread(reviewId, { kind: "overview", body: `/learn ${rule}` });
     const reply = await auto.addMessage(reviewId, thread.threadId, {
@@ -769,6 +774,30 @@ test("auto-save verifies a personal guideline in the isolated home, not the repo
     assert.equal(lesson.savedTo, file);
     assert.equal(await readFile(file, "utf8"), `- ${rule}\n`);
     await assert.rejects(readFile(path.join(repo, ".github", "copilot-instructions.md")), { code: "ENOENT" });
+});
+
+test("auto-save holds repository rules until a destination mapping is confirmed", async (t) => {
+    await settings.update(repo, { instructionMappings: [] });
+    const auto = new ReviewService({ store, settings, autoSaveLearnedRules: async () => true });
+    const rule = "Keep repository names stable.";
+    const { thread, message } = await auto.createThread(reviewId, { kind: "overview", body: `/learn ${rule}` });
+    const reply = await auto.addMessage(reviewId, thread.threadId, {
+        author: "agent", inReplyTo: message.messageId, body: rule,
+        lessons: [{ rule, scope: "repo", destination: { kind: "general" } }],
+    });
+    const lesson = required((await auto.getReview(reviewId)).lessons.find((item) => item.lessonId === reply.message.lessonIds?.[0]));
+    assert.equal(lesson.status, "proposed");
+    assert.equal(lesson.savedTo, null);
+    assert.match(lesson.saveError ?? "", /Choose an instruction destination/);
+    await assert.rejects(readFile(path.join(repo, ".github", "copilot-instructions.md")), { code: "ENOENT" });
+
+    await auto.saveLesson(reviewId, lesson.lessonId, {
+        rule, scope: "repo", mapping: { pathPrefix: "", instructionRoot: "", splitLanguageSpecific: true },
+        destination: { kind: "general" },
+    });
+    const saved = required((await auto.getReview(reviewId)).lessons.find((item) => item.lessonId === lesson.lessonId));
+    assert.equal(saved.status, "saved");
+    assert.equal(saved.savedTo, ".github/copilot-instructions.md");
 });
 
 test("a failed auto-save settings lookup preserves the reply and its proposal", async () => {
@@ -793,7 +822,8 @@ test("a failed auto-save settings lookup preserves the reply and its proposal", 
 });
 
 test("auto-save writes and verifies both explicit and unsolicited guidelines and leaves failed saves proposed", async () => {
-    const auto = new ReviewService({ store, autoSaveLearnedRules: async () => true });
+    await settings.update(repo, { instructionMappings: [{ pathPrefix: "", instructionRoot: "", splitLanguageSpecific: true }] });
+    const auto = new ReviewService({ store, settings, autoSaveLearnedRules: async () => true });
     const file = path.join(repo, ".github", "copilot-instructions.md");
     await mkdir(path.dirname(file), { recursive: true });
     try {
@@ -801,7 +831,7 @@ test("auto-save writes and verifies both explicit and unsolicited guidelines and
             const { thread, message } = await auto.createThread(reviewId, { kind: "overview", body });
             const rule = body.replace(/^\/learn /, "");
             const reply = await auto.addMessage(reviewId, thread.threadId, {
-                author: "agent", inReplyTo: message.messageId, body: rule, lessons: [{ rule }],
+                author: "agent", inReplyTo: message.messageId, body: rule, lessons: [{ rule, destination: { kind: "general" } }],
             });
             const lesson = required((await getReview()).lessons.find((item) => item.lessonId === reply.message.lessonIds?.[0]));
             assert.equal(lesson.status, "saved");
