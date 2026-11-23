@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { inferRuleDestination, previewRepositoryRuleDestination, saveRepositoryRule } from "./modules.mjs";
+import { inferRuleDestination, previewRepositoryRuleDestination, saveRepositoryRule, Store } from "./modules.mjs";
 import type { InstructionMapping } from "../types/contracts.js";
 
 const noLock = async <T,>(_key: string, action: () => Promise<T>): Promise<T> => action();
@@ -130,6 +130,67 @@ test("split-off routing uses a matching scoped file or the mapped root's general
     const routed = await saveRepositoryRule(repo, mapping, "src/Area/Rules.cs", language, "Use typed guards.", false, noLock);
     assert.equal(routed.savedTo, "src/Area/.github/instructions/csharp-documentation.instructions.md");
     assert.equal((await readFile(general, "utf8")).includes("Use typed guards."), false);
+});
+
+test("split-off overview rules use an existing scoped file only if it covers the full applyTo", async (t) => {
+    const repo = await fixture(t);
+    const mapping: InstructionMapping = { pathPrefix: "", instructionRoot: "", splitLanguageSpecific: false };
+    const file = path.join(repo, ".github", "instructions", "csharp-style.instructions.md");
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, `---\napplyTo: "**/*.cs"\n---\n`);
+    const result = await saveRepositoryRule(repo, mapping, "", language, "Use explicit guards.", false, noLock);
+    assert.equal(result.savedTo, ".github/instructions/csharp-style.instructions.md");
+    assert.match(await readFile(file, "utf8"), /- Use explicit guards\./);
+    assert.equal((await previewRepositoryRuleDestination(repo, mapping, "",
+        { kind: "language", language: "typescript", applyTo: "**/*.ts" })).savedTo, ".github/copilot-instructions.md");
+});
+
+test("instruction roots may begin with two dots without traversing", async (t) => {
+    const repo = await fixture(t);
+    const mapping: InstructionMapping = { pathPrefix: "", instructionRoot: "..notes", splitLanguageSpecific: false };
+    const saved = await saveRepositoryRule(repo, mapping, "", { kind: "general" }, "Keep notes concise.", false, noLock);
+    assert.equal(saved.savedTo, "..notes/.github/copilot-instructions.md");
+    assert.match(await readFile(path.join(repo, "..notes", ".github", "copilot-instructions.md"), "utf8"), /Keep notes concise/);
+    await assert.rejects(saveRepositoryRule(repo, { ...mapping, instructionRoot: "../outside" }, "",
+        { kind: "general" }, "Never escape.", false, noLock), /inside the repository/);
+});
+
+test("case-alias destinations share a file lock across stores", { skip: process.platform !== "win32" }, async (t) => {
+    const repo = await fixture(t);
+    await mkdir(path.join(repo, "Area"), { recursive: true });
+    const stores = [new Store(path.join(repo, "store")), new Store(path.join(repo, "store"))];
+    let firstEntered!: () => void;
+    let releaseFirst!: () => void;
+    let secondObserved!: () => void;
+    const entered = new Promise<void>(resolve => { firstEntered = resolve; });
+    const released = new Promise<void>(resolve => { releaseFirst = resolve; });
+    const observed = new Promise<void>(resolve => { secondObserved = resolve; });
+    const keys: string[] = [];
+    const firstLock = <T,>(key: string, action: () => Promise<T>) => {
+        keys[0] = key;
+        return stores[0].lock(key, async () => { firstEntered(); await released; return action(); });
+    };
+    const secondLock = <T,>(key: string, action: () => Promise<T>) => {
+        keys[1] = key;
+        secondObserved();
+        return stores[1].lock(key, action);
+    };
+    const rule = "Use explicit guards.";
+    const first = stores[0].lock("review:first", () =>
+        saveRepositoryRule(repo, { pathPrefix: "", instructionRoot: "Area", splitLanguageSpecific: false },
+            "", { kind: "general" }, rule, false, firstLock));
+    await entered;
+    const second = stores[1].lock("review:second", () =>
+        saveRepositoryRule(repo, { pathPrefix: "", instructionRoot: "area", splitLanguageSpecific: false },
+            "", { kind: "general" }, rule, false, secondLock));
+    try {
+        await observed;
+        assert.equal(keys[0], keys[1], "the same physical destination must use one cross-process lock");
+    } finally {
+        releaseFirst();
+        await Promise.all([first, second]);
+    }
+    assert.equal((await readFile(path.join(repo, "Area", ".github", "copilot-instructions.md"), "utf8")).match(/Use explicit guards\./g)?.length, 1);
 });
 
 test("split-off routing matches comma-separated applyTo patterns with trailing YAML comments", async (t) => {

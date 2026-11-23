@@ -226,6 +226,19 @@ function requireString(input, name) {
     return input[name];
 }
 const reviewIdProp = { type: "string", description: "Review id. Defaults to the review shown in this canvas instance." };
+const lessonDestination = {
+    type: "object",
+    description: "Suggested repository instruction destination; the reviewer confirms or edits it before saving.",
+    properties: {
+        kind: { type: "string", enum: ["general", "language"] },
+        pathPrefix: { type: "string" },
+        instructionRoot: { type: "string" },
+        language: { type: "string" },
+        applyTo: { type: "string" },
+    },
+    required: ["kind"],
+    additionalProperties: false,
+};
 const actions = [
     ...settingsActions({
         settings,
@@ -445,6 +458,7 @@ const actions = [
                         type: "object", properties: {
                             lessonId: { type: "string" }, scope: { type: "string", enum: ["repo", "personal"] },
                             rule: { type: "string" }, status: { type: "string", enum: LESSON_STATUSES },
+                            destination: lessonDestination,
                         }, additionalProperties: false,
                     },
                 },
@@ -483,19 +497,7 @@ const actions = [
                             scope: { type: "string", enum: ["repo", "personal"] },
                             rule: { type: "string", description: "The guideline text. Required unless lessonId is given." },
                             status: { type: "string", enum: LESSON_STATUSES, description: "proposed (default), or declined if the reviewer rejects a proposal." },
-                            destination: {
-                                type: "object",
-                                description: "Suggested repository instruction destination; the reviewer confirms or edits it before saving.",
-                                properties: {
-                                    kind: { type: "string", enum: ["general", "language"] },
-                                    pathPrefix: { type: "string" },
-                                    instructionRoot: { type: "string" },
-                                    language: { type: "string" },
-                                    applyTo: { type: "string" },
-                                },
-                                required: ["kind"],
-                                additionalProperties: false,
-                            },
+                            destination: lessonDestination,
                         },
                         additionalProperties: false,
                     },

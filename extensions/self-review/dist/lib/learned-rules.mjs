@@ -1,6 +1,7 @@
 import { appendFile, lstat, mkdir, readFile, realpath, readdir } from "node:fs/promises";
 import path from "node:path";
 import { ReviewError } from "../web/contracts.mjs";
+import { pathKey } from "./settings.mjs";
 const LANGUAGE_BY_EXTENSION = {
     cs: "csharp", js: "javascript", jsx: "javascript", mjs: "javascript", cjs: "javascript",
     ts: "typescript", tsx: "typescript", mts: "typescript", cts: "typescript", py: "python", ps1: "powershell", go: "go",
@@ -151,7 +152,8 @@ async function ensureSafeDirectory(repoRoot, relative, create = true) {
             }
         }
         const real = await realpath(current);
-        if (path.relative(root, real).startsWith("..")) {
+        const relative = path.relative(root, real);
+        if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
             throw new ReviewError("invalid_input", "The instruction destination must stay inside the repository.");
         }
     }
@@ -185,7 +187,7 @@ async function matchingScopedFile(directory, filePath, applyTo) {
         const file = path.join(directory, entry.name);
         const contents = await readInstructionFile(file);
         const pattern = contents === null ? null : applyToFrom(contents);
-        if (contents !== null && pattern && appliesTo(pattern, filePath) && coversApplyTo(pattern, applyTo))
+        if (contents !== null && scopedFileApplies(pattern, filePath, applyTo))
             return { file, contents };
     }
     return null;
@@ -264,7 +266,8 @@ export async function saveRepositoryRule(repoRoot, mapping, reviewedPath, destin
         throw new ReviewError("conflict", `The instruction destination changed to ${resolved.savedTo}. Review and confirm the updated destination.`);
     }
     const file = resolved.file;
-    await lock(`guideline-file:${file}`, async () => {
+    const lockFile = path.join(await realpath(repoRoot), ...safeRelativePath(resolved.savedTo));
+    await lock(`guideline-file:${pathKey(lockFile)}`, async () => {
         await ensureSafeDirectory(repoRoot, path.posix.dirname(resolved.savedTo));
         const current = await readInstructionFile(file);
         if (resolved.validateScopedFile) {
