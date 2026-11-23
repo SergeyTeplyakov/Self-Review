@@ -2,7 +2,7 @@ import { test } from "node:test";
 import type { TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { readdirSync } from "node:fs";
-import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,7 +19,7 @@ async function until(predicate: () => boolean | Promise<boolean>): Promise<void>
 }
 
 async function fixture(t: TestContext) {
-    const tmp = await mkdtemp(path.join(os.tmpdir(), "sr-watch-"));
+    const tmp = await realpath(await mkdtemp(path.join(os.tmpdir(), "sr-watch-")));
     const repo = path.join(tmp, "repo");
     const git = (...args: string[]) => runGit(repo, ["-c", "user.name=test", "-c", "user.email=test@example.com", "-c", "core.autocrlf=false", ...args]);
     await runGit(tmp, ["init", "-q", "-b", "main", repo]);

@@ -1,14 +1,15 @@
 // Read-only git access for capturing review snapshots. Never mutates the repository:
 // GIT_OPTIONAL_LOCKS=0 keeps diff/status from rewriting the index.
-import { runGit } from "./git-process.mjs";
+import { readGitBlobPrefixes, runGit } from "./git-process.mjs";
 export { runGit } from "./git-process.mjs";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, open, readlink, realpath } from "node:fs/promises";
 import path from "node:path";
-import { parseUnifiedDiff, synthesizeAddedFile } from "./diff.mjs";
+import { mergeTypeChanges, parseDiffPatches, synthesizeAddedFile } from "./diff.mjs";
 import type { DiffFile } from "./diff.mjs";
 import type { ReviewScope } from "../../types/contracts.js";
+import { IMAGE_SIGNATURE_BYTES, imagePath, imageType, MAX_IMAGE_BYTES } from "./image-format.mjs";
 
 export interface CaptureOptions {
     repoRoot: string;
@@ -33,6 +34,7 @@ export interface Snapshot {
 }
 
 type RepoFile = { tooLarge?: false; buffer: Buffer; contentHash?: string } | { tooLarge: true; contentHash: string };
+type ImageSides = NonNullable<DiffFile["imageSides"]>;
 const errorCode = (error: unknown) => error && typeof error === "object" && "code" in error ? error.code : undefined;
 
 const MAX_UNTRACKED_BYTES = 2 * 1024 * 1024;
@@ -82,15 +84,17 @@ async function readUntracked(repoRoot: string, relPath: string): Promise<DiffFil
         return { path: relPath, oldPath: null, status: "added", binary: true, untracked: true, additions: 0, deletions: 0, hunks: [], contentHash: result.contentHash, note: "File too large to display" };
     }
     const { buffer } = result;
-    if (isBinary(buffer)) {
-        return { path: relPath, oldPath: null, status: "added", binary: true, untracked: true, additions: 0, deletions: 0, hunks: [], contentHash: result.contentHash };
+    const image = imagePath(relPath) && imageType(buffer);
+    if (image || isBinary(buffer)) {
+        return { path: relPath, oldPath: null, status: "added", binary: true, untracked: true, additions: 0, deletions: 0, hunks: [], contentHash: result.contentHash,
+            ...(image && { imageSides: { new: result.contentHash } }) };
     }
     return { ...synthesizeAddedFile(relPath, buffer.toString("utf8")), contentHash: result.contentHash };
 }
 
 // Read symlinks as Git does (their target text), never as the target's contents.
 // Resolve and check the parent too, so junctions/directory symlinks cannot escape.
-async function readRepoFile(repoRoot: string, relPath: string, maxBytes = Infinity): Promise<RepoFile | null> {
+async function readRepoFile(repoRoot: string, relPath: string, maxBytes = Infinity, hashOversized = true): Promise<RepoFile | null> {
     const full = safeJoin(repoRoot, relPath);
     const root = await realpath(repoRoot);
     const parent = await realpath(path.dirname(full));
@@ -105,6 +109,7 @@ async function readRepoFile(repoRoot: string, relPath: string, maxBytes = Infini
     safeJoin(root, path.relative(root, resolved));
     const handle = await open(resolved, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
     try {
+        if (!hashOversized && (await handle.stat()).size > maxBytes) return null;
         if (!Number.isFinite(maxBytes)) return { buffer: await handle.readFile() };
         const hash = createHash("sha256");
         const chunks: Buffer[] = [];
@@ -113,6 +118,7 @@ async function readRepoFile(repoRoot: string, relPath: string, maxBytes = Infini
         for await (const chunk of handle.createReadStream({ autoClose: false })) {
             hash.update(chunk);
             size += chunk.length;
+            if (!hashOversized && size > maxBytes) return null;
             if (size <= maxBytes) chunks.push(chunk);
             else chunks.length = 0;
         }
@@ -122,6 +128,76 @@ async function readRepoFile(repoRoot: string, relPath: string, maxBytes = Infini
         await handle.close();
     }
 }
+
+// A symlink's blob holds its target path and a submodule's ID names a commit; only regular files hold their content.
+function regularFile(mode: string | undefined) {
+    return mode === undefined || mode.startsWith("100");
+}
+
+// Git reports image sides only for files it diffs as binary. Find the rest, keeping only sides whose exact bytes have
+// an image signature, so text with an image name, such as a Git LFS pointer, keeps its text diff:
+// - Git diffs a file as text when its first 8000 bytes contain no NUL, which some valid JPEGs satisfy.
+// - Git omits the index line only when content is unchanged (a pure rename or mode change), so both sides are the base blob.
+// Pass patches before mergeTypeChanges, so that a symlink replaced by an image checks the image alone.
+async function addImageSides(repoRoot: string, baseCommit: string, patches: DiffFile[], textImageIds: Map<DiffFile, [string, string]>) {
+    const candidates: { file: DiffFile; sides: ImageSides }[] = [];
+    const unchanged: DiffFile[] = [];
+    for (const file of patches) {
+        if (file.imageSides || file.binary || !(imagePath(file.path) || imagePath(file.oldPath))) continue;
+        const ids = textImageIds.get(file);
+        if (ids) {
+            const sides: ImageSides = {};
+            if (file.status !== "added" && regularFile(file.oldMode)) sides.old = ids[0];
+            if (file.status !== "deleted" && regularFile(file.newMode)) sides.new = ids[1];
+            candidates.push({ file, sides });
+        } else if (!file.hunks.length && (file.status === "modified" || file.status === "renamed")
+            && regularFile(file.oldMode) && regularFile(file.newMode)) {
+            unchanged.push(file);
+        }
+    }
+    if (unchanged.length) {
+        // cat-file reads one object name per line, so resolve a path containing a line break on its own.
+        const names = await Promise.all(unchanged.map(async (file) => {
+            const name = `${baseCommit}:${file.oldPath ?? file.path}`;
+            if (!/[\r\n]/.test(name)) return name;
+            const resolved = await runGit(repoRoot, ["rev-parse", "--verify", "--quiet", name], { allowFail: true, env: { GIT_NO_LAZY_FETCH: "1" } });
+            return resolved.ok ? resolved.stdout.trim() : null;
+        }));
+        const lookups = unchanged.flatMap((file, i) => names[i] ? [{ file, name: names[i] }] : []);
+        const lookup = await runGit(repoRoot, ["cat-file", "--batch-check=%(objectname) %(objecttype)"], {
+            allowFail: true, env: { GIT_NO_LAZY_FETCH: "1" },
+            input: lookups.map(({ name }) => `${name}\n`).join(""),
+        });
+        const lines = lookup.ok ? lookup.stdout.split("\n") : [];
+        lookups.forEach(({ file }, i) => {
+            const blob = /^([0-9a-f]{40}|[0-9a-f]{64}) blob$/.exec(lines[i] ?? "");
+            if (blob) candidates.push({ file, sides: { old: blob[1], new: blob[1] } });
+        });
+    }
+    if (!candidates.length) return;
+    // One stream for every candidate, since where images live in Git LFS every changed image is a text candidate.
+    // Only signatures are kept, so memory does not grow with the candidates' total size.
+    const signatures = await readGitBlobPrefixes(repoRoot, candidates.flatMap(({ sides }) => [sides.old, sides.new].filter((oid) => oid !== undefined)),
+        MAX_IMAGE_BYTES, IMAGE_SIGNATURE_BYTES);
+    for (const { file, sides } of candidates) {
+        const images: ImageSides = {};
+        for (const side of ["old", "new"] as const) {
+            const oid = sides[side];
+            // Git's diff names an unstaged file's blob without storing it; use the file only if its bytes still match.
+            const bytes = oid && (signatures.get(oid) ?? (side === "new" ? await readMatchingWorkingImage(repoRoot, file, oid) : null));
+            if (bytes && imageType(bytes)) images[side] = oid;
+        }
+        if (!images.old && !images.new) continue;
+        file.imageSides = images;
+        // As Git does, show the whole change as binary when either side is.
+        if (textImageIds.has(file)) Object.assign(file, { binary: true, hunks: [], additions: 0, deletions: 0 });
+    }
+}
+
+// Refresh stores a new revision only when the fingerprint changes. Bump this when capture records data that Git's diff
+// output does not show, so the next refresh of an existing review stores that data rather than keeping the revision
+// captured without it. Version 2 added image sides, which a pure rename or mode change gains with an unchanged diff.
+const CAPTURE_VERSION = 2;
 
 // scope "all" diffs the working tree against the merge-base with `base` (the whole branch or PR);
 // scope "pending" diffs it against HEAD, so committed work is left out.
@@ -140,10 +216,13 @@ export async function captureSnapshot({ repoRoot, base, paths, exclude, includeU
     // Explicit prefixes keep the a/ and b/ headers the parser expects, whatever diff.noprefix or diff.mnemonicPrefix say.
     // --no-textconv keeps hunks in the file's real content, which anchors and agent edits use.
     const diff = await runGit(repoRoot, [
-        "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--find-renames", "--src-prefix=a/", "--dst-prefix=b/", `-U${contextLines}`, baseCommit, "--", ...pathspec,
+        "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--full-index", "--find-renames", "--src-prefix=a/", "--dst-prefix=b/", `-U${contextLines}`, baseCommit, "--", ...pathspec,
     ]);
-    const files = parseUnifiedDiff(diff.stdout);
-    const hash = createHash("sha256").update(baseCommit).update("\0").update(diff.stdout);
+    const textImageIds = new Map<DiffFile, [string, string]>();
+    const patches = parseDiffPatches(diff.stdout, textImageIds);
+    await addImageSides(repoRoot, baseCommit, patches, textImageIds);
+    const files = mergeTypeChanges(patches);
+    const hash = createHash("sha256").update(`capture v${CAPTURE_VERSION}\0`).update(baseCommit).update("\0").update(diff.stdout);
 
     if (includeUntracked) {
         const list = await runGit(repoRoot, ["ls-files", "--others", "--exclude-standard", "-z", "--", ...pathspec]);
@@ -229,4 +308,18 @@ export async function readCommitFile(repoRoot: string, commit: string, relPath: 
     const r = await runGit(repoRoot, ["show", `${commit}:${relPath}`], { allowFail: true });
     if (!r.ok) return null;
     return r.stdout.split("\n").map((l) => (l.endsWith("\r") ? l.slice(0, -1) : l));
+}
+
+export async function readMatchingWorkingImage(repoRoot: string, file: DiffFile, expected: string) {
+    try {
+        const result = await readRepoFile(repoRoot, file.path, MAX_IMAGE_BYTES, false);
+        if (!result || result.tooLarge) return null;
+        const bytes = result.buffer;
+        const hash = file.untracked ? result.contentHash : createHash(expected.length === 64 ? "sha256" : "sha1")
+            .update(`blob ${bytes.length}\0`).update(bytes).digest("hex");
+        return hash === expected ? bytes : null;
+    } catch (err) {
+        if (errorCode(err) === "ENOENT" || errorCode(err) === "ENOTDIR") return null;
+        throw err;
+    }
 }
