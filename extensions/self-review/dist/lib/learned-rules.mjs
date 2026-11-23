@@ -17,23 +17,96 @@ export function inferRuleDestination(filePath) {
 function isMissing(error) {
     return error !== null && typeof error === "object" && "code" in error && error.code === "ENOENT";
 }
+function closingBracket(pattern, start) {
+    const negated = pattern[start + 1] === "!" || pattern[start + 1] === "^";
+    const firstMember = start + (negated ? 2 : 1);
+    return pattern.indexOf("]", firstMember + (pattern[firstMember] === "]" ? 1 : 0));
+}
 function globRegex(glob) {
-    const escaped = glob.replace(/[.+^${}()|[\]\\]/g, "\\$&")
-        .replace(/\*\*/g, "\u0000")
-        .replace(/\*/g, "[^/]*")
-        .replace(/\?/g, "[^/]")
-        .replace(/\u0000\//g, "(?:.*/)?")
-        .replace(/\u0000/g, ".*");
-    return new RegExp(`^${escaped}$`, "i");
+    let regex = "";
+    for (let i = 0; i < glob.length; i++) {
+        const char = glob[i];
+        if (char === "*") {
+            if (glob[i + 1] === "*") {
+                i++;
+                if (glob[i + 1] === "/") {
+                    regex += "(?:.*/)?";
+                    i++;
+                }
+                else
+                    regex += ".*";
+            }
+            else
+                regex += "[^/]*";
+        }
+        else if (char === "?") {
+            regex += "[^/]";
+        }
+        else if (char === "[") {
+            const negated = glob[i + 1] === "!" || glob[i + 1] === "^";
+            const end = closingBracket(glob, i);
+            const contents = end < 0 ? "" : glob.slice(i + 1, end);
+            if (contents && contents !== "!" && contents !== "^" && !contents.includes("/")) {
+                const members = (negated ? contents.slice(1) : contents).replace(/[\\[\]^]/g, "\\$&");
+                const characterClass = `[${negated ? "^" : ""}${members}]`;
+                try {
+                    new RegExp(characterClass);
+                    regex += `(?!/)${characterClass}`;
+                    i = end;
+                    continue;
+                }
+                catch (error) {
+                    if (!(error instanceof SyntaxError))
+                        throw error;
+                }
+            }
+            regex += "\\[";
+        }
+        else {
+            regex += char.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+        }
+    }
+    return new RegExp(`^${regex}$`, "i");
 }
 const MAX_BRACE_EXPANSIONS = 64;
+function braceOutsideBrackets(pattern, brace, from = 0) {
+    for (let i = from; i < pattern.length; i++) {
+        if (pattern[i] === "[") {
+            const end = closingBracket(pattern, i);
+            if (end < 0)
+                return -1;
+            i = end;
+        }
+        else if (pattern[i] === brace)
+            return i;
+    }
+    return -1;
+}
+function braceChoices(value) {
+    const choices = [];
+    let start = 0;
+    for (let i = 0; i < value.length; i++) {
+        if (value[i] === "[") {
+            const end = closingBracket(value, i);
+            if (end < 0)
+                break;
+            i = end;
+        }
+        else if (value[i] === ",") {
+            choices.push(value.slice(start, i));
+            start = i + 1;
+        }
+    }
+    choices.push(value.slice(start));
+    return choices;
+}
 // Expands non-nested {a,b} groups into brace-free alternatives; an expansion that grows too large stays literal and matches nothing.
 function expandBraces(pattern) {
-    const open = pattern.indexOf("{");
-    const close = open < 0 ? -1 : pattern.indexOf("}", open + 1);
+    const open = braceOutsideBrackets(pattern, "{");
+    const close = open < 0 ? -1 : braceOutsideBrackets(pattern, "}", open + 1);
     if (close < 0)
         return [pattern];
-    const choices = pattern.slice(open + 1, close).split(",");
+    const choices = braceChoices(pattern.slice(open + 1, close));
     const rests = expandBraces(pattern.slice(close + 1));
     if (choices.length * rests.length > MAX_BRACE_EXPANSIONS)
         return [pattern];
@@ -44,9 +117,19 @@ function applyToPatterns(value) {
     const patterns = [];
     let current = "";
     let inBraces = false;
-    let inBrackets = false;
-    for (const char of value) {
-        if (char === "," && !inBraces && !inBrackets) {
+    for (let i = 0; i < value.length; i++) {
+        const char = value[i];
+        if (char === "[") {
+            const end = closingBracket(value, i);
+            if (end < 0) {
+                current += value.slice(i);
+                break;
+            }
+            current += value.slice(i, end + 1);
+            i = end;
+            continue;
+        }
+        if (char === "," && !inBraces) {
             patterns.push(current);
             current = "";
             continue;
@@ -55,10 +138,6 @@ function applyToPatterns(value) {
             inBraces = true;
         else if (char === "}")
             inBraces = false;
-        else if (char === "[")
-            inBrackets = true;
-        else if (char === "]")
-            inBrackets = false;
         current += char;
     }
     patterns.push(current);

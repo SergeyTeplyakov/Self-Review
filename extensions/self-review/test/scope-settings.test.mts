@@ -1,7 +1,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { access, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -874,6 +874,50 @@ test("repoIdentity follows the origin remote across clones and worktrees, and fa
     await runGit(tmp, ["init", "-q", "-b", "main", clone]);
     await git(clone, "remote", "add", "origin", "https://user@github.com/owner/my-repo.git");
     assert.equal((await repoIdentity(clone)).key, "remote:github.com/owner/my-repo", "a clone over another protocol is the same repository");
+});
+
+test("local repository settings survive a junction alias and preserve existing entries", async () => {
+    const actual = path.join(tmp, "identity-real");
+    const alias = path.join(tmp, "identity-alias");
+    const other = path.join(tmp, "identity-other");
+    await runGit(tmp, ["init", "-q", "-b", "main", actual]);
+    await runGit(tmp, ["init", "-q", "-b", "main", other]);
+    await symlink(actual, alias, process.platform === "win32" ? "junction" : "dir");
+    const { store } = fresh();
+    const legacyKey = `local:${pathKey(path.join(alias, ".git"))}`;
+    const mapping = { pathPrefix: "src", instructionRoot: "src", splitLanguageSpecific: true };
+    await store.updateSettings((document) => {
+        document.repos[legacyKey] = { autoSaveLearnedRules: true, instructionMappings: [mapping] };
+    });
+
+    const reopened = new SettingsService({ store: new Store(store.root) });
+    assert.deepEqual((await reopened.get(actual)).instructionMappings, [mapping]);
+    assert.equal((await reopened.get(actual)).autoSaveLearnedRules, true);
+    assert.deepEqual((await reopened.get(other)).instructionMappings, []);
+    const canonicalKey = `local:${pathKey(path.join(await realpath(actual), ".git"))}`;
+    await reopened.update(actual, { delivery: "batch" });
+    assert.equal((await reopened.get(alias)).delivery, "batch");
+    await reopened.updateInstructionMappings(alias, (mappings) => [...mappings, { pathPrefix: "docs", instructionRoot: "", splitLanguageSpecific: false }]);
+    assert.equal((await reopened.get(actual)).instructionMappings.length, 2);
+    assert.deepEqual(Object.keys((await store.readSettings()).repos), [canonicalKey]);
+    await rm(alias);
+    assert.equal((await reopened.get(actual)).instructionMappings.length, 2);
+    assert.equal((await reopened.get(actual)).autoSaveLearnedRules, true);
+    await symlink(actual, alias, process.platform === "win32" ? "junction" : "dir");
+
+    const invalidKey = "local:\0unresolvable";
+    await store.updateSettings((document) => { document.repos[invalidKey] = { delivery: "immediate" }; });
+    const warnings: string[] = [];
+    const withLog = new SettingsService({ store, log: (message) => warnings.push(message) });
+    assert.equal((await withLog.get(actual)).delivery, "batch");
+    await withLog.update(actual, { delivery: "ask" });
+    assert.ok(warnings.some((message) => message.includes("Could not resolve a stored repository settings path")));
+    assert.equal((await store.readSettings()).repos[invalidKey].delivery, "immediate");
+
+    await store.updateSettings((document) => { document.repos[legacyKey] = { delivery: "immediate" }; });
+    await assert.rejects(reopened.get(actual), /Multiple settings entries/);
+    await assert.rejects(reopened.update(alias, { delivery: "ask" }), /Multiple settings entries/);
+    assert.equal((await store.readSettings()).repos[legacyKey].delivery, "immediate");
 });
 
 test("local-only separate-Git-directory worktrees honor core.worktree and otherwise keep the checkout fallback", async () => {

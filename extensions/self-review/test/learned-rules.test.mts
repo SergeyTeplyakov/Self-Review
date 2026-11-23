@@ -299,6 +299,31 @@ test("brace groups in applyTo expand to alternatives instead of splitting at the
     );
 });
 
+test("scoped routing matches character classes, ranges, and negation in applyTo", async (t) => {
+    const repo = await fixture(t);
+    const mapping: InstructionMapping = { pathPrefix: "", instructionRoot: "", splitLanguageSpecific: false };
+    const directory = path.join(repo, ".github", "instructions");
+    const file = path.join(directory, "scoped.instructions.md");
+    await mkdir(directory, { recursive: true });
+    for (const [pattern, matching, excluded] of [
+        ["src/[ab]/*.ts", "src/a/View.ts", "src/c/View.ts"],
+        ["src/[a-c]/*.ts", "src/b/View.ts", "src/d/View.ts"],
+        ["src/[!ab]/*.ts", "src/c/View.ts", "src/a/View.ts"],
+        ["src/[^ab]/*.ts", "src/c/View.ts", "src/a/View.ts"],
+        ["src/[]a]/*.ts", "src/]/View.ts", "src/b/View.ts"],
+        ["src/[]a,]/*.ts", "src/,/View.ts", "src/b/View.ts"],
+        ["src/[,a]/*.ts", "src/,/View.ts", "src/b/View.ts"],
+        ["src/[{a,b}]/*.ts", "src/{/View.ts", "src/c/View.ts"],
+        ["src/{[a,b],c}/*.ts", "src/,/View.ts", "src/d/View.ts"],
+    ]) {
+        await writeFile(file, `---\napplyTo: "${pattern}"\n---\n`);
+        const destination = { kind: "language", language: "typescript", applyTo: pattern } as const;
+        assert.deepEqual(await previewRepositoryRuleDestination(repo, mapping, matching, destination),
+            { savedTo: ".github/instructions/scoped.instructions.md", needsConfirmation: false });
+        await assert.rejects(previewRepositoryRuleDestination(repo, mapping, excluded, destination), /does not cover/);
+    }
+});
+
 test("applyTo matching ignores case, so an uppercase extension keeps its inferred destination", async (t) => {
     const repo = await fixture(t);
     const mapping: InstructionMapping = { pathPrefix: "", instructionRoot: "", splitLanguageSpecific: false };

@@ -1,6 +1,7 @@
 // @ts-check
 // Per-repository user settings, kept in the extension's user-local data and never written into the repository.
 import path from "node:path";
+import { realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import * as gitDefault from "./git-process.mjs";
 import { agentReviewDefaults, settingsPatch, isCommentConcurrency, isDeliveryMode, isRecord, ReviewError } from "../web/contracts.mjs";
@@ -148,6 +149,29 @@ export async function repoIdentity(repoRoot, git = gitDefault) {
     const name = path.basename(nameRoot);
     return { key: `local:${pathKey(root)}`, name };
 }
+async function settingsKey(settings, key, log) {
+    if (!key.startsWith("local:"))
+        return { key, existingKey: key };
+    const target = pathKey(await realpath(key.slice("local:".length)));
+    const matches = [];
+    for (const candidate of Object.keys(settings.repos)) {
+        if (!candidate.startsWith("local:"))
+            continue;
+        try {
+            if (pathKey(await realpath(candidate.slice("local:".length))) === target)
+                matches.push(candidate);
+        }
+        catch (error) {
+            if (error instanceof Error && "code" in error && (error.code === "ENOENT" || error.code === "ENOTDIR"))
+                continue;
+            log(`Could not resolve a stored repository settings path: ${error instanceof Error ? error.message : String(error)}`, "warning");
+        }
+    }
+    if (matches.length > 1)
+        throw new ReviewError("conflict", "Multiple settings entries refer to the same repository; resolve them before changing settings.");
+    const canonical = `local:${target}`;
+    return { key: canonical, existingKey: matches[0] ?? canonical };
+}
 export class SettingsService {
     store;
     git;
@@ -184,12 +208,15 @@ export class SettingsService {
     async get(repoRoot) {
         const identity = await repoIdentity(repoRoot, this.git);
         let entry = null;
+        let settings = null;
         try {
-            entry = (await this.store.readSettings()).repos?.[identity.key] ?? null;
+            settings = await this.store.readSettings();
         }
         catch (err) {
             this.log(`settings unreadable: ${err instanceof Error ? err.message : String(err)}`);
         }
+        if (settings)
+            entry = settings.repos[(await settingsKey(settings, identity.key, this.log)).existingKey] ?? null;
         const autoSave = storedAutoSave(entry);
         const instructionMappings = storedInstructionMappings(entry);
         return {
@@ -207,8 +234,9 @@ export class SettingsService {
     async update(repoRoot, input = {}) {
         const patch = settingsPatch(input);
         const identity = await repoIdentity(repoRoot, this.git);
-        await this.store.updateSettings((settings) => {
-            const entry = { ...settings.repos[identity.key] };
+        await this.store.updateSettings(async (settings) => {
+            const { key, existingKey } = await settingsKey(settings, identity.key, this.log);
+            const entry = { ...settings.repos[existingKey] };
             const autoSave = patch.autoSaveLearnedRules ?? storedAutoSave(entry);
             if (autoSave !== undefined) {
                 entry.autoSaveLearnedRules = autoSave;
@@ -230,18 +258,23 @@ export class SettingsService {
                 }
                 entry.instructionMappings = patch.instructionMappings;
             }
-            settings.repos[identity.key] = { ...entry, name: identity.name, updatedAt: new Date().toISOString() };
+            settings.repos[key] = { ...entry, name: identity.name, updatedAt: new Date().toISOString() };
+            if (existingKey !== key)
+                delete settings.repos[existingKey];
         });
         return this.get(repoRoot);
     }
     async updateInstructionMappings(repoRoot, update) {
         const identity = await repoIdentity(repoRoot, this.git);
         await this.store.updateSettings(async (settings) => {
-            const entry = { ...settings.repos[identity.key] };
+            const { key, existingKey } = await settingsKey(settings, identity.key, this.log);
+            const entry = { ...settings.repos[existingKey] };
             const mappings = await update(storedInstructionMappings(entry));
             validateMappingPrefixes(mappings);
             entry.instructionMappings = settingsPatch({ instructionMappings: mappings }).instructionMappings;
-            settings.repos[identity.key] = { ...entry, name: identity.name, updatedAt: new Date().toISOString() };
+            settings.repos[key] = { ...entry, name: identity.name, updatedAt: new Date().toISOString() };
+            if (existingKey !== key)
+                delete settings.repos[existingKey];
         });
     }
     async withInstructionMappings(repoRoot, action) {
