@@ -1,6 +1,6 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile, readFile, cp, appendFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile, readFile, realpath, cp, appendFile } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -55,7 +55,7 @@ function errorHasCode(error: unknown, code: string): boolean {
 }
 
 before(async () => {
-    tmp = await mkdtemp(path.join(os.tmpdir(), "mr-int-"));
+    tmp = await realpath(await mkdtemp(path.join(os.tmpdir(), "mr-int-")));
     repo = path.join(tmp, "repo");
     await runGit(tmp, ["init", "-q", "-b", "main", repo]);
     await writeFile(path.join(repo, "a.cs"), lines(20));
@@ -754,7 +754,7 @@ test("retrying a saved guideline repairs its journal after an append failure", a
 });
 
 test("auto-save verifies a personal guideline in the isolated home, not the repository", async (t) => {
-    const home = await mkdtemp(path.join(os.tmpdir(), "self-review-personal-"));
+    const home = await realpath(await mkdtemp(path.join(os.tmpdir(), "self-review-personal-")));
     t.after(() => rm(home, { force: true, recursive: true }));
     t.mock.method(os, "homedir", () => home);
     const auto = new ReviewService({ store, autoSaveLearnedRules: async () => true });
