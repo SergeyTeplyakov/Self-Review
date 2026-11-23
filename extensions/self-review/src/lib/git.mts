@@ -151,17 +151,25 @@ async function addImageSides(repoRoot: string, baseCommit: string, patches: Diff
             if (file.status !== "deleted" && regularFile(file.newMode)) sides.new = ids[1];
             candidates.push({ file, sides });
         } else if (!file.hunks.length && (file.status === "modified" || file.status === "renamed")
-            && regularFile(file.oldMode) && regularFile(file.newMode) && !/[\r\n]/.test(file.oldPath ?? file.path)) {
+            && regularFile(file.oldMode) && regularFile(file.newMode)) {
             unchanged.push(file);
         }
     }
     if (unchanged.length) {
+        // cat-file reads one object name per line, so resolve a path containing a line break on its own.
+        const names = await Promise.all(unchanged.map(async (file) => {
+            const name = `${baseCommit}:${file.oldPath ?? file.path}`;
+            if (!/[\r\n]/.test(name)) return name;
+            const resolved = await runGit(repoRoot, ["rev-parse", "--verify", "--quiet", name], { allowFail: true, env: { GIT_NO_LAZY_FETCH: "1" } });
+            return resolved.ok ? resolved.stdout.trim() : null;
+        }));
+        const lookups = unchanged.flatMap((file, i) => names[i] ? [{ file, name: names[i] }] : []);
         const lookup = await runGit(repoRoot, ["cat-file", "--batch-check=%(objectname) %(objecttype)"], {
             allowFail: true, env: { GIT_NO_LAZY_FETCH: "1" },
-            input: unchanged.map((file) => `${baseCommit}:${file.oldPath ?? file.path}\n`).join(""),
+            input: lookups.map(({ name }) => `${name}\n`).join(""),
         });
         const lines = lookup.ok ? lookup.stdout.split("\n") : [];
-        unchanged.forEach((file, i) => {
+        lookups.forEach(({ file }, i) => {
             const blob = /^([0-9a-f]{40}|[0-9a-f]{64}) blob$/.exec(lines[i] ?? "");
             if (blob) candidates.push({ file, sides: { old: blob[1], new: blob[1] } });
         });

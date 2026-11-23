@@ -137,6 +137,33 @@ test("pure image renames and mode-only changes preview the unchanged blob on bot
     await expectPreviews("r2");
 });
 
+test("a pure image rename from a path with a line break previews the unchanged blob", async (t) => {
+    const tmp = await mkdtemp(path.join(os.tmpdir(), "image-diff-test-"));
+    t.after(() => rm(tmp, { recursive: true, force: true }));
+    const repo = path.join(tmp, "repo");
+    await mkdir(repo);
+    const git = (...args: string[]) => runGit(repo, ["-c", "user.name=test", "-c", "user.email=test@example.invalid",
+        "-c", "commit.gpgsign=false", ...args]);
+    const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0, 1]);
+    const oldPath = "line\nbreak.png";
+    await git("init", "-q", "-b", "main");
+    await writeFile(path.join(repo, "renamed.png"), png);
+    // Windows cannot create such a file, so build the base commit from objects.
+    const blob = (await git("hash-object", "-w", "renamed.png")).stdout.trim();
+    const tree = (await runGit(repo, ["mktree", "-z"], { input: `100644 blob ${blob}\t${oldPath}\0` })).stdout.trim();
+    await git("update-ref", "refs/heads/main", (await git("commit-tree", tree, "-m", "base")).stdout.trim());
+    await git("add", "renamed.png");
+
+    const service = new ReviewService({ store: new Store(path.join(tmp, "reviews")) });
+    const review = await service.ensureReview({ repoPath: repo, base: "main", scope: "pending" });
+    const file = (await service.getSnapshot(review)).files.find((entry) => entry.path === "renamed.png");
+    assert.equal(file?.status, "renamed");
+    assert.equal(file.oldPath, oldPath);
+    for (const side of ["old", "new"]) {
+        assert.deepEqual((await service.getDiffImage(review, "r1", "renamed.png", side)).bytes, png, side);
+    }
+});
+
 // A valid 1x1 JPEG; jpeg() prefixes a comment so long that Git sees no NUL in the first 8000 bytes and diffs it as text.
 const JPEG = Buffer.from("/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/2wBDAQMEBAUEBQkFBQkUDQsNFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBT/wAARCAABAAEDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDySiiivy8/vA//2Q==", "base64");
 const jpeg = (label: string) => {
