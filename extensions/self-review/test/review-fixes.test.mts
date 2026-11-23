@@ -29,6 +29,18 @@ function hasErrorCode(value: unknown, code: string): boolean {
     return typeof value === "object" && value !== null && "code" in value && value.code === code;
 }
 
+// Windows allows file symlinks only in Developer Mode or with administrator rights; skip the test elsewhere.
+async function symlinkOrSkip(t: TestContext, target: string, linkPath: string): Promise<boolean> {
+    try {
+        await symlink(target, linkPath, "file");
+        return true;
+    } catch (err) {
+        if (!hasErrorCode(err, "EPERM")) throw err;
+        t.skip("File symlink creation requires Windows Developer Mode or administrator rights.");
+        return false;
+    }
+}
+
 async function messageDelivery(service: ReviewServiceType, reviewId: string, messageId: string): Promise<MessageDelivery> {
     return required((await service.findMessage(reviewId, messageId)).message.delivery);
 }
@@ -352,12 +364,7 @@ test("symlink contents are target text, including broken and external links", as
     const { dir, repo } = await fixture(t);
     const secret = path.join(dir, "external.txt");
     await writeFile(secret, "must never enter the review");
-    try {
-        await symlink(secret, path.join(repo, "external-link"), "file");
-    } catch (err) {
-        if (hasErrorCode(err, "EPERM")) { t.skip("File symlink creation requires Windows Developer Mode or administrator rights."); return; }
-        throw err;
-    }
+    if (!await symlinkOrSkip(t, secret, path.join(repo, "external-link"))) return;
     await symlink(path.join(dir, "missing.txt"), path.join(repo, "broken-link"), "file");
     const snapshot = await captureSnapshot({ repoRoot: repo, base: "main" });
     const external = required(snapshot.files.find((f) => f.path === "external-link"));
@@ -655,7 +662,7 @@ test("file-to-symlink replacement is one navigable file with both sides availabl
     const { repo, service } = await fixture(t);
     await git(repo, "config", "core.symlinks", "true");
     await rm(path.join(repo, "a.txt"));
-    await symlink("target.txt", path.join(repo, "a.txt"), "file");
+    if (!await symlinkOrSkip(t, "target.txt", path.join(repo, "a.txt"))) return;
     const id = await service.ensureReview({ repoPath: repo, base: "main" });
     const snapshot = required(await service.store.readSnapshot(id, "r1"));
     const files = snapshot.files.filter((f) => f.path === "a.txt");
