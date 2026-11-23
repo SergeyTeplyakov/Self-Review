@@ -225,13 +225,18 @@ Run these after every push to a PR branch, whatever the change, and before
 reporting a UI change done. A UI change is done when the user can see it in the
 live canvas; tests and screenshots do not count.
 
-1. **Provider identity.** In the checkout being verified, run
+1. **Build and validate.** In the checkout being verified, run
+   `npm run build`, `npm run typecheck`, and the relevant tests, and keep
+   `extensions/self-review/dist/` consistent with the sources. Provider identity
+   compares existing `dist` files, so a stale `dist` passes it without serving
+   the edited sources. This applies to an unpushed UI change too.
+2. **Provider identity.** In the checkout being verified, run
    `npm run deploy:provider -- verify --receipt <new-receipt.json> --url <provider-url>`;
    the open canvas's URL works as `<provider-url>`. After a push the checkout
    must be clean at the pushed commit, and the receipt's `commit` must equal the
    pushed SHA. `dataChanged` must be `false`. A matching build needs no deploy
    or reload.
-2. **Mismatch.** Report it. A mismatch does not authorize replacing or reloading
+3. **Mismatch.** Report it. A mismatch does not authorize replacing or reloading
    the user-wide provider (`~/.copilot/extensions/self-review` by default),
    which changes every session; that needs explicit authorization, either the
    user's request or a standing personal instruction. When authorized, follow
@@ -240,8 +245,8 @@ live canvas; tests and screenshots do not count.
    `verify` again. If the new build fails verification, `restore` from the
    backup, reload, and `verify --backup`. Preserve stored reviews, settings, and
    other user data.
-3. **Canvas.** Run the section 2 canvas checkpoint on the verified head. Before a
+4. **Canvas.** Run the section 2 canvas checkpoint on the verified head. Before a
    PR exists, compare against `origin/main`.
 
 If a step cannot be completed, report which and why. Claim the live UI changed
-only after all three pass.
+only after all four pass.
