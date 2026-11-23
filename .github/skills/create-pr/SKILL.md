@@ -129,11 +129,13 @@ blocks pushing an authorized fix: push it even when a check failed, is pending,
 or could not run, and report that state. Report each check as passed, failed,
 pending, or blocked, and call the head verified only when every check passed.
 
-If further changes are needed, make the smallest in-scope fix, rerun relevant
-local validation, push normally, and start a new verification cycle for the new
-SHA. A new PR head invalidates prior Copilot review evidence. Request a review
-for each changed head and verify that the completed review is associated with
-that exact SHA before treating the review gate as satisfied.
+Outside a `create-pr` run, the checks above only verify and report; fixing,
+pushing, requesting a review, and merging need their own authorization. In a
+`create-pr` run, if further changes are needed, make the smallest in-scope fix,
+rerun relevant local validation, push normally, and start a new verification
+cycle for the new SHA. A new PR head invalidates prior Copilot review evidence.
+Request a review for each changed head and verify that the completed review is
+associated with that exact SHA before treating the review gate as satisfied.
 
 Before any merge, verify all of the following against the same current PR head
 and verified target:
@@ -232,11 +234,14 @@ live canvas; tests and screenshots do not count.
    compares existing `dist` files, so a stale `dist` passes it without serving
    the edited sources. This applies to an unpushed UI change too.
 2. **Provider identity.** In the checkout being verified, run
-   `npm run deploy:provider -- verify --receipt <new-receipt.json> --url <provider-url>`;
-   the open canvas's URL works as `<provider-url>`. After a push the checkout
-   must be clean at the pushed commit, and the receipt's `commit` must equal the
-   pushed SHA. `dataChanged` must be `false`. A matching build needs no deploy
-   or reload.
+   `npm run deploy:provider -- verify --receipt <new-receipt.json> --url <provider-url>`.
+   The receipt must be a file that does not exist yet, outside the checkout and
+   the installation and data directories; the command rejects any other path.
+   The open canvas's URL works as `<provider-url>`, but it carries an
+   authentication token, so keep it out of PRs, comments, and shared output.
+   After a push the checkout must be clean at the pushed commit, and the
+   receipt's `commit` must equal the pushed SHA. `dataChanged` must be `false`.
+   A matching build needs no deploy or reload.
 3. **Mismatch.** Report it. A mismatch does not authorize replacing or reloading
    the user-wide provider (`~/.copilot/extensions/self-review` by default),
    which changes every session; that needs explicit authorization, either the
