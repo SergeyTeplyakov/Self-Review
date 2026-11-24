@@ -1858,6 +1858,37 @@ test("a merged PR moves its comments to review history with their disposition, a
     assert.equal(app.read("state.historySelection.size"), 0);
 });
 
+test("the PR header reports open, closed, and unknown states with local work and never claims an unobserved merge", async () => {
+    const app = await loadApp();
+    const pr = (state: string, extra: Record<string, unknown> = {}) => ({
+        number: 9, url: "https://github.com/SergeyTeplyakov/Self-Review/pull/9", state, baseRefName: "main", headRefOid: "c0ffee",
+        mergedAt: null, closedAt: null, mergeCommitOid: null, ...extra,
+    });
+    const pills = (pullRequest: unknown, status: unknown, overrides: Record<string, unknown> = {}, scope = "all") => {
+        app.state.review = reviewFixture(overrides);
+        Object.assign(app.state, { pullRequest, pullRequestStatus: status });
+        return app.read<{ heading: string; localWork: string | null }>(`pullRequestPills(state.review, ${JSON.stringify(scope)})`);
+    };
+    const ok = (commitsAfterHead: number | null = null) => ({ checkedAt: "2026-01-03T00:00:00Z", error: null, commitsAfterHead });
+
+    let shown = pills(pr("open"), ok(2));
+    assert.match(shown.heading, /class="pill pr-link pr-open"[^>]*>PR #9 · Awaiting merge<\/a>/);
+    assert.match(shown.localWork ?? "", />Not in PR #9: 2 commits · 3 uncommitted<\/span>/);
+    assert.equal(pills(pr("open"), ok(2), {}, "pending").localWork, null, "Pending changes has no PR comparison");
+    assert.equal(pills(pr("open"), ok(0), { git: { ...reviewFixture().git, uncommittedFiles: 0 } }).localWork, "", "no local work, no pill");
+
+    shown = pills(pr("closed", { closedAt: "2026-01-02T00:00:00Z" }), ok());
+    assert.match(shown.heading, /pr-closed"[^>]*>PR #9 closed without merging<\/a>/);
+    assert.equal(shown.localWork, null, "a closed PR leaves the review active");
+
+    shown = pills(pr("open"), { checkedAt: "2026-01-03T00:00:00Z", error: "gh: not logged in", commitsAfterHead: null });
+    assert.match(shown.heading, /pr-stale warn"[^>]*title="Last known state: open\. Could not check the pull request on GitHub: gh: not logged in Last successful check: [^"]+"[^>]*>PR #9 · status may be stale<\/a>/);
+    shown = pills(null, { checkedAt: null, error: "gh: not found", commitsAfterHead: null });
+    assert.match(shown.heading, /<span class="pill muted pr-stale" title="[^"]*No successful check yet\.">PR status unknown<\/span>/);
+    assert.doesNotMatch(shown.heading, /Completed/, "a failed lookup never reports a merge");
+    assert.equal(pills(null, ok()).heading, "", "no PR, no pill");
+});
+
 test("the first-use banner offers manual saving or auto-save, with the old dismissal still supported", async () => {
     const app = await loadApp();
     const banner = (settings: RuntimeState["settings"]) => {
