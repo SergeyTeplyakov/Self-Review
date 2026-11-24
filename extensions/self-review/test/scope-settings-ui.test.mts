@@ -645,6 +645,38 @@ test("an empty reply box is one line until opened and stays vertically resizable
     }
 });
 
+test("Tab accepts the highlighted / command like Enter; Shift+Tab and a hidden menu keep normal focus navigation", async () => {
+    const app = await loadApp();
+    app.state.review = reviewFixture();
+    const chosen: string[] = [];
+    const option = (name: string, selected: boolean) => ({
+        classList: { contains: (name: string) => name === "selected" && selected, toggle: () => false },
+        click: () => chosen.push(name),
+    });
+    let options = [option("explain", false), option("learn", true)];
+    let menuVisible = true;
+    const menu = { querySelectorAll: () => options };
+    const composer = { querySelector: (selector: string) => (menuVisible && selector === ".review-commands:not([hidden])" ? menu : null) };
+    const textarea = { value: "/", dataset: { composer: "file:file.ts" }, closest: (selector: string) => (selector === ".composer" ? composer : null) };
+    let prevented = 0;
+    const press = (event: { key: string; shiftKey?: boolean }) => app.run("onKeyDown")({ target: textarea, preventDefault: () => prevented++, ...event });
+
+    press({ key: "Tab" });
+    assert.deepEqual(chosen, ["learn"], "Tab inserts the highlighted command");
+    assert.equal(prevented, 1, "focus stays in the composer");
+
+    options = [option("explain", false), option("learn", false)];
+    press({ key: "Tab" });
+    assert.deepEqual(chosen, ["learn", "explain"], "the first command is used when none is highlighted");
+    assert.equal(prevented, 2);
+
+    press({ key: "Tab", shiftKey: true });
+    menuVisible = false;
+    press({ key: "Tab" });
+    assert.deepEqual(chosen, ["learn", "explain"], "Shift+Tab and Tab without the menu choose nothing");
+    assert.equal(prevented, 2, "the browser keeps its usual focus navigation");
+});
+
 const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
 const skillsApp = async (
     catalog: unknown,
