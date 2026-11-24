@@ -4,13 +4,13 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import {
     Delivery, ReviewService, SettingsService, Store, captureSnapshot, hunkExcerpt, normalizeRemoteUrl,
-    parseUnifiedDiff, readWorkingFile, relocate, runGit, safeJoin,
+    parseUnifiedDiff, readWorkingFile, relocate, resolveRevealTarget, runGit, safeJoin,
 } from "./modules.mjs";
 import type { MessageDelivery, Review, ReviewMessage, ReviewService as ReviewServiceType, ThreadInput } from "../src/lib/review-service.mjs";
 import type { Store as StoreType } from "../src/lib/store.mjs";
@@ -387,6 +387,27 @@ test("working-file reads reject paths through escaping directory links and allow
     await assert.rejects(readWorkingFile(repo, "escape/secret.txt"), /escapes repository/);
     assert.deepEqual(await readWorkingFile(repo, "contained/safe.txt"), ["safe"]);
     await assert.rejects(readWorkingFile(repo, "../outside/secret.txt"), /escapes repository/);
+});
+
+test("file locations select existing files, fall back to the nearest folder, and never leave the repository", async (t) => {
+    const { dir, repo } = await fixture(t);
+    const root = await realpath(repo);
+    const outside = path.join(dir, "outside");
+    await mkdir(outside);
+    await mkdir(path.join(repo, "docs"));
+    await writeFile(path.join(outside, "secret.txt"), "external secret");
+    await symlink(outside, path.join(repo, "escape"), process.platform === "win32" ? "junction" : "dir");
+    assert.deepEqual(await resolveRevealTarget(repo, "a.txt"), { path: path.join(root, "a.txt"), select: true });
+    assert.deepEqual(await resolveRevealTarget(repo, "docs/deleted.md"), { path: path.join(root, "docs"), select: false });
+    assert.deepEqual(await resolveRevealTarget(repo, "gone/deeper/deleted.md"), { path: root, select: false });
+    // A path under a file must not fall back to opening that file in its default app.
+    assert.deepEqual(await resolveRevealTarget(repo, "a.txt/child"), { path: root, select: false });
+    for (const bad of ["escape/secret.txt", "escape/missing.txt", "../outside/secret.txt"]) {
+        await assert.rejects(resolveRevealTarget(repo, bad), /escapes repository/, bad);
+    }
+    for (const bad of ["", path.join(root, "a.txt"), "C:\\Windows\\notepad.exe"]) {
+        await assert.rejects(resolveRevealTarget(repo, bad), /repository-relative/, bad);
+    }
 });
 
 test("safeJoin accepts names that start with two dots and rejects parent traversal", async (t) => {

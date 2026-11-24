@@ -407,6 +407,45 @@ test("comment links use the browser launcher only for authenticated web URLs in 
     }
 });
 
+test("file locations open only paths inside the active review's repository", async () => {
+    const revealed: { path: string; select: boolean }[] = [];
+    let fail = false;
+    const server = await startReviewServer({
+        instanceId: "reveal-file", getReviewId: () => reviewId, service, delivery, webRoot: WEB_ROOT,
+        revealFile: async (target) => {
+            if (fail) throw new Error("explorer unavailable");
+            revealed.push(target);
+        },
+    });
+    try {
+        const url = new URL(server.url);
+        const port = Number(url.port);
+        const token = required(url.searchParams.get("t"));
+        const headers = { "Content-Type": "application/json", "X-MR-Token": token, "X-MR-Review": reviewId };
+        const post = (body: { path?: unknown }, extra: Record<string, string> = {}) =>
+            request(port, { method: "POST", pathName: "/api/reveal-file", headers: { ...headers, ...extra }, body });
+        const root = await realpath(repo);
+        assert.equal((await post({ path: "a.cs" }, { "X-MR-Token": "invalid" })).status, 403);
+        assert.equal((await post({ path: "a.cs" }, { "X-MR-Review": "old-review" })).status, 409);
+        for (const bad of [undefined, "", "../outside.txt", path.join(root, "a.cs")]) {
+            assert.equal((await post({ path: bad })).status, 400, String(bad));
+        }
+        assert.deepEqual(revealed, []);
+        const selected = await post({ path: "a.cs" });
+        assert.equal(selected.status, 200);
+        assert.equal(selected.json?.selected, true);
+        const fallback = await post({ path: "removed/old.cs" });
+        assert.equal(fallback.json?.selected, false);
+        assert.deepEqual(revealed, [{ path: path.join(root, "a.cs"), select: true }, { path: root, select: false }]);
+        fail = true;
+        const failure = await post({ path: "a.cs" });
+        assert.equal(failure.status, 502);
+        assert.match(failure.text, /Could not open the file location/);
+    } finally {
+        await server.close();
+    }
+});
+
 test("HTTP server enforces token/host/origin and delivers posted comments", async () => {
     const extensionVersion = { version: "0.3.0", buildId: "a1b2c3d4e5f6" };
     const server = await startReviewServer({ instanceId: "inst-1", getReviewId: () => reviewId, service, delivery, webRoot: WEB_ROOT, extensionVersion });

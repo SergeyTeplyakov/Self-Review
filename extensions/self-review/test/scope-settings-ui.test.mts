@@ -525,6 +525,37 @@ function capturedBody(posts: CapturedPost[], index = -1): Record<string, unknown
     return body as Record<string, unknown>;
 }
 
+test("tree rows and file headers reveal the file in the platform file manager and report a folder fallback", async () => {
+    const requests: Array<{ url: string; body?: string }> = [];
+    let selected = true;
+    const app = await loadApp({
+        navigator: { platform: "Win32" },
+        fetch: async (url, opts) => {
+            requests.push({ url, body: opts?.body });
+            return jsonResponse({ ok: true, selected });
+        },
+    });
+    app.state.review = reviewFixture();
+    const file = { path: "src/a b.ts", status: "modified", additions: 1, deletions: 0, hunks: [] };
+    app.state.snapshot = { revisionId: "r1", files: [file] };
+    const tree = app.run<string>(`(() => { const out = []; treeHtml(buildTree(${JSON.stringify([file])}), 0, out); return out.join(""); })()`);
+    assert.match(tree, /<button type="button" class="reveal-file tree" data-action="reveal-file" data-path="src\/a b\.ts" title="Reveal in File Explorer" aria-label="Reveal in File Explorer: src\/a b\.ts" tabindex="-1">/);
+    assert.match(app.run<string>(`revealButtonHtml("x.ts", "head")`), /class="reveal-file head"[^>]*title="Reveal in File Explorer"(?![^>]*tabindex)/);
+    app.run(`globalThis.navigator = { platform: "MacIntel" }`);
+    assert.match(app.run<string>(`revealButtonHtml("x.ts", "head")`), /title="Reveal in Finder"/);
+
+    const click = clicker(app);
+    await click("reveal-file", { path: "src/a b.ts" });
+    assert.equal(app.node("#toast").textContent, "");
+    selected = false;
+    await click("reveal-file", { path: "src/gone.ts" });
+    assert.deepEqual(requests, [
+        { url: "/api/reveal-file", body: JSON.stringify({ path: "src/a b.ts" }) },
+        { url: "/api/reveal-file", body: JSON.stringify({ path: "src/gone.ts" }) },
+    ]);
+    assert.equal(app.node("#toast").textContent, "src/gone.ts is not on disk, so its nearest folder was opened.");
+});
+
 test("active threads can be collapsed and expanded without changing their status or replies", async () => {
     const thread = {
         threadId: "t1", kind: "line", status: "active",
