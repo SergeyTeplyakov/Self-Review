@@ -4,13 +4,13 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
-import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import {
     Delivery, ReviewService, SettingsService, Store, captureSnapshot, hunkExcerpt, normalizeRemoteUrl,
-    parseUnifiedDiff, readWorkingFile, relocate, runGit, safeJoin,
+    parseUnifiedDiff, readWorkingFile, relocate, resolveRevealTarget, revealInFileManager, runGit, safeJoin,
 } from "./modules.mjs";
 import type { MessageDelivery, Review, ReviewMessage, ReviewService as ReviewServiceType, ThreadInput } from "../src/lib/review-service.mjs";
 import type { Store as StoreType } from "../src/lib/store.mjs";
@@ -387,6 +387,45 @@ test("working-file reads reject paths through escaping directory links and allow
     await assert.rejects(readWorkingFile(repo, "escape/secret.txt"), /escapes repository/);
     assert.deepEqual(await readWorkingFile(repo, "contained/safe.txt"), ["safe"]);
     await assert.rejects(readWorkingFile(repo, "../outside/secret.txt"), /escapes repository/);
+});
+
+test("file locations select existing files, fall back to the nearest folder, and never leave the repository", async (t) => {
+    const { dir, repo } = await fixture(t);
+    const root = await realpath(repo);
+    const outside = path.join(dir, "outside");
+    await mkdir(outside);
+    await mkdir(path.join(repo, "docs"));
+    await writeFile(path.join(outside, "secret.txt"), "external secret");
+    await symlink(outside, path.join(repo, "escape"), process.platform === "win32" ? "junction" : "dir");
+    await symlink(path.join(root, "docs"), path.join(repo, "linked"), process.platform === "win32" ? "junction" : "dir");
+    assert.deepEqual(await resolveRevealTarget(repo, "a.txt"), { path: path.join(root, "a.txt"), select: true });
+    assert.deepEqual(await resolveRevealTarget(repo, "docs/deleted.md"), { path: path.join(root, "docs"), select: false });
+    assert.deepEqual(await resolveRevealTarget(repo, "gone/deeper/deleted.md"), { path: root, select: false });
+    // A path under a file must not fall back to opening that file in its default app.
+    assert.deepEqual(await resolveRevealTarget(repo, "a.txt/child"), { path: root, select: false });
+    // A contained folder link is selected as the link, and a missing path under it opens the folder it points to.
+    assert.deepEqual(await resolveRevealTarget(repo, "linked"), { path: path.join(root, "linked"), select: true });
+    assert.deepEqual(await resolveRevealTarget(repo, "linked/deleted.md"), { path: path.join(root, "docs"), select: false });
+    for (const bad of ["escape/secret.txt", "escape/missing.txt", "escape/gone/missing.txt", "../outside/secret.txt"]) {
+        await assert.rejects(resolveRevealTarget(repo, bad), /escapes repository/, bad);
+    }
+    for (const bad of ["", path.join(root, "a.txt"), "C:\\Windows\\notepad.exe"]) {
+        await assert.rejects(resolveRevealTarget(repo, bad), /repository-relative/, bad);
+    }
+});
+
+test("Linux file locations wait for xdg-open and report its failure", { skip: process.platform !== "linux" }, async (t) => {
+    const bin = await temporary(t);
+    const opened = path.join(bin, "opened");
+    await writeFile(path.join(bin, "xdg-open"), `#!/bin/sh\nprintf '%s' "$1" > '${opened}'\nexit "$XDG_OPEN_EXIT"\n`, { mode: 0o755 });
+    const saved = { PATH: process.env.PATH, XDG_OPEN_EXIT: process.env.XDG_OPEN_EXIT };
+    t.after(() => Object.assign(process.env, saved));
+    process.env.PATH = `${bin}${path.delimiter}${saved.PATH ?? ""}`;
+    process.env.XDG_OPEN_EXIT = "0";
+    await revealInFileManager({ path: path.join(bin, "docs", "a.txt"), select: true });
+    assert.equal(await readFile(opened, "utf8"), path.join(bin, "docs"), "a selected file opens its folder");
+    process.env.XDG_OPEN_EXIT = "3";
+    await assert.rejects(revealInFileManager({ path: bin, select: false }), "a failing file manager is reported");
 });
 
 test("safeJoin accepts names that start with two dots and rejects parent traversal", async (t) => {

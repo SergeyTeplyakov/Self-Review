@@ -321,6 +321,8 @@ type State = {
     reviewSkillsAvailable: boolean;
     skillOverrides: Map<string, string[]>;
     approving: Set<string>;
+    // Thread ID to the status being saved for it.
+    statusUpdates: Map<string, ThreadStatus>;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -706,6 +708,7 @@ const state: State = {
     reviewSkillsAvailable: false,
     skillOverrides: new Map(),
     approving: new Set(),
+    statusUpdates: new Map(),
 };
 
 const FOLDER_VIEW_ROW_BUDGET = 3000;
@@ -2283,6 +2286,20 @@ function activeCount(pathName: string): number {
 
 const CHEVRON = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 const FOLDER_ICON = `<svg class="ficon" viewBox="0 0 16 16" aria-hidden="true"><path d="M1.75 3h4.1l1.5 1.5h6.9c.41 0 .75.34.75.75v7c0 .41-.34.75-.75.75H1.75A.75.75 0 0 1 1 12.25v-8.5c0-.41.34-.75.75-.75Z" fill="currentColor"/></svg>`;
+const REVEAL_ICON = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1.5 12.5v-9h4l1.5 1.5h5.5v2M1.5 12.5l2-5.5h11l-2 5.5Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>`;
+
+function revealLabel(): string {
+    const platform = globalThis.navigator?.platform ?? "";
+    if (/^win/i.test(platform)) return "Reveal in File Explorer";
+    if (/^mac/i.test(platform)) return "Reveal in Finder";
+    return "Open containing folder";
+}
+
+// The tree rows are not tab stops, so the tree copy is pointer-only; the file header copy stays keyboard reachable.
+function revealButtonHtml(path: string, place: "tree" | "head"): string {
+    const label = revealLabel();
+    return `<button type="button" class="reveal-file ${place}" data-action="reveal-file" data-path="${esc(path)}" title="${label}" aria-label="${esc(`${label}: ${path}`)}"${place === "tree" ? ' tabindex="-1"' : ""}>${REVEAL_ICON}</button>`;
+}
 
 const statHtml = (adds: number, dels: number) => `<span class="stat"><span class="add">+${adds}</span> <span class="del">−${dels}</span></span>`;
 
@@ -2310,6 +2327,7 @@ function treeHtml(node: FileTreeNode, depth: number, out: string[]): void {
             + `<span class="status-letter ${letter}">${letter}</span>`
             + `<span class="name">${esc(f.path.slice(f.path.lastIndexOf("/") + 1))}</span>`
             + `<span class="count${fn ? "" : " zero"}">${fn}</span>`
+            + revealButtonHtml(f.path, "tree")
             + `${statHtml(f.additions, f.deletions)}</div>`);
     }
 }
@@ -2863,7 +2881,7 @@ function threadHtml(t: ReviewThread, { showLocation = false }: { showLocation?: 
         + (outdated ? `<span class="badge outdated" title="The commented code changed or was removed">Outdated</span>` : "")
         + (notInDiff ? `<span class="badge outdated" title="This location is not part of the current diff">Not in diff</span>` : "")
         + (t.status !== "active" ? `<span class="badge st-${t.status}">${t.status === "wontfix" ? "won't fix" : t.status}</span>` : "")
-        + `<select data-action="status" data-thread="${esc(t.threadId)}" title="Thread status">${options}</select>`
+        + `<select data-action="status" data-thread="${esc(t.threadId)}" title="Thread status"${state.statusUpdates.has(t.threadId) ? " disabled" : ""}>${options}</select>`
         + (collapsed ? pending.map(deliveryHtml).join("") : "")
         + (collapsed && hasDraftReply(t.threadId) ? `<span class="badge">Unposted reply</span>` : "")
         + `<button class="link" data-action="toggle" data-thread="${esc(t.threadId)}" aria-expanded="${!collapsed}">${collapsed ? "Show" : "Hide"}</button>`
@@ -2878,7 +2896,39 @@ function threadHtml(t: ReviewThread, { showLocation = false }: { showLocation?: 
         ? `<div class="finding-actions"><button class="primary" data-action="approve-finding" data-thread="${esc(t.threadId)}" title="${esc(staleFinding ? "Review changed; rerun before approving" : approvalIssue || "Send this suggestion to the coding agent for implementation")}"${t.agentReview.approvalMessageId || staleFinding || approvalIssue || t.status !== "active" || state.approving.has(t.threadId) ? " disabled" : ""}>${t.agentReview.approvalMessageId ? "Approved" : "Approve"}</button>`
             + `<button data-action="discuss-finding" data-thread="${esc(t.threadId)}">Discuss</button></div>`
         : "";
-    return `<div class="thread${collapsed ? " collapsed" : ""}" data-thread-id="${esc(t.threadId)}">${head}<div class="thread-body">${original}${t.messages.map((m, i) => messageHtml(m) + (i === 0 ? findingEvidenceHtml(t.agentReview) : "")).join("")}${actions}${reply}</div></div>`;
+    return `<div class="thread${collapsed ? " collapsed" : ""}" data-thread-id="${esc(t.threadId)}">${head}<div class="thread-body">${original}${t.messages.map((m, i) => messageHtml(m) + (i === 0 ? findingEvidenceHtml(t.agentReview) : "")).join("")}${actions}${reply}${threadStatusActionHtml(t)}</div></div>`;
+}
+
+// One-click Resolve for an active thread or Reactivate for any other status; the header dropdown keeps the rest.
+function threadStatusActionHtml(t: ReviewThread): string {
+    const pending = state.statusUpdates.get(t.threadId);
+    const resolve = t.status === "active";
+    const target: ThreadStatus = resolve ? "resolved" : "active";
+    const label = pending ? (pending === "active" ? "Reactivating…" : "Resolving…") : resolve ? "Resolve" : "Reactivate";
+    const title = resolve ? "Mark this thread resolved" : "Reopen this thread as active";
+    return `<div class="thread-status-actions"><button type="button" data-action="thread-status" data-thread="${esc(t.threadId)}" data-status="${target}" title="${title}"`
+        + `${pending ? ` disabled aria-busy="true"` : ""}>${label}</button></div>`;
+}
+
+// Saves a thread status through the same endpoint as the header dropdown. A failure is reported and the
+// reloaded state keeps the thread's previous status.
+async function setThreadStatus(threadId: string, status: ThreadStatus): Promise<void> {
+    if (state.statusUpdates.has(threadId)) return;
+    state.statusUpdates.set(threadId, status);
+    render();
+    try {
+        try {
+            await api("POST", `threads/${encodeURIComponent(threadId)}/status`, { status });
+            if (status !== "active") state.expanded.delete(threadId);
+        } catch (err: unknown) {
+            toast(errorMessage(err), true);
+        }
+        // Hold the guard until the reload, so a render before it cannot re-enable the stale controls.
+        await loadState().catch((err: unknown) => toast(errorMessage(err), true));
+    } finally {
+        state.statusUpdates.delete(threadId);
+        render();
+    }
 }
 
 // Explains an empty diff and, for pending changes, offers the way back to the full branch diff.
@@ -3272,6 +3322,7 @@ function fileView(file: DiffFile, { stacked = false, folded = false }: { stacked
         + `<span class="status-letter ${letter}">${letter}</span><span class="path">${pathHtml}${file.oldPath && file.oldPath !== file.path ? ` <span class="muted">(from ${esc(file.oldPath)})</span>` : ""}${file.untracked ? ` <span class="badge">untracked</span>` : ""}</span>`
         + (stacked && folded && activeHere ? `<span class="count">${activeHere}</span>` : "")
         + `<span class="stat"><span class="add">+${file.additions}</span> <span class="del">−${file.deletions}</span></span>`
+        + revealButtonHtml(file.path, "head")
         + `<button data-action="open" data-key="${esc(fileKey)}" data-path="${esc(file.path)}">Comment on file</button></div>`];
     if (folded) {
         html.push(`</section>`);
@@ -3617,6 +3668,20 @@ async function onClick(e: MouseEvent): Promise<void> {
                 }
                 break;
             }
+            case "thread-status": {
+                const id = value("thread");
+                const status = value("status");
+                if (!id || !isThreadStatus(status)) break;
+                await setThreadStatus(id, status);
+                // Re-rendering dropped focus from the button. Put it back on the thread unless the user moved it
+                // while the save was pending. A placed thread reactivated from Overview becomes an Active threads link.
+                if (document.activeElement && document.activeElement !== document.body) break;
+                const thread = `[data-thread-id="${CSS.escape(id)}"]`;
+                (document.querySelector<HTMLElement>(`${thread}:not(.collapsed) [data-action="thread-status"]`)
+                    ?? document.querySelector<HTMLElement>(`${thread} [data-action="toggle"]`)
+                    ?? document.querySelector<HTMLElement>(`.list-row [data-action="jump"][data-thread="${CSS.escape(id)}"]`))?.focus();
+                break;
+            }
             case "discuss-description":
                 focusComposer("overview:new");
                 break;
@@ -3636,6 +3701,12 @@ async function onClick(e: MouseEvent): Promise<void> {
                 setDirCollapsed(value("path"), !collapsedDirs().has(value("path")));
                 render();
                 break;
+            case "reveal-file": {
+                const path = value("path");
+                const res = await api("POST", "reveal-file", { path });
+                if (isRecord(res) && res.selected === false) toast(`${path} is not on disk, so its nearest folder was opened.`);
+                break;
+            }
             case "fold-tree":
                 setAllDirsCollapsed(value("fold") === "1");
                 render();
@@ -3929,14 +4000,7 @@ async function onChange(e: Event): Promise<void> {
     if (el.dataset?.action !== "status") return;
     const threadId = el.dataset.thread;
     if (!threadId || !isThreadStatus(el.value)) return;
-    try {
-        await api("POST", `threads/${encodeURIComponent(threadId)}/status`, { status: el.value });
-        if (el.value !== "active") state.expanded.delete(threadId);
-        await loadState();
-    } catch (err: unknown) {
-        toast(errorMessage(err), true);
-        await loadState().catch(() => undefined);
-    }
+    await setThreadStatus(threadId, el.value);
 }
 
 function updateReviewCommands(textarea: HTMLTextAreaElement): void {
@@ -4050,9 +4114,9 @@ function onKeyDown(e: KeyboardEvent): void {
             menu.hidden = true;
             return;
         }
-        if (options.length && (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Enter")) {
+        if (options.length && (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Enter" || e.key === "Tab")) {
             e.preventDefault();
-            if (e.key === "Enter") options[Math.max(0, selected)].click();
+            if (e.key === "Enter" || e.key === "Tab") options[Math.max(0, selected)].click();
             else {
                 const next = (selected + (e.key === "ArrowDown" ? 1 : -1) + options.length) % options.length;
                 options.forEach((option, index) => option.classList.toggle("selected", index === next));
