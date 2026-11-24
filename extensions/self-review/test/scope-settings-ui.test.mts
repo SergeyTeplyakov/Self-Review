@@ -1532,6 +1532,38 @@ test("Resolve and Reactivate change thread status in one click, show progress, a
     assert.equal(app.run("state.statusUpdates.size"), 0);
 });
 
+test("thread status buttons stay disabled through the reload and restore focus only when the user left it", async () => {
+    let release = () => {};
+    const app = await loadApp({
+        CSS: { escape: (value: string) => value },
+        fetch: async () => {
+            await new Promise<void>((resolve) => { release = resolve; });
+            return jsonResponse({ ok: true });
+        },
+    });
+    app.run("var pendingDuringReload; render = () => {}; loadState = async () => { pendingDuringReload = state.statusUpdates.has('t1'); }");
+    const thread = { threadId: "t1", kind: "line", status: "active", messages: [{ messageId: "m", author: "user", body: "Fix it", createdAt: "2026-01-01T00:00:00Z" }] };
+    app.state.review = reviewFixture({ threads: [thread] });
+    const click = clicker(app);
+
+    let saving = click("thread-status", { thread: "t1", status: "resolved" });
+    app.document.activeElement = { tagName: "TEXTAREA", dataset: { composer: "reply:t2" } };
+    release();
+    await saving;
+    assert.equal(app.run("pendingDuringReload"), true, "the reload still sees the save in progress");
+    assert.equal(app.run("state.statusUpdates.size"), 0);
+    assert.deepEqual(app.focused, [], "focus stays in the composer the user moved to");
+
+    // Reactivating a placed thread from Closed threads leaves only its Active threads row.
+    app.document.activeElement = null;
+    const findNode = app.document.querySelector;
+    app.document.querySelector = (selector: string) => selector.startsWith("[data-thread-id") ? null as unknown as MockNode : findNode(selector);
+    saving = click("thread-status", { thread: "t1", status: "active" });
+    release();
+    await saving;
+    assert.deepEqual(app.focused, ['.list-row [data-action="jump"][data-thread="t1"]']);
+});
+
 test("file views show mode changes and side-specific EOF notes without selectable phantom lines", async () => {
     const app = await loadApp();
     app.state.review = reviewFixture();

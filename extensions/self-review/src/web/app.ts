@@ -2730,17 +2730,18 @@ async function setThreadStatus(threadId: string, status: ThreadStatus): Promise<
     state.statusUpdates.set(threadId, status);
     render();
     try {
-        await api("POST", `threads/${encodeURIComponent(threadId)}/status`, { status });
-        if (status !== "active") state.expanded.delete(threadId);
-    } catch (err: unknown) {
-        toast(errorMessage(err), true);
+        try {
+            await api("POST", `threads/${encodeURIComponent(threadId)}/status`, { status });
+            if (status !== "active") state.expanded.delete(threadId);
+        } catch (err: unknown) {
+            toast(errorMessage(err), true);
+        }
+        // Hold the guard until the reload, so a render before it cannot re-enable the stale controls.
+        await loadState().catch((err: unknown) => toast(errorMessage(err), true));
     } finally {
         state.statusUpdates.delete(threadId);
-    }
-    await loadState().catch((err: unknown) => {
-        toast(errorMessage(err), true);
         render();
-    });
+    }
 }
 
 // Explains an empty diff and, for pending changes, offers the way back to the full branch diff.
@@ -3352,10 +3353,13 @@ async function onClick(e: MouseEvent): Promise<void> {
                 const status = value("status");
                 if (!id || !isThreadStatus(status)) break;
                 await setThreadStatus(id, status);
-                // The button was re-rendered (and a resolved thread collapses), so keep keyboard focus on the thread.
+                // Re-rendering dropped focus from the button. Put it back on the thread unless the user moved it
+                // while the save was pending. A placed thread reactivated from Overview becomes an Active threads link.
+                if (document.activeElement && document.activeElement !== document.body) break;
                 const thread = `[data-thread-id="${CSS.escape(id)}"]`;
                 (document.querySelector<HTMLElement>(`${thread}:not(.collapsed) [data-action="thread-status"]`)
-                    ?? document.querySelector<HTMLElement>(`${thread} [data-action="toggle"]`))?.focus();
+                    ?? document.querySelector<HTMLElement>(`${thread} [data-action="toggle"]`)
+                    ?? document.querySelector<HTMLElement>(`.list-row [data-action="jump"][data-thread="${CSS.escape(id)}"]`))?.focus();
                 break;
             }
             case "discuss-description":
