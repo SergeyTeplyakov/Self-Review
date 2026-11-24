@@ -29,7 +29,7 @@ export function isCommentConcurrency(value: unknown): value is number {
 }
 export const REVIEW_FOCUSES: import("../../types/contracts.js").ReviewFocus[] = ["review", "simplify", "both"];
 export const FUSION_REVIEWER = "copilot-fusion";
-export const SUGGESTED_REVIEWERS = ["gpt-6-astra", "gpt-6.1-sol", FUSION_REVIEWER];
+export const SUGGESTED_REVIEWERS = ["mai-code-2", "gpt-6.2-sol", "gpt-6.2-astra"];
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
     return value !== null && typeof value === "object" && !Array.isArray(value);
