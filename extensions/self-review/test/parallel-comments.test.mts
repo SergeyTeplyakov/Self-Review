@@ -158,8 +158,9 @@ test("parallel follow-ups wait for earlier claims to finish routing", async t =>
     const firstSettingsRead = deferred();
     const releaseFirstSettings = deferred();
     const laterSend = deferred();
-    const f = await fixture(t, 3, async options => {
-        if (options.prompt.includes("Second comment")) laterSend.resolve();
+    let sendCount = 0;
+    const f = await fixture(t, 3, async () => {
+        if (++sendCount === 2) laterSend.resolve();
     });
     const getSettings = f.settings.get.bind(f.settings);
     let settingsReads = 0;
@@ -175,7 +176,7 @@ test("parallel follow-ups wait for earlier claims to finish routing", async t =>
     const first = await f.newThread("First comment");
     const firstDelivery = f.send(first);
     await firstSettingsRead.promise;
-    const second = await f.newThread("Second comment");
+    const second = await f.service.addMessage(f.reviewId, first.thread.threadId, { author: "user", body: "Second comment" });
     const secondClaimed = deferred();
     const onChanged = (event: { reviewId: string; reason: string }) => {
         if (event.reviewId === f.reviewId && event.reason === "delivery") {
