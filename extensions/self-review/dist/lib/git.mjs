@@ -196,15 +196,18 @@ async function addImageSides(repoRoot, baseCommit, patches, textImageIds) {
 const CAPTURE_VERSION = 3;
 // scope "all" diffs the working tree against the merge-base with `base` (the whole branch or PR);
 // scope "pending" diffs it against HEAD, so committed work is left out.
-export async function captureSnapshot({ repoRoot, base, paths, exclude, includeUntracked = true, contextLines = 5, scope = "all" }) {
+export async function captureSnapshot({ repoRoot, base, paths, exclude, includeUntracked = true, contextLines = 5, scope = "all", delivered }) {
     const head = (await runGit(repoRoot, ["rev-parse", "HEAD"])).stdout.trim();
     const branch = (await runGit(repoRoot, ["rev-parse", "--abbrev-ref", "HEAD"])).stdout.trim();
     let baseCommit = head;
+    let separation;
     if (scope !== "pending") {
         const mergeBase = await runGit(repoRoot, ["merge-base", base, "HEAD"], { allowFail: true });
         baseCommit = mergeBase.ok && mergeBase.stdout.trim()
             ? mergeBase.stdout.trim()
             : (await runGit(repoRoot, ["rev-parse", "--verify", base])).stdout.trim();
+        if (delivered)
+            ({ baseCommit, separation } = await separateDelivered(repoRoot, baseCommit, delivered));
     }
     const pathspec = buildPathspec(paths, exclude);
     // Explicit prefixes keep the a/ and b/ headers the parser expects, whatever diff.noprefix or diff.mnemonicPrefix say.
@@ -288,7 +291,36 @@ export async function captureSnapshot({ repoRoot, base, paths, exclude, includeU
         uncommittedFiles,
         fingerprint: hash.digest("hex"),
         files,
+        ...(separation ? { delivered: separation } : {}),
     };
+}
+const OBJECT_ONLY = { GIT_NO_LAZY_FETCH: "1" };
+const FULL_OID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+async function hasCommit(repoRoot, oid) {
+    return FULL_OID.test(oid)
+        && (await runGit(repoRoot, ["cat-file", "-e", `${oid}^{commit}`], { allowFail: true, env: OBJECT_ONLY })).ok;
+}
+const isAncestor = async (repoRoot, ancestor, descendant) => (await runGit(repoRoot, ["merge-base", "--is-ancestor", ancestor, descendant], { allowFail: true, env: OBJECT_ONLY })).ok;
+// Squash and rebase merges leave the PR head outside the base, so the diff starts at the PR head when HEAD still
+// contains it. Anything else keeps the normal base rather than hide work.
+async function separateDelivered(repoRoot, baseCommit, { headRefOid, mergeCommitOid }) {
+    const keep = (separation) => ({ baseCommit, separation });
+    if (mergeCommitOid && await hasCommit(repoRoot, mergeCommitOid) && await isAncestor(repoRoot, mergeCommitOid, baseCommit))
+        return keep("in-base");
+    if (!headRefOid || !await hasCommit(repoRoot, headRefOid))
+        return keep("unavailable");
+    if (await isAncestor(repoRoot, headRefOid, baseCommit))
+        return keep("in-base");
+    if (!await isAncestor(repoRoot, headRefOid, "HEAD"))
+        return keep("not-in-branch");
+    return { baseCommit: headRefOid, separation: "separated" };
+}
+// Commits on HEAD after a pull request's head, or null when HEAD does not contain that commit.
+export async function commitsAfter(repoRoot, oid) {
+    if (!await hasCommit(repoRoot, oid) || !await isAncestor(repoRoot, oid, "HEAD"))
+        return null;
+    const count = await runGit(repoRoot, ["rev-list", "--count", `${oid}..HEAD`], { allowFail: true });
+    return count.ok ? Number(count.stdout.trim()) : null;
 }
 export async function readWorkingFile(repoRoot, relPath) {
     try {

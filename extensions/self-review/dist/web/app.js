@@ -17,7 +17,7 @@ function onRefreshProgress(event) {
 function isView(value) {
     if (!isRecord(value))
         return false;
-    if (value.type === "overview" || value.type === "lessons" || value.type === "agent-comments")
+    if (value.type === "overview" || value.type === "lessons" || value.type === "agent-comments" || value.type === "history")
         return true;
     return (value.type === "file" || value.type === "folder") && typeof value.path === "string";
 }
@@ -118,7 +118,8 @@ function isThread(value) {
         || !["overview", "file", "change", "line"].includes(String(value.kind))
         || !["active", "resolved", "wontfix", "closed"].includes(String(value.status))
         || !Array.isArray(value.messages) || !value.messages.every(isMessage)
-        || (value.location !== undefined && value.location !== null && !isLocation(value.location)))
+        || (value.location !== undefined && value.location !== null && !isLocation(value.location))
+        || (value.followUpOf !== undefined && typeof value.followUpOf !== "string"))
         return false;
     if (value.anchor !== undefined && value.anchor !== null) {
         if (!isAnchor(value.anchor))
@@ -171,6 +172,10 @@ function isGitStatus(value) {
     if (!isRecord(value) || !isOptionalString(value.headCommit) || !isOptionalString(value.baseCommit)
         || !isOptionalString(value.branch) || (value.uncommittedFiles !== undefined && typeof value.uncommittedFiles !== "number"))
         return false;
+    if (value.delivered !== undefined && value.delivered !== null && (!isRecord(value.delivered)
+        || typeof value.delivered.pullRequestNumber !== "number"
+        || !["separated", "in-base", "unavailable", "not-in-branch"].includes(String(value.delivered.separation))))
+        return false;
     return value.upstream === undefined || value.upstream === null
         || (isRecord(value.upstream) && (value.upstream.ahead === null || typeof value.upstream.ahead === "number")
             && (value.upstream.behind === null || typeof value.upstream.behind === "number")
@@ -179,6 +184,33 @@ function isGitStatus(value) {
 function isDescription(value) {
     return isRecord(value) && typeof value.version === "number"
         && (value.revisionId === null || typeof value.revisionId === "string") && typeof value.body === "string";
+}
+function isPullRequest(value) {
+    return isRecord(value) && typeof value.number === "number" && Number.isSafeInteger(value.number) && typeof value.url === "string"
+        && (value.state === undefined || value.state === "open" || value.state === "merged" || value.state === "closed")
+        && isOptionalString(value.baseRefName) && isOptionalString(value.headRefOid) && isOptionalString(value.mergedAt)
+        && isOptionalString(value.closedAt) && isOptionalString(value.mergeCommitOid);
+}
+// Older providers reported only an open pull request's number and URL.
+function parsePullRequest(value) {
+    return {
+        number: value.number,
+        url: value.url,
+        state: value.state ?? "open",
+        baseRefName: value.baseRefName ?? null,
+        headRefOid: value.headRefOid ?? null,
+        mergedAt: value.mergedAt ?? null,
+        closedAt: value.closedAt ?? null,
+        mergeCommitOid: value.mergeCommitOid ?? null,
+    };
+}
+function isPullRequestStatus(value) {
+    return isRecord(value) && isOptionalString(value.checkedAt) && isOptionalString(value.error)
+        && (value.commitsAfterHead === null || value.commitsAfterHead === undefined || typeof value.commitsAfterHead === "number");
+}
+function isCompletion(value) {
+    return isRecord(value) && isPullRequest(value.pullRequest) && typeof value.completedAt === "string"
+        && isStringArray(value.archivedThreadIds) && isOptionalString(value.deliveredRevisionId);
 }
 function isReview(value) {
     return isRecord(value)
@@ -196,7 +228,8 @@ function isReview(value) {
         && (value.description === undefined || value.description === null || isDescription(value.description))
         && (value.deliveryMode === undefined || value.deliveryMode === null
             || value.deliveryMode === "immediate" || value.deliveryMode === "batch")
-        && (value.agentReviews === undefined || (Array.isArray(value.agentReviews) && value.agentReviews.every(isAgentReviewRun)));
+        && (value.agentReviews === undefined || (Array.isArray(value.agentReviews) && value.agentReviews.every(isAgentReviewRun)))
+        && (value.completions === undefined || (Array.isArray(value.completions) && value.completions.every(isCompletion)));
 }
 function parseReview(value) {
     if (!isReview(value))
@@ -243,8 +276,8 @@ function isStateResponse(value) {
         || (value.extensionVersion !== undefined && !isExtensionVersion(value.extensionVersion))
         || (value.session !== undefined && (!isRecord(value.session)
             || (value.session.busy !== null && typeof value.session.busy !== "boolean")))
-        || (value.pullRequest !== undefined && value.pullRequest !== null
-            && (!isRecord(value.pullRequest) || typeof value.pullRequest.number !== "number" || typeof value.pullRequest.url !== "string"))
+        || (value.pullRequest !== undefined && value.pullRequest !== null && !isPullRequest(value.pullRequest))
+        || (value.pullRequestStatus !== undefined && value.pullRequestStatus !== null && !isPullRequestStatus(value.pullRequestStatus))
         || (value.agentReviewAvailable !== undefined && typeof value.agentReviewAvailable !== "boolean")
         || (value.reviewSkillsAvailable !== undefined && typeof value.reviewSkillsAvailable !== "boolean")
         || (value.agentReviewSuggestedModels !== undefined && !isStringArray(value.agentReviewSuggestedModels)))
@@ -258,7 +291,12 @@ function parseState(value) {
         review: value.review,
         refresh: value.refresh,
         session: value.session === undefined ? undefined : { busy: value.session.busy },
-        pullRequest: value.pullRequest == null ? null : { number: value.pullRequest.number, url: value.pullRequest.url },
+        pullRequest: value.pullRequest == null ? null : parsePullRequest(value.pullRequest),
+        pullRequestStatus: value.pullRequestStatus == null ? null : {
+            checkedAt: value.pullRequestStatus.checkedAt ?? null,
+            error: value.pullRequestStatus.error ?? null,
+            commitsAfterHead: value.pullRequestStatus.commitsAfterHead ?? null,
+        },
         agentReviewAvailable: value.agentReviewAvailable === true,
         reviewSkillsAvailable: value.reviewSkillsAvailable === true,
         agentReviewSuggestedModels: value.agentReviewSuggestedModels ?? [],
@@ -295,6 +333,11 @@ const state = {
     review: null,
     snapshot: null,
     pullRequest: null,
+    pullRequestStatus: null,
+    archived: [],
+    historyDiffs: new Map(),
+    historySelection: new Set(),
+    followingUp: false,
     busy: null,
     connection: "connecting",
     view: { type: "overview" },
@@ -842,6 +885,9 @@ function resetForReview() {
     pruneImages(null);
     state.imageViews.clear();
     state.collapsedDirs = null;
+    state.archived = [];
+    state.historyDiffs.clear();
+    state.historySelection.clear();
     viewRestored = false;
 }
 let loading = null;
@@ -853,13 +899,37 @@ let refreshError = "";
 let serverRefresh;
 let renderedStatusHtml = "";
 let renderedFooterControlsHtml = "";
+// The next state load asks the provider to bypass its cached pull request lookup.
+let pullRequestCheckDue = false;
+let lastPullRequestCheck = 0;
+let quietLoad = false;
+const PULL_REQUEST_POLL_MS = 120_000;
+function checkPullRequest() {
+    if (typeof document.visibilityState === "string" && document.visibilityState === "hidden")
+        return;
+    pullRequestCheckDue = true;
+    if (loading || reloadPending) {
+        if (loading)
+            reloadAgain = true;
+        return;
+    }
+    // A background status check keeps the page as it is instead of flashing the refresh indicator.
+    quietLoad = true;
+    void loadState().catch(() => undefined);
+}
+function archivedIds(review) {
+    return new Set((review?.completions ?? []).flatMap((c) => c.archivedThreadIds));
+}
+const latestCompletion = () => state.review?.completions?.at(-1) ?? null;
+const findAnyThread = (threadId) => state.review?.threads.find((t) => t.threadId === threadId)
+    ?? state.archived.find((t) => t.threadId === threadId);
 function renderLoadStatus() {
     const status = $("#review-status");
     const footerControls = $("#review-status-controls");
     if (!status || !footerControls)
         return;
     const refreshFailure = refreshError || (serverRefresh?.status === "error" ? serverRefresh.error : "");
-    const pending = Boolean(loading) || reloadPending || refreshing || (!loadError && !refreshFailure && serverRefresh?.status === "refreshing");
+    const pending = (Boolean(loading) && !quietLoad) || reloadPending || refreshing || (!loadError && !refreshFailure && serverRefresh?.status === "refreshing");
     const error = loadError || refreshFailure;
     const failureLabel = loadError ? "Could not load the current review" : "Could not refresh from the working tree";
     const errorText = error.trim();
@@ -907,7 +977,11 @@ async function loadState() {
     loading = Promise.resolve().then(async () => {
         do {
             reloadAgain = false;
-            const data = parseState(await api("GET", "state"));
+            const checkPullRequest = pullRequestCheckDue;
+            pullRequestCheckDue = false;
+            const data = parseState(await api("GET", checkPullRequest ? "state?pullRequest=refresh" : "state"));
+            if (checkPullRequest)
+                lastPullRequestCheck = Date.now();
             const rev = data.review.currentRevisionId;
             const snapshot = !rev ? null : state.review?.reviewId !== data.review.reviewId || state.snapshot?.revisionId !== rev
                 ? parseSnapshot(await api("GET", `snapshot/${rev}`)) : state.snapshot;
@@ -922,6 +996,13 @@ async function loadState() {
             else if (state.review && state.review.currentRevisionId !== data.review.currentRevisionId)
                 pinComposers();
             state.review = data.review;
+            const archived = archivedIds(data.review);
+            state.archived = data.review.threads.filter((t) => archived.has(t.threadId));
+            if (archived.size)
+                state.review.threads = data.review.threads.filter((t) => !archived.has(t.threadId));
+            for (const id of state.historySelection)
+                if (!archived.has(id))
+                    state.historySelection.delete(id);
             state.extensionVersion = data.extensionVersion;
             if (reviewChanged)
                 restorePinnedComposers(data.review.reviewId);
@@ -932,6 +1013,7 @@ async function loadState() {
             refreshError = "";
             state.reviewSkillsAvailable = data.reviewSkillsAvailable === true;
             state.pullRequest = data.pullRequest ?? null;
+            state.pullRequestStatus = data.pullRequestStatus ?? null;
             const settingsState = settingsApi.readState(data.settingsPayload);
             state.settings = settingsState.settings;
             state.agentReviewAvailable = data.agentReviewAvailable;
@@ -951,6 +1033,7 @@ async function loadState() {
         const retryQueued = reloadAgain;
         reloadAgain = false;
         loading = null;
+        quietLoad = false;
         renderLoadStatus();
         if (retryQueued)
             scheduleReload();
@@ -961,6 +1044,7 @@ async function loadState() {
 let reloadTimer;
 function scheduleReload() {
     reloadPending = true;
+    quietLoad = false;
     renderLoadStatus();
     clearTimeout(reloadTimer);
     if (loading) {
@@ -975,6 +1059,7 @@ async function refreshReview() {
     refreshing = true;
     loadError = "";
     refreshError = "";
+    pullRequestCheckDue = true;
     renderLoadStatus();
     try {
         await api("POST", "refresh", {});
@@ -1062,7 +1147,7 @@ function restoreView() {
     viewRestored = true;
     try {
         const value = JSON.parse(sessionStorage.getItem(`sr:${state.review.reviewId}:view`) ?? "null");
-        if (isView(value))
+        if (isView(value) && (value.type !== "history" || latestCompletion()))
             state.view = value;
     }
     catch { /* ignore */ }
@@ -1314,6 +1399,58 @@ function reviewSettingsMenuHtml() {
         ? `<details class="review-settings-menu"><summary title="Configure review settings">Settings</summary><div class="review-settings-options" role="group" aria-label="Review settings">${settings.join("")}</div></details>`
         : "";
 }
+function prLink(pr, className, label, title) {
+    return `<a class="pill pr-link ${className}" href="${esc(pr.url)}" target="_blank" rel="noopener noreferrer" title="${esc(title)}">${esc(label)}</a>`;
+}
+function completedLabel(pr) {
+    return `Completed · PR #${pr.number} merged${pr.baseRefName ? ` into ${pr.baseRefName}` : ""}${pr.mergedAt ? ` · ${ago(pr.mergedAt)}` : ""}`;
+}
+const mergedTitle = (pr) => `Pull request #${pr.number} merged${pr.mergedAt ? ` ${new Date(pr.mergedAt).toLocaleString()}` : ""}. Open it in the browser.`;
+// A failed lookup keeps the last known pull request but never reports a completion it did not observe.
+function pullRequestPills(r, scope) {
+    const completion = r.completions?.at(-1)?.pullRequest ?? null;
+    const pr = state.pullRequest;
+    const status = state.pullRequestStatus;
+    const error = status?.error ?? null;
+    const checked = status?.checkedAt ? `Last successful check: ${new Date(status.checkedAt).toLocaleString()}.` : "No successful check yet.";
+    const staleTitle = `Could not check the pull request on GitHub: ${error ?? ""} ${checked}`;
+    const heading = [];
+    if (completion)
+        heading.push(prLink(completion, "pr-completed", completedLabel(completion), mergedTitle(completion)));
+    const current = pr && pr.number !== completion?.number ? pr : null;
+    if (current && error) {
+        heading.push(prLink(current, "pr-stale warn", `PR #${current.number} · status may be stale`, `Last known state: ${current.state}. ${staleTitle}`));
+    }
+    else if (current?.state === "open") {
+        heading.push(prLink(current, "pr-open", `PR #${current.number} · Awaiting merge`, `Pull request #${current.number} is open and has not merged yet. Open it in the browser.`));
+    }
+    else if (current?.state === "merged") {
+        heading.push(prLink(current, "pr-completed", completedLabel(current), mergedTitle(current)));
+    }
+    else if (current) {
+        heading.push(prLink(current, "pr-closed", `PR #${current.number} closed without merging`, `Pull request #${current.number} was closed without merging. This review stays active.`));
+    }
+    else if (error) {
+        heading.push(`<span class="pill ${completion ? "warn" : "muted"} pr-stale" title="${esc(staleTitle)}">${completion ? "PR status may be stale" : "PR status unknown"}</span>`);
+    }
+    let localWork = null;
+    const open = pr?.state === "open" && pr.number !== completion?.number ? pr : null;
+    const delivered = open ? null : completion ?? (pr?.state === "merged" ? pr : null);
+    const reference = open ?? delivered;
+    if (scope === "all" && reference) {
+        const commits = pr?.number === reference.number ? status?.commitsAfterHead ?? null : null;
+        const uncommitted = r.git?.uncommittedFiles ?? 0;
+        const counts = [
+            commits ? `${commits} ${commits === 1 ? "commit" : "commits"}` : "",
+            uncommitted ? `${uncommitted} uncommitted` : "",
+        ].filter(Boolean).join(" · ");
+        const title = open
+            ? `Local work that pull request #${open.number} does not contain yet. All changes shows the pull request together with this work.`
+            : `Work added after pull request #${reference.number}. It stays active in All changes.`;
+        localWork = counts ? `<span class="pill warn local-work" title="${esc(title)}">${open ? "Not in" : "After"} PR #${reference.number}: ${counts}</span>` : "";
+    }
+    return { heading: heading.join(""), localWork };
+}
 function renderTop() {
     const r = state.review;
     if (!r)
@@ -1342,13 +1479,16 @@ function renderTop() {
     // The host reports the owning conversation as busy even when it is handling something other than these comments.
     const commentsActive = running || ready || applying;
     const branch = `<span class="pill mono" title="HEAD ${esc(git.headCommit ?? "")}">${esc(r.branch ?? "?")}</span>`;
+    const prStatus = pullRequestPills(r, scope);
+    const separated = scope === "all" && git.delivered?.separation === "separated";
     const parts = [
         `<section class="change-context" role="group" aria-label="Change context">`,
         `<div class="change-context-heading"><span class="title">${esc(r.title)}</span>${branch}`,
-        scope === "all" ? `<span class="muted">vs</span><span class="pill mono" title="merge-base ${esc(git.baseCommit ?? "")}">${esc(r.base)}</span>`
-            : `<span class="muted">uncommitted changes only</span>`,
+        separated ? `<span class="muted">vs</span><span class="pill mono" title="Showing work after pull request #${git.delivered.pullRequestNumber}'s head ${esc(git.baseCommit ?? "")}. Its delivered changes are in Review history.">PR #${git.delivered.pullRequestNumber} head</span>`
+            : scope === "all" ? `<span class="muted">vs</span><span class="pill mono" title="merge-base ${esc(git.baseCommit ?? "")}">${esc(r.base)}</span>`
+                : `<span class="muted">uncommitted changes only</span>`,
         rev ? `<span class="pill" title="Revision captured ${esc(rev.createdAt)}">${esc(rev.revisionId)} · ${rev.files} files · <span class="add">+${rev.additions}</span> <span class="del">−${rev.deletions}</span></span>` : "",
-        state.pullRequest ? `<a class="pill pr-link" href="${esc(state.pullRequest.url)}" target="_blank" rel="noopener noreferrer" title="Open pull request #${esc(state.pullRequest.number)} in browser">Open PR #${esc(state.pullRequest.number)}</a>` : "",
+        prStatus.heading,
         `</div><div class="change-context-details">`,
     ];
     if (scope === "all") {
@@ -1361,8 +1501,13 @@ function renderTop() {
         }
         else if (git.branch)
             parts.push(`<span class="pill warn">no upstream</span>`);
-        if (git.uncommittedFiles)
+        if (prStatus.localWork !== null)
+            parts.push(prStatus.localWork);
+        else if (git.uncommittedFiles)
             parts.push(`<span class="pill warn" title="Diff includes working-tree changes">${git.uncommittedFiles} uncommitted</span>`);
+        if (git.delivered?.separation === "unavailable") {
+            parts.push(`<span class="pill warn" title="The head commit of pull request #${git.delivered.pullRequestNumber} is not in this clone, so All changes still includes what it delivered. Fetch the pull request head, then Refresh.">Delivered changes not separated</span>`);
+        }
     }
     if (limit > 1)
         parts.push(`<button type="button" class="pill" data-action="configure-parallelism" aria-haspopup="dialog" title="Change how many comments are analyzed together in this repository">Parallelism: ${limit}</button>`);
@@ -1764,7 +1909,7 @@ function agentReviewsHtml() {
                 else {
                     const counts = {};
                     for (const id of result.threadIds) {
-                        const assessment = review?.threads.find((t) => t.threadId === id)?.agentReview?.assessment;
+                        const assessment = findAnyThread(id)?.agentReview?.assessment;
                         const key = typeof assessment === "string" && Object.hasOwn(FINDING_ASSESSMENTS, assessment) ? assessment : "unverified";
                         counts[key] = (counts[key] ?? 0) + 1;
                     }
@@ -1975,11 +2120,13 @@ function renderSide() {
         return;
     const files = state.snapshot?.files ?? [];
     const v = state.view;
+    const completion = latestCompletion();
     const overviewCount = r.threads.filter((t) => t.status === "active" && (t.kind === "overview" || !isPlaced(t))).length;
     const html = [
         `<div class="nav-item${v.type === "overview" ? " active" : ""}" data-action="nav" data-view="overview"><span class="name">Overview</span><span class="count${overviewCount ? "" : " zero"}">${overviewCount}</span></div>`,
         ...(state.agentReviewAvailable || agentComments().length ? [`<div class="nav-item${v.type === "agent-comments" ? " active" : ""}" data-action="nav" data-view="agent-comments"><span class="count" title="Agent findings in this scope, across all revisions; excludes replies and manual threads">${agentComments().length}</span><span class="name">Agent reviews</span></div>`] : []),
         `<div class="nav-item${v.type === "lessons" ? " active" : ""}" data-action="nav" data-view="lessons"><span class="name">Lessons learned</span><span class="muted">${r.lessons.length}</span></div>`,
+        ...(completion ? [`<div class="nav-item history-nav${v.type === "history" ? " active" : ""}" data-action="nav" data-view="history" title="Review history: the diff and comments pull request #${completion.pullRequest.number} delivered"><span class="name">Delivered in PR #${completion.pullRequest.number}</span><span class="muted" title="Comments moved to history">${state.archived.length}</span></div>`] : []),
         `<div class="section">Files (${files.length})</div>`,
         `<div class="tree-scope">${scopeToggleHtml(scopeOf(r))}</div>`,
     ];
@@ -1989,7 +2136,8 @@ function renderSide() {
         html.push(`</div>`);
     }
     else if (state.snapshot) {
-        html.push(`<div class="side-empty">${scopeOf(r) === "pending" ? "No uncommitted changes." : "No changes against the base."}</div>`);
+        const after = scopeOf(r) === "all" && r.git?.delivered?.separation === "separated" ? r.git.delivered.pullRequestNumber : null;
+        html.push(`<div class="side-empty">${scopeOf(r) === "pending" ? "No uncommitted changes." : after ? `No changes after PR #${after}.` : "No changes against the base."}</div>`);
     }
     requiredElement("#side").innerHTML = html.join("");
 }
@@ -2013,7 +2161,20 @@ function renderMain() {
         }
         state.view = { type: "overview" };
     }
-    main.innerHTML = state.view.type === "lessons" ? lessonsView() : state.view.type === "agent-comments" ? agentCommentsView() : overviewView();
+    if (state.view.type === "history" && !latestCompletion())
+        state.view = { type: "overview" };
+    // Background renders rebuild the history DOM; keep delivered files the reviewer expanded or focused.
+    const openFiles = new Set(Array.from(main.querySelectorAll("details.history-file[open]"), (d) => d.dataset.historyKey));
+    const focused = document.activeElement?.closest("details.history-file");
+    const focusedKey = focused && main.contains(focused) ? focused.dataset.historyKey : undefined;
+    main.innerHTML = state.view.type === "lessons" ? lessonsView() : state.view.type === "agent-comments" ? agentCommentsView()
+        : state.view.type === "history" ? historyView() : overviewView();
+    for (const details of Array.from(main.querySelectorAll("details.history-file"))) {
+        if (openFiles.has(details.dataset.historyKey))
+            details.open = true;
+        if (focusedKey && details.dataset.historyKey === focusedKey)
+            details.querySelector("summary")?.focus();
+    }
 }
 const pinnedComposers = new Map();
 const composerContexts = new Map();
@@ -2194,7 +2355,7 @@ function mappingForPath(reviewedPath) {
 function reviewedPathForLesson(lesson) {
     if (lesson.reviewedPath !== undefined)
         return lesson.reviewedPath;
-    const thread = state.review?.threads.find((item) => item.threadId === lesson.threadId);
+    const thread = findAnyThread(lesson.threadId);
     if (thread?.kind === "overview")
         return "";
     return thread?.location?.path ?? thread?.anchor?.path;
@@ -2525,7 +2686,126 @@ function emptyDiffHtml() {
         return `<div class="card empty-diff"><strong>No uncommitted changes.</strong> The working tree matches HEAD, so there is nothing to review in this scope.`
             + ` <button data-action="scope" data-scope="all">Switch to All changes</button></div>`;
     }
+    const delivered = state.review?.git?.delivered;
+    if (delivered?.separation === "separated") {
+        return `<div class="card empty-diff"><strong>No changes after PR #${delivered.pullRequestNumber}.</strong> Everything on this branch was delivered by the merged pull request.`
+            + ` <button data-action="nav" data-view="history">Open review history</button></div>`;
+    }
     return `<div class="card empty-diff"><strong>No changes to review.</strong> Nothing differs from ${esc(state.review?.base)}.</div>`;
+}
+const DISPOSITIONS = { active: "Unresolved", resolved: "Resolved", wontfix: "Won't fix", closed: "Closed" };
+function historyMessageHtml(m) {
+    const agent = m.author === "agent";
+    return `<div class="msg" data-message-id="${esc(m.messageId)}">`
+        + `<div class="msg-head"><span class="avatar${agent ? " agent" : ""}">${agent ? "AI" : "Me"}</span>`
+        + `<span class="who">${agent ? "Copilot" : "You"}</span><span class="when" title="${esc(m.createdAt)}">${esc(ago(m.createdAt))}</span>`
+        + (agent && m.outcome ? `<span class="outcome ${esc(m.outcome)}">${esc(m.outcome)}</span>` : "")
+        + (m.delivery?.state === "draft" ? `<span class="badge" title="This draft was held and never sent to Copilot">Draft, never sent</span>` : "")
+        + `</div>${md(m.body)}${imagesHtml(m.imageIds ?? [])}`
+        + (m.verification ? `<div class="verification">Verification: ${inline(m.verification)}</div>` : "")
+        + `</div>`;
+}
+// Read-only: history keeps each thread exactly as it was, so there is no status control or reply box.
+function archivedThreadHtml(t) {
+    const followUps = state.review?.threads.filter((f) => f.followUpOf === t.threadId).length ?? 0;
+    return `<div class="thread archived" data-thread-id="${esc(t.threadId)}"><div class="thread-head">`
+        + `<input type="checkbox" data-action="history-select" data-thread="${esc(t.threadId)}" aria-label="${esc(`Select ${locLabel(t)} for follow-up`)}"${state.historySelection.has(t.threadId) ? " checked" : ""}>`
+        + `<span class="badge kind">${esc(t.kind)}</span>`
+        + (t.agentReview ? `<span class="badge">${esc(t.agentReview.category)}</span>` : "")
+        + `<span class="loc">${esc(locLabel(t))}</span>`
+        + `<span class="badge st-${esc(t.status)}" title="Status when the pull request merged. Moving to history does not change it.">${DISPOSITIONS[t.status]}</span>`
+        + (followUps ? `<span class="badge" title="Carried into the current work with Start follow-up">Followed up</span>` : "")
+        + `</div><div class="thread-body">${t.messages.map(historyMessageHtml).join("")}</div></div>`;
+}
+function historyDiff(revisionId) {
+    const known = state.historyDiffs.get(revisionId);
+    if (known)
+        return known;
+    const loading = { status: "loading" };
+    state.historyDiffs.set(revisionId, loading);
+    const reviewId = state.review?.reviewId;
+    void api("GET", `snapshot/${encodeURIComponent(revisionId)}`).then((value) => ({ status: "ready", snapshot: parseSnapshot(value) }), (error) => ({ status: "failed", error: errorMessage(error) })).then((entry) => {
+        if (state.review?.reviewId !== reviewId)
+            return;
+        state.historyDiffs.set(revisionId, entry);
+        if (state.view.type === "history")
+            render();
+    });
+    return loading;
+}
+function historyFileHtml(revisionId, file) {
+    const prefix = { add: "+", del: "-", ctx: " " };
+    const body = file.binary || !file.hunks.length
+        ? `<div class="muted history-note">${esc(file.note ?? (file.binary ? "Binary file" : "No textual changes"))}</div>`
+        : file.hunks.map((hunk) => (hunk.gap ? "" : `<div class="hunk-head"><span class="h">${esc(hunk.header ?? "")}</span></div>`)
+            + `<table class="rows"><colgroup><col style="width:52px"><col style="width:52px"><col></colgroup><tbody>`
+            + hunk.rows.map((row) => `<tr class="row ${row.t}"><td class="ln">${row.o ?? ""}</td><td class="ln">${row.n ?? ""}</td>`
+                + `<td class="code" data-p="${prefix[row.t]}">${esc(row.s)}</td></tr>`).join("")
+            + `</tbody></table>`).join("");
+    const name = file.oldPath && file.oldPath !== file.path ? `${file.oldPath} → ${file.path}` : file.path;
+    return `<details class="history-file" data-history-key="${esc(`${revisionId}\n${file.path}`)}"><summary><span class="badge">${STATUS_LETTER[file.status] ?? "M"}</span><span class="mono">${esc(name)}</span>`
+        + `<span class="add">+${file.additions}</span><span class="del">−${file.deletions}</span></summary><div class="diff">${body}</div></details>`;
+}
+function historySectionHtml(completion) {
+    const pr = completion.pullRequest;
+    const ids = new Set(completion.archivedThreadIds);
+    const threads = state.archived.filter((t) => ids.has(t.threadId));
+    const unresolved = threads.filter((t) => t.status === "active").length;
+    const merged = pr.mergedAt ? new Date(pr.mergedAt).toLocaleString() : "";
+    const diff = completion.deliveredRevisionId ? historyDiff(completion.deliveredRevisionId) : null;
+    const diffHtml = !diff ? `<p class="muted">No diff was captured before this pull request merged.</p>`
+        : diff.status === "loading" ? `<p class="muted">Loading the delivered diff...</p>`
+            : diff.status === "failed" ? `<p class="del">Could not load the delivered diff: ${esc(diff.error)}</p>`
+                : diff.snapshot.files.length ? diff.snapshot.files.map((file) => historyFileHtml(completion.deliveredRevisionId, file)).join("")
+                    : `<p class="muted">The last revision before the merge had no changes.</p>`;
+    return `<section class="history-section" aria-label="Delivered in pull request ${pr.number}">`
+        + `<div class="card history-summary"><strong>Completed · <a href="${esc(pr.url)}" target="_blank" rel="noopener noreferrer">PR #${pr.number}</a> merged${pr.baseRefName ? ` into ${esc(pr.baseRefName)}` : ""}</strong>`
+        + (merged ? ` <span class="muted" title="${esc(pr.mergedAt)}">${esc(merged)}</span>` : "")
+        + `<p class="muted">This is review history. The comments below keep the status they had when the pull request merged; moving them here does not mean a finding was fixed.`
+        + `${unresolved ? ` ${unresolved} ${unresolved === 1 ? "was" : "were"} still unresolved.` : ""} Select comments and use Start follow-up to continue them as new draft comments in the current work.</p></div>`
+        + `<h3>Comments (${threads.length})</h3>`
+        + (threads.length ? threads.map(archivedThreadHtml).join("") : `<p class="muted">No comments existed when this pull request merged.</p>`)
+        + `<h3 title="${esc(completion.deliveredRevisionId ? `Revision ${completion.deliveredRevisionId}` : "")}">Delivered diff</h3>`
+        + `<p class="muted">The last revision this review captured before the merge${completion.deliveredRevisionId ? ` (${esc(completion.deliveredRevisionId)})` : ""}. Read-only.</p>`
+        + diffHtml
+        + `</section>`;
+}
+function followUpButtonHtml() {
+    const selected = state.historySelection.size;
+    return `<button class="primary" data-action="start-follow-up" title="Create draft comments in the current work that quote the selected comments. Nothing is sent until you send or submit them."${selected && !state.followingUp ? "" : " disabled"}>`
+        + `${state.followingUp ? "Starting follow-up..." : `Start follow-up${selected ? ` (${selected})` : ""}`}</button>`;
+}
+function renderFollowUpButton() {
+    const button = document.querySelector(`[data-action="start-follow-up"]`);
+    if (button)
+        button.outerHTML = followUpButtonHtml();
+}
+async function startFollowUp() {
+    const threadIds = [...state.historySelection];
+    if (!threadIds.length || state.followingUp)
+        return;
+    state.followingUp = true;
+    renderFollowUpButton();
+    try {
+        const res = await api("POST", "follow-up", { threadIds });
+        const created = isRecord(res) && isStringArray(res.threadIds) ? res.threadIds.length : 0;
+        state.historySelection.clear();
+        toast(`Started ${created} follow-up ${created === 1 ? "draft" : "drafts"}. Send ${created === 1 ? "it" : "them"} when ready.`);
+    }
+    catch (error) {
+        toast(errorMessage(error), true);
+    }
+    finally {
+        state.followingUp = false;
+        await loadState().catch(() => undefined);
+    }
+}
+function historyView() {
+    const completions = [...(state.review?.completions ?? [])].reverse();
+    return `<div class="history-view"><div class="history-actions">`
+        + `<h2>Review history</h2><span class="spacer"></span>${followUpButtonHtml()}</div>`
+        + completions.map(historySectionHtml).join("")
+        + `</div>`;
 }
 function overviewView() {
     const r = state.review;
@@ -2919,8 +3199,14 @@ function jumpToThread(threadId) {
     if (!review)
         return;
     const t = review.threads.find((x) => x.threadId === threadId);
-    if (!t)
+    if (!t) {
+        if (state.archived.some((x) => x.threadId === threadId)) {
+            navigate({ type: "history" });
+            state.pendingJump = threadId;
+            revealPendingJump();
+        }
         return;
+    }
     state.collapsedThreads.delete(threadId);
     if (t.status !== "active" || t.location?.state === "outdated")
         state.expanded.add(threadId);
@@ -3167,7 +3453,7 @@ async function onClick(e) {
                 else {
                     if (view === "file" || view === "folder")
                         navigate({ type: view, path });
-                    else if (view === "overview" || view === "lessons" || view === "agent-comments")
+                    else if (view === "overview" || view === "lessons" || view === "agent-comments" || view === "history")
                         navigate({ type: view });
                 }
                 break;
@@ -3306,6 +3592,18 @@ async function onClick(e) {
             }
             case "jump":
                 jumpToThread(value("thread"));
+                break;
+            case "history-select":
+                if (target instanceof HTMLInputElement) {
+                    if (target.checked)
+                        state.historySelection.add(value("thread"));
+                    else
+                        state.historySelection.delete(value("thread"));
+                    renderFollowUpButton();
+                }
+                break;
+            case "start-follow-up":
+                await startFollowUp();
                 break;
             case "scope":
                 {
@@ -3835,6 +4133,15 @@ setInterval(() => {
     else
         render();
 }, 30000);
+// Pull request state changes on GitHub without any local event, so poll it while the canvas is on screen.
+setInterval(() => {
+    if (state.review)
+        checkPullRequest();
+}, PULL_REQUEST_POLL_MS);
+document.addEventListener("visibilitychange", () => {
+    if (state.review && Date.now() - lastPullRequestCheck >= PULL_REQUEST_POLL_MS)
+        checkPullRequest();
+});
 if (!TOKEN) {
     requiredElement("#top").innerHTML = `<span class="del">Missing access token. Reopen the canvas.</span>`;
 }

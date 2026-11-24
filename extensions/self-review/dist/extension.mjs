@@ -8,7 +8,7 @@ import { readFile, stat } from "node:fs/promises";
 import { joinSession, createCanvas, CanvasError } from "@github/copilot-sdk/extension";
 import { Store, migrateLegacyDataRoot } from "./lib/store.mjs";
 import { parseExtensionVersion } from "./lib/extension-version.mjs";
-import { ReviewService, ReviewError, THREAD_KINDS, THREAD_STATUSES, OUTCOMES, LESSON_STATUSES, SCOPES } from "./lib/review-service.mjs";
+import { ReviewService, ReviewError, archivedThreadIds, THREAD_KINDS, THREAD_STATUSES, OUTCOMES, LESSON_STATUSES, SCOPES } from "./lib/review-service.mjs";
 import { SettingsService } from "./lib/settings.mjs";
 import { Delivery } from "./lib/delivery.mjs";
 import { AgentReview, REVIEW_FOCUSES, FINDING_ASSESSMENTS, FINDING_SEVERITIES, EVIDENCE_FIELDS, FUSION_REVIEWER } from "./lib/agent-review.mjs";
@@ -200,7 +200,8 @@ async function openReview(ctx) {
     if (!entry.server)
         throw new Error(`Review server for ${ctx.instanceId} did not start.`);
     const review = await service.getReview(reviewId);
-    const active = review.threads.filter((t) => t.status === "active").length;
+    const archived = archivedThreadIds(review);
+    const active = review.threads.filter((t) => t.status === "active" && !archived.has(t.threadId)).length;
     return {
         title: `Review: ${review.title}`,
         url: entry.server.url,

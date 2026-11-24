@@ -227,6 +227,11 @@ button:focus-visible { outline: 2px solid var(--color-focus-outline, var(--mr-ac
 .pill.warn { border-color: var(--mr-yellow); color: var(--mr-yellow); }
 a.pill { color: var(--mr-accent); text-decoration: none; }
 a.pill:hover { text-decoration: underline; }
+a.pill.pr-completed { border-color: var(--mr-green); color: var(--mr-green); }
+a.pill.pr-open { border-color: var(--mr-accent); }
+a.pill.pr-closed { color: var(--mr-muted); }
+a.pill.warn, .pill.pr-stale { color: var(--mr-yellow); }
+.pill.muted { color: var(--mr-muted); }
 .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; display: inline-block; }
 .pill.busy .dot { animation: pulse 1.2s infinite; }
 @keyframes pulse { 50% { opacity: 0.25; } }
@@ -492,6 +497,7 @@ tr.inline > td { padding: 6px 10px 8px 90px; background: var(--mr-bg); border-to
 .badge.outdated { border-color: var(--mr-yellow); color: var(--mr-yellow); }
 .badge.st-resolved, .badge.st-closed { border-color: var(--mr-green); color: var(--mr-green); }
 .badge.st-wontfix { color: var(--mr-muted); }
+.badge.st-active { border-color: var(--mr-yellow); color: var(--mr-yellow); }
 .original { margin: 8px 10px 0; }
 .original pre { margin: 4px 0 0; }
 
@@ -639,6 +645,18 @@ table.lessons-table th { color: var(--mr-muted); font-weight: 600; font-size: 0.
 
 .empty-diff { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
 #side .side-empty { padding: 4px 12px 8px; color: var(--mr-muted); }
+
+/* Review history: what a merged pull request delivered, read-only. */
+.history-actions { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+.history-actions h2 { margin: 0; font-size: 1.15em; }
+.history-actions .spacer { flex: 1; }
+.history-summary p { margin: 6px 0 0; }
+.history-section h3 { font-size: 1em; margin: 16px 0 8px; }
+.thread.archived .thread-head input[type="checkbox"] { margin: 0; }
+.history-file { border: 1px solid var(--mr-border); border-radius: var(--mr-radius); margin-bottom: 8px; }
+.history-file > summary { display: flex; align-items: center; gap: 8px; padding: 6px 10px; cursor: pointer; background: var(--mr-subtle); }
+.history-file > summary .mono { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.history-file .history-note { padding: 6px 10px; }
 
 /* First-use notice asking how to learn from review feedback, and the per-review delivery question. */
 #banner {

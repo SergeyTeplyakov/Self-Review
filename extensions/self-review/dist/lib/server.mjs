@@ -11,7 +11,7 @@ import { isRecord } from "../web/contracts.mjs";
 import { SCOPES } from "./review-service.mjs";
 import { SUGGESTED_REVIEWERS } from "./agent-review.mjs";
 import { resolveDelivery } from "./settings.mjs";
-import { findOpenPullRequest } from "./pull-request.mjs";
+import { findPullRequest as findBranchPullRequest } from "./pull-request.mjs";
 import { SettingsHttp, HttpError } from "./settings-http.mjs";
 import { ReviewWatcher } from "./review-watcher.mjs";
 import { MAX_IMAGE_BYTES, readCommentImage, saveCommentImage } from "./comment-images.mjs";
@@ -130,12 +130,13 @@ function openInDefaultBrowser(url) {
         });
     });
 }
-export async function startReviewServer({ instanceId, getReviewId, service, delivery, webRoot, extensionVersion, log = () => { }, settings, onReviewChange, agentReview, reviewSkills, findPullRequest = findOpenPullRequest, openCommentLink = openInDefaultBrowser, revealFile = revealInFileManager, }) {
+export async function startReviewServer({ instanceId, getReviewId, service, delivery, webRoot, extensionVersion, log = () => { }, settings, onReviewChange, agentReview, reviewSkills, findPullRequest = findBranchPullRequest, openCommentLink = openInDefaultBrowser, revealFile = revealInFileManager, }) {
     const settingsHttp = new SettingsHttp(settings, log);
     const reviewWatcher = new ReviewWatcher(service, log);
     const token = randomBytes(24).toString("base64url");
     const clients = new Set();
     const pullRequestCache = new Map();
+    const commitsAfterCache = new Map();
     let port = 0;
     const broadcast = (event, data) => {
         const frame = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
@@ -189,26 +190,50 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
             service.setDelivery(reviewId, messageId, { state: "failed", error: errorMessage(err) }).catch(() => { });
         });
     };
-    async function readPullRequest(review) {
+    async function readPullRequest(review, force) {
         const branch = review.branch;
         if (!branch)
             return null;
         const key = `${review.repoRoot}\0${branch}`;
-        const cached = pullRequestCache.get(key);
-        if (cached && cached.expiresAt > Date.now())
-            return "promise" in cached ? cached.promise : cached.value;
-        const promise = Promise.resolve()
-            .then(() => findPullRequest(review.repoRoot, branch))
-            .catch((error) => {
-            log(`self-review: could not discover an open pull request: ${errorMessage(error)}`, "warning");
-            return null;
-        })
-            .then((value) => {
-            pullRequestCache.set(key, { value, expiresAt: Date.now() + PULL_REQUEST_CACHE_MS });
-            return value;
+        let entry = pullRequestCache.get(key);
+        if (!entry)
+            pullRequestCache.set(key, entry = { value: null, checkedAt: null, error: null, expiresAt: 0 });
+        if (!entry.promise && (force || entry.expiresAt <= Date.now())) {
+            const next = entry;
+            next.promise = Promise.resolve()
+                .then(() => findPullRequest(review.repoRoot, branch))
+                .then((value) => {
+                Object.assign(next, { value, checkedAt: new Date().toISOString(), error: null });
+            }, (error) => {
+                log(`self-review: could not check the pull request: ${errorMessage(error)}`, "warning");
+                next.error = errorMessage(error);
+            })
+                .finally(() => {
+                next.expiresAt = Date.now() + PULL_REQUEST_CACHE_MS;
+                delete next.promise;
+            });
+        }
+        await entry.promise;
+        const commitsAfterHead = entry.value?.headRefOid && entry.value.state !== "closed"
+            ? await commitsAfterPullRequest(review, entry.value.headRefOid)
+            : null;
+        return { pullRequest: entry.value, status: { checkedAt: entry.checkedAt, error: entry.error, commitsAfterHead } };
+    }
+    // Counted once per pull request head and local HEAD. An unavailable count is not kept, so a transient git failure only hides it until the next check.
+    async function commitsAfterPullRequest(review, headRefOid) {
+        const key = `${review.repoRoot}\0${headRefOid}\0${review.git?.headCommit ?? ""}`;
+        const cached = commitsAfterCache.get(key);
+        if (cached)
+            return cached;
+        if (commitsAfterCache.size > 50)
+            commitsAfterCache.clear();
+        const counting = service.git.commitsAfter(review.repoRoot, headRefOid).catch(() => null);
+        commitsAfterCache.set(key, counting);
+        void counting.then((count) => {
+            if (count === null && commitsAfterCache.get(key) === counting)
+                commitsAfterCache.delete(key);
         });
-        pullRequestCache.set(key, { promise, expiresAt: Infinity });
-        return promise;
+        return counting;
     }
     // An explicit draft flag wins; otherwise the repository's delivery mode decides, and an undecided ask-mode review holds.
     async function shouldHold(reviewId, draft) {
@@ -259,16 +284,25 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
             }
             if (parts[0] === "state" && parts.length === 1) {
                 const initial = await service.getReview(reviewId);
-                const [pullRequest, settingsState] = await Promise.all([readPullRequest(initial), settingsHttp.read(initial.repoRoot)]);
+                const [lookup, settingsState] = await Promise.all([
+                    readPullRequest(initial, url.searchParams.get("pullRequest") === "refresh"),
+                    settingsHttp.read(initial.repoRoot),
+                ]);
                 // PR discovery can outlive a scope/branch change; pair it only with the review it describes.
-                const review = await service.getReview(reviewId);
-                const currentPullRequest = initial.repoRoot === review.repoRoot && initial.branch === review.branch ? pullRequest : null;
+                let review = await service.getReview(reviewId);
+                const current = lookup && initial.repoRoot === review.repoRoot && initial.branch === review.branch ? lookup : null;
+                // Only a successful lookup may complete a review; a failed one leaves the last known state marked stale.
+                if (current?.pullRequest?.state === "merged" && !current.status.error
+                    && await service.recordCompletion(reviewId, current.pullRequest, initial.branch)) {
+                    review = await service.getReview(reviewId);
+                }
                 return send(res, 200, {
                     instanceId,
                     review,
                     refresh: service.refreshState(reviewId),
                     session: { busy: delivery.busy },
-                    pullRequest: currentPullRequest,
+                    pullRequest: current?.pullRequest ?? null,
+                    pullRequestStatus: current?.status ?? null,
                     agentReviewAvailable: Boolean(agentReview),
                     reviewSkillsAvailable: Boolean(reviewSkills),
                     agentReviewSuggestedModels: SUGGESTED_REVIEWERS,
@@ -409,6 +443,12 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
         if (parts[0] === "threads" && parts.length === 3 && parts[2] === "status") {
             const thread = await service.setThreadStatus(reviewId, parts[1], body.status);
             return send(res, 200, { threadId: thread.threadId, status: thread.status });
+        }
+        if (parts[0] === "follow-up" && parts.length === 1) {
+            if (pageReview !== reviewId)
+                throw new HttpError(409, "conflict", "Refresh the canvas before starting a follow-up.");
+            const threads = await service.startFollowUp(reviewId, body.threadIds);
+            return send(res, 200, { threadIds: threads.map((t) => t.threadId) });
         }
         if (parts[0] === "messages" && parts.length === 3 && parts[2] === "retry") {
             const { thread, message } = await service.findMessage(reviewId, parts[1]);

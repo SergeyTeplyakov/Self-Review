@@ -1,6 +1,6 @@
 // Coordinates opt-in reviews through the owning conversation, using its subagents, Fusion child sessions, and permissions.
 import { createHash, randomUUID } from "node:crypto";
-import { ReviewError, isRetiredCommitReview, retiredCommitError } from "./review-service.mjs";
+import { ReviewError, assertNotArchived, isRetiredCommitReview, retiredCommitError } from "./review-service.mjs";
 import { selectedLines } from "./diff.mjs";
 import { reviewOptions, FUSION_REVIEWER, isRecord } from "../web/contracts.mjs";
 export { reviewOptions, REVIEW_FOCUSES, FUSION_REVIEWER, SUGGESTED_REVIEWERS } from "../web/contracts.mjs";
@@ -606,6 +606,7 @@ export class AgentReview {
             const thread = review?.threads.find((t) => t.threadId === threadId);
             if (!review || !thread?.agentReview)
                 throw invalid("Only agent review findings can be approved.");
+            assertNotArchived(review, threadId);
             if (thread.agentReview.approvalMessageId) {
                 return { write: false, value: { threadId, messageId: thread.agentReview.approvalMessageId } };
             }
