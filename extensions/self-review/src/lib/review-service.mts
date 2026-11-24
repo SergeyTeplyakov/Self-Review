@@ -416,6 +416,11 @@ export function assertNotArchived(review: Pick<Review, "completions">, threadId:
     }
 }
 
+// Archived threads cannot be claimed, so a comment handed to the transport (or mid-send) was dispatched before the merge.
+function wasDispatched(delivery: MessageDelivery) {
+    return ["queued", "processing", "no-reply"].includes(delivery.state) || (delivery.state === "saving" && Boolean(delivery.attemptId));
+}
+
 const DISPOSITIONS: Record<string, string> = { active: "unresolved", resolved: "resolved", wontfix: "won't fix", closed: "closed" };
 
 function followUpBody(thread: ReviewThread, pullRequest: PullRequestInfo | undefined) {
@@ -1130,7 +1135,7 @@ export class ReviewService extends EventEmitter {
                 pullRequest,
                 completedAt: nowIso(),
                 archivedThreadIds: review.threads.filter((t) => !archived.has(t.threadId) && beforeMerge(t.createdAt)).map((t) => t.threadId),
-                deliveredRevisionId: delivered?.revisionId ?? review.currentRevisionId,
+                deliveredRevisionId: delivered?.revisionId ?? null,
             });
             return { review, value: true };
         });
@@ -1226,8 +1231,8 @@ export class ReviewService extends EventEmitter {
                 if (target?.delivery?.state === "draft") {
                     throw new ReviewError("conflict", `Message ${input.inReplyTo} is a draft the reviewer has not sent yet; reply after it is delivered.`);
                 }
-                // The agent may still answer a comment sent before the merge; its work is not lost.
-                if (!target?.delivery || target.delivery.state === "replied") assertNotArchived(review, threadId);
+                // The agent may still answer a comment dispatched before the merge; its work is not lost.
+                if (!target?.delivery || !wasDispatched(target.delivery)) assertNotArchived(review, threadId);
                 if (input.parallelAttemptId && (target?.delivery?.attemptId !== input.parallelAttemptId
                     || !target.delivery.parallel || target.delivery.state !== "processing")) {
                     throw new ReviewError("conflict", "This parallel comment attempt is no longer processing.");
@@ -1463,6 +1468,7 @@ export class ReviewService extends EventEmitter {
                 throw new ReviewError("conflict", `Message ${messageId} is not a draft; only drafts can be discarded.`);
             }
             const { thread } = entry;
+            assertNotArchived(review, thread.threadId);
             thread.messages = thread.messages.filter((m) => m !== entry.message);
             const threadRemoved = thread.messages.length === 0;
             if (threadRemoved) review.threads = review.threads.filter((t) => t !== thread);

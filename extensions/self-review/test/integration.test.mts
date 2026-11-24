@@ -994,6 +994,8 @@ test("a merged pull request completes the review: history keeps dispositions, la
     await prDelivery.deliver(prReviewId, inFlight.threadId, inFlight.messages[0].messageId, "merged-pr");
     assert.equal(prompts.length, 1);
     prompts.length = 0;
+    const unsent = (await prService.createThread(prReviewId, { kind: "overview", body: "Never sent", author: "user" })).thread;
+    assert.equal(unsent.messages[0].delivery?.state, "saving");
     const mergedAt = new Date().toISOString();
 
     const open: PullRequestInfo = { number: 5, url: "https://github.com/example/repo/pull/5", state: "open", baseRefName: "main", headRefOid: prHead, mergedAt: null, closedAt: null, mergeCommitOid: null };
@@ -1043,7 +1045,7 @@ test("a merged pull request completes the review: history keeps dispositions, la
     lookup = async () => ({ ...open, state: "merged", mergedAt, closedAt: mergedAt, mergeCommitOid: squash });
     state = await readState();
     const completion = required(state.review.completions?.[0]);
-    assert.deepEqual(completion.archivedThreadIds, [unresolved.threadId, resolved.threadId, inFlight.threadId]);
+    assert.deepEqual(completion.archivedThreadIds, [unresolved.threadId, resolved.threadId, inFlight.threadId, unsent.threadId]);
     assert.equal(completion.deliveredRevisionId, "r1");
     assert.equal(thread(state, unresolved.threadId).status, "active", "archiving does not mark a finding fixed");
     assert.equal(thread(state, resolved.threadId).status, "resolved");
@@ -1066,6 +1068,9 @@ test("a merged pull request completes the review: history keeps dispositions, la
     await assert.rejects(prService.setThreadStatus(prReviewId, unresolved.threadId, "resolved"), archivedError);
     await assert.rejects(prService.addMessage(prReviewId, resolved.threadId, { author: "agent", body: "Done", outcome: "answered" }), archivedError);
     await assert.rejects(prService.claimDelivery(prReviewId, unresolved.threadId, unresolved.messages[0].messageId), archivedError);
+    await assert.rejects(prService.discardDraft(prReviewId, unresolved.messages[0].messageId), archivedError);
+    await assert.rejects(prService.addMessage(prReviewId, unsent.threadId, { author: "agent", body: "Done", outcome: "answered" }), archivedError,
+        "a comment never dispatched before the merge cannot be answered");
     const late = await prService.addMessage(prReviewId, inFlight.threadId, { author: "agent", body: "Renamed it", outcome: "answered" });
     assert.equal(late.thread.messages[0].delivery?.state, "replied", "the agent can still answer a comment sent before the merge");
     await assert.rejects(prService.addMessage(prReviewId, inFlight.threadId, { author: "agent", body: "One more thing", outcome: "answered" }), archivedError);
@@ -1089,4 +1094,10 @@ test("a merged pull request completes the review: history keeps dispositions, la
     assert.ok(![followUpId, laterId].some((id) => completion.archivedThreadIds.includes(id)));
     assert.deepEqual(required(state.review.completions?.[0]).archivedThreadIds, completion.archivedThreadIds);
     assert.equal(prompts.length, 0, "starting a follow-up sends nothing");
+
+    // A review first opened after the merge has no pre-merge revision, so it claims no delivered diff.
+    const lateService = new ReviewService({ store: new Store(path.join(root, "late-data")) });
+    const lateId = await lateService.ensureReview({ repoPath: prRepo, base: "main" });
+    assert.ok(await lateService.recordCompletion(lateId, { ...open, state: "merged", mergedAt: "2000-01-01T00:00:00Z", closedAt: "2000-01-01T00:00:00Z", mergeCommitOid: squash }, "feature"));
+    assert.equal(required((await lateService.getReview(lateId)).completions?.[0]).deliveredRevisionId, null);
 });

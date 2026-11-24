@@ -1845,6 +1845,21 @@ test("a merged PR moves its comments to review history with their disposition, a
     await settle();
     assert.match(app.run("historyView()"), /The last revision before the merge had no changes/, "the delivered diff loads from the pre-merge revision");
 
+    // A background render rebuilds the history DOM; an expanded, focused delivered file stays that way.
+    const key = "r1\napp.ts";
+    const before = Object.assign(new MockElement("DETAILS"), { dataset: { historyKey: key }, open: true });
+    const rebuilt = Object.assign(new MockElement("DETAILS"), { dataset: { historyKey: key }, open: false });
+    let summaryFocused = false;
+    rebuilt.querySelector = () => Object.assign(new MockElement("SUMMARY"), { focus: () => { summaryFocused = true; } });
+    let renders = 0;
+    Object.assign(app.node("#main"), { querySelectorAll: () => (renders++ ? [rebuilt] : [before]), contains: () => true });
+    app.document.activeElement = Object.assign(new MockElement("SUMMARY"), { closest: () => before });
+    app.run("state.view = { type: 'history' }; renderMain()");
+    assert.equal(rebuilt.open, true);
+    assert.ok(summaryFocused);
+    app.document.activeElement = null;
+    Object.assign(app.node("#main"), { querySelectorAll: () => [] });
+
     const checkbox = Object.assign(new MockElement("INPUT"), { dataset: { action: "history-select", thread: "old-open" }, checked: true });
     checkbox.closest = () => checkbox;
     await app.run("onClick")({ target: checkbox });

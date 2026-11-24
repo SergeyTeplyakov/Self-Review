@@ -2390,8 +2390,16 @@ function renderMain(): void {
         state.view = { type: "overview" };
     }
     if (state.view.type === "history" && !latestCompletion()) state.view = { type: "overview" };
+    // Background renders rebuild the history DOM; keep delivered files the reviewer expanded or focused.
+    const openFiles = new Set(Array.from(main.querySelectorAll<HTMLDetailsElement>("details.history-file[open]"), (d) => d.dataset.historyKey));
+    const focused = document.activeElement?.closest<HTMLDetailsElement>("details.history-file");
+    const focusedKey = focused && main.contains(focused) ? focused.dataset.historyKey : undefined;
     main.innerHTML = state.view.type === "lessons" ? lessonsView() : state.view.type === "agent-comments" ? agentCommentsView()
         : state.view.type === "history" ? historyView() : overviewView();
+    for (const details of Array.from(main.querySelectorAll<HTMLDetailsElement>("details.history-file"))) {
+        if (openFiles.has(details.dataset.historyKey)) details.open = true;
+        if (focusedKey && details.dataset.historyKey === focusedKey) details.querySelector("summary")?.focus();
+    }
 }
 
 type ComposerOptions = {
@@ -2933,7 +2941,7 @@ function historyDiff(revisionId: string): HistoryDiff {
     return loading;
 }
 
-function historyFileHtml(file: DiffFile): string {
+function historyFileHtml(revisionId: string, file: DiffFile): string {
     const prefix = { add: "+", del: "-", ctx: " " } as const;
     const body = file.binary || !file.hunks.length
         ? `<div class="muted history-note">${esc(file.note ?? (file.binary ? "Binary file" : "No textual changes"))}</div>`
@@ -2943,7 +2951,7 @@ function historyFileHtml(file: DiffFile): string {
                 + `<td class="code" data-p="${prefix[row.t]}">${esc(row.s)}</td></tr>`).join("")
             + `</tbody></table>`).join("");
     const name = file.oldPath && file.oldPath !== file.path ? `${file.oldPath} → ${file.path}` : file.path;
-    return `<details class="history-file"><summary><span class="badge">${STATUS_LETTER[file.status] ?? "M"}</span><span class="mono">${esc(name)}</span>`
+    return `<details class="history-file" data-history-key="${esc(`${revisionId}\n${file.path}`)}"><summary><span class="badge">${STATUS_LETTER[file.status] ?? "M"}</span><span class="mono">${esc(name)}</span>`
         + `<span class="add">+${file.additions}</span><span class="del">−${file.deletions}</span></summary><div class="diff">${body}</div></details>`;
 }
 
@@ -2957,7 +2965,7 @@ function historySectionHtml(completion: ReviewCompletion): string {
     const diffHtml = !diff ? `<p class="muted">No diff was captured before this pull request merged.</p>`
         : diff.status === "loading" ? `<p class="muted">Loading the delivered diff...</p>`
         : diff.status === "failed" ? `<p class="del">Could not load the delivered diff: ${esc(diff.error)}</p>`
-        : diff.snapshot.files.length ? diff.snapshot.files.map(historyFileHtml).join("")
+        : diff.snapshot.files.length ? diff.snapshot.files.map((file) => historyFileHtml(completion.deliveredRevisionId!, file)).join("")
         : `<p class="muted">The last revision before the merge had no changes.</p>`;
     return `<section class="history-section" aria-label="Delivered in pull request ${pr.number}">`
         + `<div class="card history-summary"><strong>Completed · <a href="${esc(pr.url)}" target="_blank" rel="noopener noreferrer">PR #${pr.number}</a> merged${pr.baseRefName ? ` into ${esc(pr.baseRefName)}` : ""}</strong>`
