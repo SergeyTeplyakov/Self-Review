@@ -3736,9 +3736,9 @@ function onKeyDown(e: KeyboardEvent): void {
             menu.hidden = true;
             return;
         }
-        if (options.length && (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Enter")) {
+        if (options.length && (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Enter" || e.key === "Tab")) {
             e.preventDefault();
-            if (e.key === "Enter") options[Math.max(0, selected)].click();
+            if (e.key === "Enter" || e.key === "Tab") options[Math.max(0, selected)].click();
             else {
                 const next = (selected + (e.key === "ArrowDown" ? 1 : -1) + options.length) % options.length;
                 options.forEach((option, index) => option.classList.toggle("selected", index === next));
