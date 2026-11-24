@@ -289,6 +289,20 @@ a.pill:hover { text-decoration: underline; }
 .tree-scope .seg button { flex: 1; padding: 3px 4px; font-size: 0.8em; white-space: nowrap; }
 .nav-item.tree { padding-left: calc(6px + var(--depth, 0) * 14px); gap: 4px; }
 .nav-item.tree .stat { opacity: 0.85; }
+button.reveal-file {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: none;
+    padding: 2px 4px;
+    background: none;
+    border-color: transparent;
+    color: var(--mr-muted);
+}
+button.reveal-file:hover { background: var(--mr-subtle); border-color: var(--mr-border); color: var(--mr-fg); }
+button.reveal-file svg { width: 15px; height: 15px; }
+.nav-item.tree .reveal-file { visibility: hidden; padding: 1px 3px; }
+.nav-item.tree:hover .reveal-file, .nav-item.tree.active .reveal-file { visibility: visible; }
 .nav-item .meta { color: var(--mr-muted); font-size: 0.85em; white-space: nowrap; min-width: 4.5em; text-align: right; }
 
 .tree-controls { display: flex; gap: 12px; padding: 0 12px 8px; font-size: 0.85em; }

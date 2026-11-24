@@ -15,6 +15,7 @@ import { findOpenPullRequest } from "./pull-request.mjs";
 import { SettingsHttp, HttpError } from "./settings-http.mjs";
 import { ReviewWatcher } from "./review-watcher.mjs";
 import { MAX_IMAGE_BYTES, readCommentImage, saveCommentImage } from "./comment-images.mjs";
+import { resolveRevealTarget, revealInFileManager } from "./reveal-file.mjs";
 const MAX_JSON = 1024 * 1024;
 const PULL_REQUEST_CACHE_MS = 30_000;
 const STATIC = {
@@ -129,7 +130,7 @@ function openInDefaultBrowser(url) {
         });
     });
 }
-export async function startReviewServer({ instanceId, getReviewId, service, delivery, webRoot, extensionVersion, log = () => { }, settings, onReviewChange, agentReview, reviewSkills, findPullRequest = findOpenPullRequest, openCommentLink = openInDefaultBrowser, }) {
+export async function startReviewServer({ instanceId, getReviewId, service, delivery, webRoot, extensionVersion, log = () => { }, settings, onReviewChange, agentReview, reviewSkills, findPullRequest = findOpenPullRequest, openCommentLink = openInDefaultBrowser, revealFile = revealInFileManager, }) {
     const settingsHttp = new SettingsHttp(settings, log);
     const reviewWatcher = new ReviewWatcher(service, log);
     const token = randomBytes(24).toString("base64url");
@@ -329,6 +330,27 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
                 throw new HttpError(502, "browser_error", "Could not open the link in the default browser.");
             }
             return send(res, 200, { ok: true });
+        }
+        if (parts[0] === "reveal-file" && parts.length === 1) {
+            if (pageReview !== reviewId)
+                throw new HttpError(409, "conflict", "Refresh the canvas before opening a file location.");
+            if (typeof body.path !== "string" || !body.path)
+                throw new HttpError(400, "invalid_input", "path must be a repository-relative file path.");
+            const { repoRoot } = await service.getReview(reviewId);
+            let target;
+            try {
+                target = await resolveRevealTarget(repoRoot, body.path);
+            }
+            catch (error) {
+                throw new HttpError(400, "invalid_input", `Cannot open the location of ${body.path}: ${errorMessage(error)}`);
+            }
+            try {
+                await revealFile(target);
+            }
+            catch {
+                throw new HttpError(502, "file_manager_error", "Could not open the file location in the file manager.");
+            }
+            return send(res, 200, { ok: true, selected: target.select });
         }
         if (parts[0] === "review-skills" && parts.length === 1) {
             if (!reviewSkills)

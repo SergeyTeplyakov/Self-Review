@@ -1,0 +1,82 @@
+import { execFile, spawn, type SpawnOptions } from "node:child_process";
+import { lstat, realpath, stat } from "node:fs/promises";
+import path from "node:path";
+import { safeJoin } from "./git.mjs";
+
+// What to show in the system file manager: the item selected in its folder, or a folder opened on its own.
+export interface RevealTarget {
+    path: string;
+    select: boolean;
+}
+
+function isMissing(error: unknown): boolean {
+    const code = error instanceof Error && "code" in error ? error.code : undefined;
+    return code === "ENOENT" || code === "ENOTDIR";
+}
+
+// Resolves a repository-relative path for the file manager. A path that no longer exists, such as a deleted
+// file, falls back to its nearest existing folder, which is opened rather than selected. Links are resolved
+// before the containment check, so a junction or directory symlink cannot reveal a location outside the repository.
+export async function resolveRevealTarget(repoRoot: string, relPath: string): Promise<RevealTarget> {
+    if (!relPath || path.isAbsolute(relPath) || path.win32.isAbsolute(relPath)) {
+        throw new Error("Expected a repository-relative path.");
+    }
+    const root = await realpath(repoRoot);
+    let candidate = safeJoin(root, relPath);
+    let select = true;
+    while (candidate !== root) {
+        const parent = path.dirname(candidate);
+        try {
+            if (select) {
+                // The item itself is selected, not followed, so an existing link is shown as the link.
+                const item = safeJoin(root, path.relative(root, path.join(await realpath(parent), path.basename(candidate))));
+                await lstat(item);
+                return { path: item, select };
+            }
+            // A fallback folder is opened, so follow a link to the folder it really is.
+            const folder = safeJoin(root, path.relative(root, await realpath(candidate)));
+            // Only a folder may be opened directly; opening a file would launch it in its default app.
+            if ((await stat(folder)).isDirectory()) return { path: folder, select };
+        } catch (error) {
+            if (!isMissing(error)) throw error;
+        }
+        candidate = parent;
+        select = false;
+    }
+    return { path: root, select: false };
+}
+
+function launch(file: string, args: string[], options: SpawnOptions = {}): Promise<void> {
+    return new Promise((resolve, reject) => {
+        const child = spawn(file, args, { ...options, detached: true, stdio: "ignore" });
+        child.once("error", reject);
+        child.once("spawn", () => {
+            child.unref();
+            resolve();
+        });
+    });
+}
+
+function run(file: string, args: string[]): Promise<void> {
+    return new Promise((resolve, reject) => {
+        execFile(file, args, { windowsHide: true, timeout: 10_000 }, (error) => {
+            if (error) reject(error);
+            else resolve();
+        });
+    });
+}
+
+// Shows the target in File Explorer, Finder, or the desktop's default file manager without a shell.
+export function revealInFileManager({ path: target, select }: RevealTarget): Promise<void> {
+    if (process.platform === "win32") {
+        // Explorer parses its own command line, so pass the path quoted verbatim (Windows paths cannot contain
+        // double quotes) to keep commas in names intact. Explorer exits with 1 even on success, so a successful
+        // launch is the only reliable signal.
+        const explorer = path.join(process.env.SystemRoot ?? "C:\\Windows", "explorer.exe");
+        return launch(explorer, [select ? `/select,"${target}"` : `"${target}"`], { windowsVerbatimArguments: true });
+    }
+    if (process.platform === "darwin") return run("/usr/bin/open", select ? ["-R", target] : [target]);
+    // xdg-open reports a missing or failing file manager only through its exit status.
+    if (process.platform === "linux") return run("xdg-open", [select ? path.dirname(target) : target]);
+    return Promise.reject(new Error("No file manager launcher is available on this platform."));
+}

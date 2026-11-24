@@ -1895,6 +1895,20 @@ function activeCount(pathName) {
 }
 const CHEVRON = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M6 3.5 10.5 8 6 12.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 const FOLDER_ICON = `<svg class="ficon" viewBox="0 0 16 16" aria-hidden="true"><path d="M1.75 3h4.1l1.5 1.5h6.9c.41 0 .75.34.75.75v7c0 .41-.34.75-.75.75H1.75A.75.75 0 0 1 1 12.25v-8.5c0-.41.34-.75.75-.75Z" fill="currentColor"/></svg>`;
+const REVEAL_ICON = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M1.5 12.5v-9h4l1.5 1.5h5.5v2M1.5 12.5l2-5.5h11l-2 5.5Z" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>`;
+function revealLabel() {
+    const platform = globalThis.navigator?.platform ?? "";
+    if (/^win/i.test(platform))
+        return "Reveal in File Explorer";
+    if (/^mac/i.test(platform))
+        return "Reveal in Finder";
+    return "Open containing folder";
+}
+// The tree rows are not tab stops, so the tree copy is pointer-only; the file header copy stays keyboard reachable.
+function revealButtonHtml(path, place) {
+    const label = revealLabel();
+    return `<button type="button" class="reveal-file ${place}" data-action="reveal-file" data-path="${esc(path)}" title="${label}" aria-label="${esc(`${label}: ${path}`)}"${place === "tree" ? ' tabindex="-1"' : ""}>${REVEAL_ICON}</button>`;
+}
 const statHtml = (adds, dels) => `<span class="stat"><span class="add">+${adds}</span> <span class="del">−${dels}</span></span>`;
 function treeHtml(node, depth, out) {
     const review = state.review;
@@ -1923,6 +1937,7 @@ function treeHtml(node, depth, out) {
             + `<span class="status-letter ${letter}">${letter}</span>`
             + `<span class="name">${esc(f.path.slice(f.path.lastIndexOf("/") + 1))}</span>`
             + `<span class="count${fn ? "" : " zero"}">${fn}</span>`
+            + revealButtonHtml(f.path, "tree")
             + `${statHtml(f.additions, f.deletions)}</div>`);
     }
 }
@@ -2767,6 +2782,7 @@ function fileView(file, { stacked = false, folded = false } = {}) {
             + `<span class="status-letter ${letter}">${letter}</span><span class="path">${pathHtml}${file.oldPath && file.oldPath !== file.path ? ` <span class="muted">(from ${esc(file.oldPath)})</span>` : ""}${file.untracked ? ` <span class="badge">untracked</span>` : ""}</span>`
             + (stacked && folded && activeHere ? `<span class="count">${activeHere}</span>` : "")
             + `<span class="stat"><span class="add">+${file.additions}</span> <span class="del">−${file.deletions}</span></span>`
+            + revealButtonHtml(file.path, "head")
             + `<button data-action="open" data-key="${esc(fileKey)}" data-path="${esc(file.path)}">Comment on file</button></div>`];
     if (folded) {
         html.push(`</section>`);
@@ -3160,6 +3176,13 @@ async function onClick(e) {
                 setDirCollapsed(value("path"), !collapsedDirs().has(value("path")));
                 render();
                 break;
+            case "reveal-file": {
+                const path = value("path");
+                const res = await api("POST", "reveal-file", { path });
+                if (isRecord(res) && res.selected === false)
+                    toast(`${path} is not on disk, so its nearest folder was opened.`);
+                break;
+            }
             case "fold-tree":
                 setAllDirsCollapsed(value("fold") === "1");
                 render();

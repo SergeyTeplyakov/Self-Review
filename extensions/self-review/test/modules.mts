@@ -24,6 +24,7 @@ const settingsApi = await loadModule<typeof import("../src/web/settings-api.mjs"
 const reviewCommands = await loadModule<typeof import("../src/web/review-commands.mjs")>("../dist/web/review-commands.mjs");
 const completionGuidance = await loadModule<typeof import("../src/lib/completion-guidance.mjs")>("../dist/lib/completion-guidance.mjs");
 const reviewWatcher = await loadModule<typeof import("../src/lib/review-watcher.mjs")>("../dist/lib/review-watcher.mjs");
+const revealFileModule = await loadModule<typeof import("../src/lib/reveal-file.mjs")>("../dist/lib/reveal-file.mjs");
 
 export const relocate = anchors.relocate;
 export const { AgentReview, FUSION_REVIEWER, SUGGESTED_REVIEWERS } = agentReview;
@@ -48,6 +49,7 @@ export const { createSettingsApi } = settingsApi;
 export const { REVIEW_COMMANDS, reviewCommandSuggestions, parseReviewCommand } = reviewCommands;
 export const { completionHooks, COMPLETION_REVIEW_GUIDANCE } = completionGuidance;
 export const { ReviewWatcher } = reviewWatcher;
+export const { resolveRevealTarget, revealInFileManager } = revealFileModule;
 
 export async function loadExtension(): Promise<void> {
     const extensionUrl = new URL("../dist/extension.mjs", import.meta.url).href;
