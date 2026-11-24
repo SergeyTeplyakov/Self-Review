@@ -350,13 +350,15 @@ const deliveryRepoMode = () => {
     return mode === "batch" || mode === "ask" ? mode : "immediate";
 };
 // Mirrors the server's resolveDelivery: null while an ask-mode review is undecided. Without settings nothing is held.
-function deliveryMode(mode = deliveryRepoMode()) {
+function deliveryMode() {
+    if (!state.settings)
+        return "immediate";
+    const mode = deliveryRepoMode();
     if (mode !== "ask")
         return mode;
     const chosen = state.review?.deliveryMode;
     return chosen === "immediate" || chosen === "batch" ? chosen : null;
 }
-const activeCommentConcurrency = () => deliveryMode() === "immediate" ? state.settings?.commentConcurrency ?? 1 : 1;
 const draftMessages = () => (state.review?.threads ?? []).flatMap((t) => t.messages).filter((m) => m.author === "user" && m.delivery?.state === "draft");
 // Lessons recorded before statuses existed were saved by definition.
 const lessonStatus = (lesson) => (lesson.status === "proposed" || lesson.status === "declined" || lesson.status === "saved" ? lesson.status : "saved");
@@ -1319,6 +1321,7 @@ function renderTop() {
     const previousSettingsMenu = top.querySelector(".review-settings-menu");
     const active = document.activeElement;
     const activeInSettingsMenu = active instanceof HTMLElement && previousSettingsMenu?.contains(active);
+    const activeParallelismBadge = active instanceof HTMLElement && active.dataset.action === "configure-parallelism";
     const settingsMenuWasOpen = previousSettingsMenu?.open ?? false;
     const focusedSettingsSummary = activeInSettingsMenu && active === previousSettingsMenu?.querySelector("summary");
     const focusedSettingsAction = activeInSettingsMenu && active instanceof HTMLElement ? active.dataset.action : undefined;
@@ -1330,7 +1333,7 @@ function renderTop() {
     const processing = deliveries.filter(d => d?.state === "processing");
     const ready = processing.filter(d => d?.parallelPhase === "ready").length;
     const applying = processing.filter(d => d?.parallelPhase === "applying").length;
-    const limit = activeCommentConcurrency();
+    const limit = state.settings?.commentConcurrency ?? 1;
     const running = processing.length - ready - applying;
     const counts = limit > 1 || processing.some(d => d?.parallel) || queued || running
         ? ` · ${queued} queued · ${running} running${ready ? ` · ${ready} waiting to apply` : ""}${applying ? ` · ${applying} applying` : ""}`
@@ -1381,6 +1384,13 @@ function renderTop() {
         parts.push(`<div class="review-controls">${controls.join("")}</div>`);
     top.innerHTML = parts.join("");
     const settingsMenu = top.querySelector(".review-settings-menu");
+    if (activeParallelismBadge) {
+        const badge = top.querySelector('[data-action="configure-parallelism"]');
+        if (badge)
+            badge.focus();
+        else
+            settingsMenu?.querySelector("summary")?.focus();
+    }
     if (!settingsMenu)
         return;
     settingsMenu.open = settingsMenuWasOpen;
@@ -1431,8 +1441,6 @@ function dialogHtml() {
         return "";
     if (d.type === "agent-review")
         return agentReviewDialogHtml(d);
-    const batch = deliveryMode(d.delivery) === "batch";
-    const limit = batch ? state.settings?.commentConcurrency ?? 1 : d.commentConcurrency;
     return `<div class="modal-backdrop" data-action="dialog-backdrop"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby="dialog-desc">`
         + `<h2 id="dialog-title">Review settings</h2>`
         + `<p id="dialog-desc" class="muted">Settings for ${esc(state.settings?.repoName ?? "this repository")}. They are stored on this machine only and never committed.</p>`
@@ -1447,9 +1455,7 @@ function dialogHtml() {
             : `<p class="muted">No mappings yet. Repository rules remain proposals until a destination is configured.</p>`)
         + `<button data-action="mapping-add">Add destination mapping</button></fieldset>`
         + `<fieldset class="choices"><legend>Send comments to Copilot</legend>${choicesHtml("delivery", DELIVERY_MODES, DELIVERY, d.delivery)}</fieldset>`
-        + `<fieldset class="choices"><legend>Comment processing</legend><label>Concurrent comments <select name="commentConcurrency" aria-describedby="comment-concurrency-hint"${batch ? " disabled" : ""}>${[1, 2, 3, 4].map(n => `<option value="${n}"${n === limit ? " selected" : ""}>${n === 1 ? "1 (serial)" : n}</option>`).join("")}</select></label><p id="comment-concurrency-hint">${batch
-            ? "Batched comments are sent together in one review. Your concurrency limit is kept for immediate delivery."
-            : "With immediate delivery, 2–4 comments can be analyzed together in this checkout. Only the coordinator edits, one change at a time. Follow-ups in the same thread wait their turn."}</p></fieldset>`
+        + `<fieldset class="choices"><legend>Comment processing</legend><label>Concurrent comments <select name="commentConcurrency" aria-describedby="comment-concurrency-hint">${[1, 2, 3, 4].map(n => `<option value="${n}"${n === (d.commentConcurrency ?? 1) ? " selected" : ""}>${n === 1 ? "1 (serial)" : n}</option>`).join("")}</select></label><p id="comment-concurrency-hint">2–4 comments can be analyzed together in this checkout. Only the coordinator edits, one change at a time. Follow-ups in the same thread wait their turn.</p></fieldset>`
         + (d.error ? `<div class="modal-error" role="alert">${esc(d.error)}</div>` : "")
         + `<div class="modal-actions"><button data-action="dialog-cancel"${d.saving ? " disabled" : ""}>Cancel</button>`
         + `<button class="primary" data-action="dialog-save"${d.saving ? " disabled" : ""}>${d.saving ? "Saving…" : "Save"}</button></div>`
@@ -1463,7 +1469,7 @@ function focusIn(selector) {
 // The dialog is rendered on its own so re-renders of the page never disturb its focus or radio state.
 function renderDialog() {
     const active = document.activeElement instanceof HTMLElement && document.activeElement.closest("#dialog") ? document.activeElement : null;
-    const key = active instanceof HTMLInputElement && active.name ? `[name="${active.name}"]${active.type === "checkbox" || active.type === "radio" ? `[value="${CSS.escape(active.value)}"]` : ""}`
+    const key = active instanceof HTMLInputElement && active.name ? `[name="${active.name}"]${active.type === "checkbox" ? `[value="${CSS.escape(active.value)}"]` : ""}`
         : active instanceof HTMLSelectElement && active.name ? `[name="${active.name}"]`
             : active instanceof HTMLTextAreaElement && active.name ? `[name="${active.name}"]`
                 : active?.dataset?.action ? `[data-action="${active.dataset.action}"]` : null;
@@ -1504,11 +1510,10 @@ function openConfigure(opener = "configure") {
 function closeConfigure() {
     if (!state.dialog || state.dialog.saving)
         return;
-    const opener = state.dialog.opener;
+    const opener = state.dialog.type === "agent-review" ? state.dialog.opener ?? "agent-review" : state.dialog.opener;
     state.dialog = null;
     renderDialog();
-    // Serial and batch modes have no badge. Return to Settings instead.
-    const returnTo = opener === "configure-parallelism" && activeCommentConcurrency() <= 1 ? "configure" : opener;
+    const returnTo = opener === "configure-parallelism" && (state.settings?.commentConcurrency ?? 1) <= 1 ? "configure" : opener;
     focusIn(`[data-action="${returnTo}"]`);
 }
 function reviewSkillsSectionHtml(d) {
@@ -1827,7 +1832,7 @@ async function saveConfigure() {
         const mappingsChanged = JSON.stringify(d.instructionMappings) !== JSON.stringify(d.originalInstructionMappings);
         await updateSettings({
             autoSaveLearnedRules: d.autoSaveLearnedRules, delivery: d.delivery,
-            ...(deliveryMode(d.delivery) !== "batch" && d.commentConcurrency !== (state.settings?.commentConcurrency ?? 1) ? { commentConcurrency: d.commentConcurrency } : {}),
+            ...(d.commentConcurrency !== (state.settings?.commentConcurrency ?? 1) ? { commentConcurrency: d.commentConcurrency } : {}),
             ...(mappingsChanged ? {
                 instructionMappings: d.instructionMappings,
                 expectedInstructionMappings: d.originalInstructionMappings,
@@ -3406,10 +3411,8 @@ async function onChange(e) {
     if ((el.name === "autoSaveLearnedRules" || el.name === "delivery" || el.name === "commentConcurrency") && state.dialog?.type === "configure") {
         if (el instanceof HTMLInputElement && el.name === "autoSaveLearnedRules")
             state.dialog.autoSaveLearnedRules = el.checked;
-        if (el.name === "delivery" && (el.value === "immediate" || el.value === "batch" || el.value === "ask")) {
+        if (el.name === "delivery" && (el.value === "immediate" || el.value === "batch" || el.value === "ask"))
             state.dialog.delivery = el.value;
-            renderDialog();
-        }
         if (el.name === "commentConcurrency" && /^[1-4]$/.test(el.value))
             state.dialog.commentConcurrency = Number(el.value);
         return;

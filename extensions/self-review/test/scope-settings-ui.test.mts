@@ -722,35 +722,24 @@ test("the Parallelism badge opens the repository concurrency control and disappe
     assert.equal(app.focused.at(-1), '[data-action="configure"]');
 });
 
-test("batch delivery disables concurrency without overwriting the immediate-mode limit", async () => {
-    const patches: Record<string, unknown>[] = [];
-    const app = await loadApp({ fetch: async (_url, init) => {
-        const patch = requestBody(init);
-        patches.push(patch);
-        return jsonResponse(settingsFixture({ commentConcurrency: 3, ...patch }));
+test("saving parallelism with parallel mode enabled restores focus to the badge", async () => {
+    const calls: CapturedPost[] = [];
+    const app = await loadApp({ fetch: async (url, init) => {
+        calls.push([init?.method ?? "GET", url, requestBody(init)]);
+        return jsonResponse(settingsFixture({ commentConcurrency: 2 }));
     } });
-    app.state.review = reviewFixture({ deliveryMode: "batch" });
+    app.state.review = reviewFixture();
     app.state.settings = settingsFixture({ commentConcurrency: 3 });
+    app.run("renderTop()");
+
     const click = clicker(app);
-    const change = (name: string, value: string) => app.run("onChange")({ target: { name, value } });
     await click("configure-parallelism");
-    await change("commentConcurrency", "2");
-    for (const delivery of ["ask", "batch"]) {
-        await change("delivery", delivery);
-        const html = app.node("#dialog").innerHTML;
-        assert.match(html, /<select name="commentConcurrency"[^>]* disabled>/);
-        assert.match(html, /Batched comments are sent together/);
-        assert.match(html, /<option value="3" selected>/);
-    }
+    await app.run("onChange")({ target: { name: "commentConcurrency", value: "2" } });
     await click("dialog-save");
-    assert.deepEqual(patches, [{ delivery: "batch", autoSaveLearnedRules: false }]);
-    assert.doesNotMatch(app.node("#top").innerHTML, /Parallelism:/);
-    assert.equal(app.focused.at(-1), '[data-action="configure"]');
-    await click("configure");
-    await change("delivery", "immediate");
-    assert.doesNotMatch(app.node("#dialog").innerHTML, /<select name="commentConcurrency"[^>]* disabled/);
-    await click("dialog-save");
-    assert.match(app.node("#top").innerHTML, /Parallelism: 3/);
+
+    assert.deepEqual(calls, [["POST", "/api/settings", { autoSaveLearnedRules: false, delivery: "immediate", commentConcurrency: 2 }]]);
+    assert.match(app.node("#top").innerHTML, /Parallelism: 2/);
+    assert.equal(app.focused.at(-1), '[data-action="configure-parallelism"]');
 });
 
 const bundledCatalog = (selected = NAMES) => ({ bundled: true, selected, defaults: { selected, saved: selected !== NAMES }, skills: NAMES.map((name, i) => ({
@@ -794,7 +783,7 @@ test("Agent review settings has a heading, General and Review skills tabs, no Ru
 test("header rerenders preserve the open Settings menu and focused menu control", async () => {
     const app = await loadApp();
     app.state.review = reviewFixture();
-    app.state.settings = settingsFixture();
+    app.state.settings = settingsFixture({ commentConcurrency: 3 });
     app.state.agentReviewAvailable = true;
 
     const focusEvents: string[] = [];
@@ -803,10 +792,15 @@ test("header rerenders preserve the open Settings menu and focused menu control"
         dataset: { action: "configure" },
         focus: () => focusEvents.push("configure"),
     });
+    const badge = Object.assign(new MockElement("BUTTON"), {
+        dataset: { action: "configure-parallelism" },
+        focus: () => focusEvents.push("badge"),
+    });
     const menu = Object.assign(new MockElement("DETAILS"), { open: true });
     menu.contains = (node) => node === summary || node === configure;
     menu.querySelector = (selector) => selector === "summary" ? summary : selector === '[data-action="configure"]' ? configure : null;
-    app.node("#top").querySelector = (selector) => selector === ".review-settings-menu" ? menu : null;
+    app.node("#top").querySelector = (selector) => selector === ".review-settings-menu" ? menu
+        : selector === '[data-action="configure-parallelism"]' ? badge : null;
 
     app.document.activeElement = configure;
     app.run("renderTop()");
@@ -817,6 +811,10 @@ test("header rerenders preserve the open Settings menu and focused menu control"
     app.run("renderTop()");
     assert.equal(menu.open, true);
     assert.equal(focusEvents.at(-1), "summary", "focus on the Settings summary survives an update");
+
+    app.document.activeElement = badge;
+    app.run("renderTop()");
+    assert.equal(focusEvents.at(-1), "badge", "focus on the Parallelism badge survives an update");
 });
 
 test("bundled skill loading failures keep unsaved choices and can be retried", async () => {
@@ -1808,7 +1806,7 @@ test("the Configure dialog is an accessible modal with auto-save off by default 
         [["immediate", false], ["batch", true], ["ask", false]],
     );
     assert.match(html, /<span class="choice-title">Ask for each review<\/span>/);
-    assert.doesNotMatch(html, /role="alert"|<button\b[^>]* disabled/);
+    assert.doesNotMatch(html, /role="alert"|\sdisabled[\s>]/);
     assert.match(html, /data-action="dialog-save">Save<\/button>/);
 
     app.state.dialog = { autoSaveLearnedRules: true, instructionMappings: [], saving: true, error: "Could not save <b>" };

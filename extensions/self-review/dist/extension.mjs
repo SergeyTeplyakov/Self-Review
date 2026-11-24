@@ -57,7 +57,7 @@ const delivery = new Delivery({
     send,
     reviewIds: openReviewIds,
     autoSaveLearnedRules,
-    settings,
+    commentConcurrency: async (repoRoot) => (await settings.get(repoRoot)).commentConcurrency ?? 1,
     sessionId: () => session?.sessionId,
 });
 const reviewSkills = new ReviewSkills({ store });

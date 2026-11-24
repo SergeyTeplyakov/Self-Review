@@ -5,7 +5,6 @@ import { EventEmitter } from "node:events";
 import { buildBatchPrompt, buildCommentPrompt } from "./prompt.mjs";
 import { readCommentImage } from "./comment-images.mjs";
 import type { ReviewService, DraftClaim } from "./review-service.mjs";
-import { resolveDelivery, type SettingsService } from "./settings.mjs";
 import type { Log } from "../../types/contracts.js";
 import { ParallelComments } from "./parallel-comments.mjs";
 
@@ -17,7 +16,6 @@ export interface DeliveryResult {
     error?: string;
     sessionMessageId?: string;
 }
-type DeliveryStart<T> = { pending: Promise<T> } | { result: T };
 interface DeliveryTarget { reviewId: string; messageId: string; attemptId?: string }
 export interface UserMessageEvent {
     data?: { messageId?: string; transformedContent?: string; content?: string };
@@ -40,14 +38,12 @@ export class Delivery extends EventEmitter {
     readonly sessionId: () => string | undefined;
     readonly fallbackOwner: string;
     readonly parallel: ParallelComments;
-    private readonly settings?: SettingsService;
+    readonly commentConcurrency: (repoRoot: string) => Promise<number>;
     busy: boolean | null;
     private readonly bySessionMessageId: Map<string, DeliveryTarget[]>;
     private readonly seenSessionMessageIds: Map<string, { finished: boolean }>;
     private readonly touched: Set<string>;
     private readonly inFlight: Map<string, Promise<DeliveryResult>>;
-    private readonly sendByAttemptId: Map<string, Promise<DeliveryResult>>;
-    private readonly claimTails: Map<string, Promise<void>>;
     private lifecycle: Promise<void>;
     /**
      * @param {object} p
@@ -59,10 +55,10 @@ export class Delivery extends EventEmitter {
      * @param {() => string | undefined} [p.sessionId] conversation that processes the comments this instance sends
      */
     constructor({ service, send, log = () => {}, reviewIds = () => [], autoSaveLearnedRules = async () => false,
-        sessionId = () => undefined, settings }: {
+        sessionId = () => undefined, commentConcurrency = async () => 1 }: {
         service: ReviewService; send: (options: SendOptions) => Promise<string>; log?: Log; reviewIds?: () => Iterable<string>;
         autoSaveLearnedRules?: (repoRoot: string) => Promise<boolean>; sessionId?: () => string | undefined;
-        settings?: SettingsService;
+        commentConcurrency?: (repoRoot: string) => Promise<number>;
     }) {
         super();
         this.service = service;
@@ -72,7 +68,7 @@ export class Delivery extends EventEmitter {
         this.autoSaveLearnedRules = autoSaveLearnedRules;
         this.sessionId = sessionId;
         this.fallbackOwner = `delivery-${randomUUID()}`;
-        this.settings = settings;
+        this.commentConcurrency = commentConcurrency;
         this.parallel = new ParallelComments(service, send, () => this.owner(), root => this.repoLearning(root));
         this.busy = null;
         this.bySessionMessageId = new Map();
@@ -80,8 +76,6 @@ export class Delivery extends EventEmitter {
         this.seenSessionMessageIds = new Map();
         this.touched = new Set();
         this.inFlight = new Map();
-        this.sendByAttemptId = new Map();
-        this.claimTails = new Map();
         this.lifecycle = Promise.resolve();
     }
 
@@ -97,25 +91,18 @@ export class Delivery extends EventEmitter {
 
     async deliverOnce(reviewId: string, threadId: string, messageId: string, instanceId: string, { retry = false } = {}): Promise<DeliveryResult> {
         this.touched.add(reviewId);
-        const started = await this.withClaimOrder<DeliveryStart<DeliveryResult>>(reviewId, async () => {
-            const claim = await this.service.claimDelivery(reviewId, threadId, messageId, { retry, senderSessionId: this.owner() });
-            if (!claim) return { result: { delivered: false, skipped: true } };
-            return { pending: this.startClaimed(reviewId, [{ threadId, messageId, ...claim }], instanceId, "immediate") };
-        });
-        return "pending" in started ? started.pending : started.result;
+        const claim = await this.service.claimDelivery(reviewId, threadId, messageId, { retry, senderSessionId: this.owner() });
+        if (!claim) return { delivered: false, skipped: true };
+        return this.sendClaimed(reviewId, [{ threadId, messageId, ...claim }], instanceId);
     }
 
-    // Explicit submissions stay together; choosing immediate can release held drafts to parallel workers.
-    async submit(reviewId: string, instanceId: string, mode: "combined" | "immediate" = "combined"): Promise<DeliveryResult & { submitted: number }> {
+    // Sends every draft of a review as one prompt; drafts are claimed atomically so a review is submitted once.
+    async submit(reviewId: string, instanceId: string): Promise<DeliveryResult & { submitted: number }> {
         this.touched.add(reviewId);
-        const started = await this.withClaimOrder<DeliveryStart<DeliveryResult & { submitted: number }>>(reviewId, async () => {
-            const claims = await this.service.claimDrafts(reviewId, { senderSessionId: this.owner() });
-            if (!claims.length) return { result: { submitted: 0, delivered: false } };
-            const pending = this.startClaimed(reviewId, claims, instanceId, mode)
-                .then((result) => ({ submitted: claims.length, ...result }));
-            return { pending };
-        });
-        return "pending" in started ? started.pending : started.result;
+        const claims = await this.service.claimDrafts(reviewId, { senderSessionId: this.owner() });
+        if (!claims.length) return { submitted: 0, delivered: false };
+        const result = await this.sendClaimed(reviewId, claims, instanceId);
+        return { submitted: claims.length, ...result };
     }
 
     async repoLearning(repoRoot: string) {
@@ -128,33 +115,12 @@ export class Delivery extends EventEmitter {
     }
 
     // Builds and sends the prompt for claimed messages: one comment uses the single-comment prompt, more use the batch prompt.
-    private async sendClaimed(reviewId: string, claims: DraftClaim[], instanceId: string, mode: "combined" | "immediate"): Promise<DeliveryResult> {
+    async sendClaimed(reviewId: string, claims: DraftClaim[], instanceId: string): Promise<DeliveryResult> {
         let sessionMessageId;
         try {
-            let review = await this.service.getReview(reviewId);
-            let predecessors = this.pendingSerialPredecessors(review, claims);
-            const savingAttempts = predecessors.filter((predecessor) => predecessor.state === "saving");
-            if (savingAttempts.length) {
-                const pending = savingAttempts
-                    .map((predecessor) => predecessor.attemptId ? this.sendByAttemptId.get(predecessor.attemptId) : undefined)
-                    .filter((send): send is Promise<DeliveryResult> => send !== undefined);
-                if (pending.length !== savingAttempts.length) {
-                    throw new Error("An earlier comment in this thread is still being queued; retry after it settles.");
-                }
-                await Promise.all(new Set(pending));
-                review = await this.service.getReview(reviewId);
-                predecessors = this.pendingSerialPredecessors(review, claims);
-                if (predecessors.some((predecessor) => predecessor.state === "saving")) {
-                    throw new Error("An earlier comment in this thread is still being queued; retry after it settles.");
-                }
-            }
-            if (mode === "immediate" && this.settings && !predecessors.length) {
-                const settings = await this.settings.get(review.repoRoot);
-                const limit = settings.commentConcurrency ?? 1;
-                if (limit > 1 && resolveDelivery(settings.delivery, review) === "immediate") {
-                    return await this.parallel.enqueue(reviewId, instanceId, claims, limit);
-                }
-            }
+            const { repoRoot } = await this.service.getReview(reviewId);
+            const concurrency = await this.commentConcurrency(repoRoot);
+            if (concurrency > 1) return await this.parallel.enqueue(reviewId, instanceId, claims, concurrency);
             const threadIds = [...new Set(claims.map((c) => c.threadId))];
             const contexts = [];
             for (const threadId of threadIds) contexts.push(await this.service.promptContext(reviewId, threadId));
@@ -210,47 +176,6 @@ export class Delivery extends EventEmitter {
             for (const target of targets) await this.processTarget(target, sessionMessageId, seen.finished);
         });
         return { delivered: true, sessionMessageId };
-    }
-
-    private withClaimOrder<T>(reviewId: string, operation: () => Promise<T>): Promise<T> {
-        const previous = this.claimTails.get(reviewId) ?? Promise.resolve();
-        let release!: () => void;
-        const gate = new Promise<void>((resolve) => { release = resolve; });
-        const tail = previous.then(() => gate);
-        this.claimTails.set(reviewId, tail);
-        return previous.then(operation).finally(() => {
-            release();
-            if (this.claimTails.get(reviewId) === tail) this.claimTails.delete(reviewId);
-        });
-    }
-
-    private startClaimed(reviewId: string, claims: DraftClaim[], instanceId: string, mode: "combined" | "immediate"): Promise<DeliveryResult> {
-        const pending = this.sendClaimed(reviewId, claims, instanceId, mode);
-        for (const claim of claims) this.sendByAttemptId.set(claim.attemptId, pending);
-        const clear = () => {
-            for (const claim of claims) {
-                if (this.sendByAttemptId.get(claim.attemptId) === pending) this.sendByAttemptId.delete(claim.attemptId);
-            }
-        };
-        void pending.then(clear, clear);
-        return pending;
-    }
-
-    private pendingSerialPredecessors(review: Awaited<ReturnType<ReviewService["getReview"]>>, claims: DraftClaim[]) {
-        const submitted = new Set(claims.map((claim) => claim.messageId));
-        const predecessors = new Map<string, { attemptId?: string; state: string }>();
-        for (const claim of claims) {
-            const thread = review.threads.find((entry) => entry.threadId === claim.threadId);
-            const index = thread?.messages.findIndex((message) => message.messageId === claim.messageId) ?? -1;
-            if (!thread || index <= 0) continue;
-            for (const message of thread.messages.slice(0, index)) {
-                const delivery = message.delivery;
-                if (message.author !== "user" || submitted.has(message.messageId) || !delivery?.attemptId || delivery.parallel
-                    || !["saving", "queued", "processing"].includes(delivery.state)) continue;
-                predecessors.set(delivery.attemptId ?? message.messageId, { attemptId: delivery.attemptId, state: delivery.state });
-            }
-        }
-        return [...predecessors.values()];
     }
 
     // Several conversations can share a review, so a processing comment records which one is working on it.

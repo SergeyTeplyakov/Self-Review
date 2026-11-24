@@ -1,10 +1,8 @@
 # Comment processing
 
 This document separates the **current contract** from a **proposed future
-design**. It covers immediate delivery with **Concurrent comments** set to 2–4;
-serial processing (1) is the default. **Submit review** sends drafts together
-in one prompt rather than dispatching parallel workers. Batch delivery keeps
-the repository's saved concurrency limit for the next immediate review.
+design**. It covers sent comments with **Concurrent comments** set to 2–4;
+serial delivery (1) is the default. Held drafts are not queued until sent.
 
 ## Current contract
 
