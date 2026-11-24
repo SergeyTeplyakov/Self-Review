@@ -385,7 +385,6 @@ test("multi-model review queues only after an explicit start and excludes manual
 });
 
 test("copilot-fusion runs in one coordinated child session and its result may arrive after the subagents report", async (t) => {
-    assert.deepEqual(SUGGESTED_REVIEWERS, ["gpt-6-astra", "gpt-6.1-sol", FUSION_REVIEWER]);
     const f = await fixture(t);
     const run = await f.agent.start("review", { ...input, models: [models[0], FUSION_REVIEWER] }, "c");
     const prompt = required(f.sent[0]).prompt ?? "";

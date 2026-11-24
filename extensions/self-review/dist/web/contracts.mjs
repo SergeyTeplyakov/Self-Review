@@ -13,7 +13,7 @@ export function isCommentConcurrency(value) {
 }
 export const REVIEW_FOCUSES = ["review", "simplify", "both"];
 export const FUSION_REVIEWER = "copilot-fusion";
-export const SUGGESTED_REVIEWERS = ["gpt-6-astra", "gpt-6.1-sol", FUSION_REVIEWER];
+export const SUGGESTED_REVIEWERS = ["mai-code-2", "gpt-6.2-sol", "gpt-6.2-astra"];
 export function isRecord(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value);
 }

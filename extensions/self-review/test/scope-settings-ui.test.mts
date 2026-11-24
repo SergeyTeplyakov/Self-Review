@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { resolveObjectURL } from "node:buffer";
 import { readFile } from "node:fs/promises";
 import vm from "node:vm";
-import { parseUnifiedDiff } from "./modules.mjs";
+import { parseUnifiedDiff, SUGGESTED_REVIEWERS } from "./modules.mjs";
 import { loadApp as runApp, MockElement } from "./load-app.mjs";
 
 // Loads the page script into a bare vm context. Elements are created on demand and remembered per selector,
@@ -1009,10 +1009,10 @@ test("built-in reviewer suggestions prefill only without saved or previous choic
     const app = await loadApp({ fetch: async (url: string) => { posts.push(url); return jsonResponse({}); } });
     app.state.review = reviewFixture();
     app.state.agentReviewAvailable = true;
-    app.state.agentReviewSuggestedModels = ["gpt-6-astra", "gpt-6.1-sol", "copilot-fusion"];
+    app.state.agentReviewSuggestedModels = SUGGESTED_REVIEWERS;
     const click = clicker(app);
     await click("agent-review");
-    assert.equal(dialog(app).models, "gpt-6-astra, gpt-6.1-sol, copilot-fusion");
+    assert.equal(dialog(app).models, "mai-code-2, gpt-6.2-sol, gpt-6.2-astra");
     assert.equal(dialog(app).saveDefaults, false, "suggestions are not saved choices");
     assert.equal(dialog(app).skipDialog, false);
     assert.match(app.node("#dialog").innerHTML, /copilot-fusion to run Copilot Fusion in a child session/);

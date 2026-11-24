@@ -95,8 +95,7 @@ credits. Use the user's exact selected model IDs and review focus. Discover
 choices. On an explicit review request, use saved defaults with
 `run_agent_review` and `useDefaults: true` without asking again unless the user
 requests different choices. Ask only when neither saved defaults nor explicit
-choices exist. The canvas suggests `gpt-6-astra`, `gpt-6.1-sol`, and
-`copilot-fusion` when nothing is saved; these are not saved choices or consent.
+choices exist. The canvas's built-in suggestions are not saved choices or consent.
 `copilot-fusion` is not a subagent model: follow the queued review prompt to run
 it in one coordinated child session with Auto and a Fusion tier. Wait for the
 child to finish, reconcile its provisional replies, then report once, possibly
