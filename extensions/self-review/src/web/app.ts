@@ -307,6 +307,8 @@ type State = {
     reviewSkillsAvailable: boolean;
     skillOverrides: Map<string, string[]>;
     approving: Set<string>;
+    // Thread ID to the status being saved for it.
+    statusUpdates: Map<string, ThreadStatus>;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -646,6 +648,7 @@ const state: State = {
     reviewSkillsAvailable: false,
     skillOverrides: new Map(),
     approving: new Set(),
+    statusUpdates: new Map(),
 };
 
 const FOLDER_VIEW_ROW_BUDGET = 3000;
@@ -2706,7 +2709,7 @@ function threadHtml(t: ReviewThread, { showLocation = false }: { showLocation?: 
         + (outdated ? `<span class="badge outdated" title="The commented code changed or was removed">Outdated</span>` : "")
         + (notInDiff ? `<span class="badge outdated" title="This location is not part of the current diff">Not in diff</span>` : "")
         + (t.status !== "active" ? `<span class="badge st-${t.status}">${t.status === "wontfix" ? "won't fix" : t.status}</span>` : "")
-        + `<select data-action="status" data-thread="${esc(t.threadId)}" title="Thread status">${options}</select>`
+        + `<select data-action="status" data-thread="${esc(t.threadId)}" title="Thread status"${state.statusUpdates.has(t.threadId) ? " disabled" : ""}>${options}</select>`
         + (collapsed ? pending.map(deliveryHtml).join("") : "")
         + (collapsed && hasDraftReply(t.threadId) ? `<span class="badge">Unposted reply</span>` : "")
         + `<button class="link" data-action="toggle" data-thread="${esc(t.threadId)}" aria-expanded="${!collapsed}">${collapsed ? "Show" : "Hide"}</button>`
@@ -2721,7 +2724,39 @@ function threadHtml(t: ReviewThread, { showLocation = false }: { showLocation?: 
         ? `<div class="finding-actions"><button class="primary" data-action="approve-finding" data-thread="${esc(t.threadId)}" title="${esc(staleFinding ? "Review changed; rerun before approving" : approvalIssue || "Send this suggestion to the coding agent for implementation")}"${t.agentReview.approvalMessageId || staleFinding || approvalIssue || t.status !== "active" || state.approving.has(t.threadId) ? " disabled" : ""}>${t.agentReview.approvalMessageId ? "Approved" : "Approve"}</button>`
             + `<button data-action="discuss-finding" data-thread="${esc(t.threadId)}">Discuss</button></div>`
         : "";
-    return `<div class="thread${collapsed ? " collapsed" : ""}" data-thread-id="${esc(t.threadId)}">${head}<div class="thread-body">${original}${t.messages.map((m, i) => messageHtml(m) + (i === 0 ? findingEvidenceHtml(t.agentReview) : "")).join("")}${actions}${reply}</div></div>`;
+    return `<div class="thread${collapsed ? " collapsed" : ""}" data-thread-id="${esc(t.threadId)}">${head}<div class="thread-body">${original}${t.messages.map((m, i) => messageHtml(m) + (i === 0 ? findingEvidenceHtml(t.agentReview) : "")).join("")}${actions}${reply}${threadStatusActionHtml(t)}</div></div>`;
+}
+
+// One-click Resolve for an active thread or Reactivate for any other status; the header dropdown keeps the rest.
+function threadStatusActionHtml(t: ReviewThread): string {
+    const pending = state.statusUpdates.get(t.threadId);
+    const resolve = t.status === "active";
+    const target: ThreadStatus = resolve ? "resolved" : "active";
+    const label = pending ? (pending === "active" ? "Reactivating…" : "Resolving…") : resolve ? "Resolve" : "Reactivate";
+    const title = resolve ? "Mark this thread resolved" : "Reopen this thread as active";
+    return `<div class="thread-status-actions"><button type="button" data-action="thread-status" data-thread="${esc(t.threadId)}" data-status="${target}" title="${title}"`
+        + `${pending ? ` disabled aria-busy="true"` : ""}>${label}</button></div>`;
+}
+
+// Saves a thread status through the same endpoint as the header dropdown. A failure is reported and the
+// reloaded state keeps the thread's previous status.
+async function setThreadStatus(threadId: string, status: ThreadStatus): Promise<void> {
+    if (state.statusUpdates.has(threadId)) return;
+    state.statusUpdates.set(threadId, status);
+    render();
+    try {
+        try {
+            await api("POST", `threads/${encodeURIComponent(threadId)}/status`, { status });
+            if (status !== "active") state.expanded.delete(threadId);
+        } catch (err: unknown) {
+            toast(errorMessage(err), true);
+        }
+        // Hold the guard until the reload, so a render before it cannot re-enable the stale controls.
+        await loadState().catch((err: unknown) => toast(errorMessage(err), true));
+    } finally {
+        state.statusUpdates.delete(threadId);
+        render();
+    }
 }
 
 // Explains an empty diff and, for pending changes, offers the way back to the full branch diff.
@@ -3329,6 +3364,20 @@ async function onClick(e: MouseEvent): Promise<void> {
                 }
                 break;
             }
+            case "thread-status": {
+                const id = value("thread");
+                const status = value("status");
+                if (!id || !isThreadStatus(status)) break;
+                await setThreadStatus(id, status);
+                // Re-rendering dropped focus from the button. Put it back on the thread unless the user moved it
+                // while the save was pending. A placed thread reactivated from Overview becomes an Active threads link.
+                if (document.activeElement && document.activeElement !== document.body) break;
+                const thread = `[data-thread-id="${CSS.escape(id)}"]`;
+                (document.querySelector<HTMLElement>(`${thread}:not(.collapsed) [data-action="thread-status"]`)
+                    ?? document.querySelector<HTMLElement>(`${thread} [data-action="toggle"]`)
+                    ?? document.querySelector<HTMLElement>(`.list-row [data-action="jump"][data-thread="${CSS.escape(id)}"]`))?.focus();
+                break;
+            }
             case "discuss-description":
                 focusComposer("overview:new");
                 break;
@@ -3637,14 +3686,7 @@ async function onChange(e: Event): Promise<void> {
     if (el.dataset?.action !== "status") return;
     const threadId = el.dataset.thread;
     if (!threadId || !isThreadStatus(el.value)) return;
-    try {
-        await api("POST", `threads/${encodeURIComponent(threadId)}/status`, { status: el.value });
-        if (el.value !== "active") state.expanded.delete(threadId);
-        await loadState();
-    } catch (err: unknown) {
-        toast(errorMessage(err), true);
-        await loadState().catch(() => undefined);
-    }
+    await setThreadStatus(threadId, el.value);
 }
 
 function updateReviewCommands(textarea: HTMLTextAreaElement): void {
@@ -3758,9 +3800,9 @@ function onKeyDown(e: KeyboardEvent): void {
             menu.hidden = true;
             return;
         }
-        if (options.length && (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Enter")) {
+        if (options.length && (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Enter" || e.key === "Tab")) {
             e.preventDefault();
-            if (e.key === "Enter") options[Math.max(0, selected)].click();
+            if (e.key === "Enter" || e.key === "Tab") options[Math.max(0, selected)].click();
             else {
                 const next = (selected + (e.key === "ArrowDown" ? 1 : -1) + options.length) % options.length;
                 options.forEach((option, index) => option.classList.toggle("selected", index === next));
