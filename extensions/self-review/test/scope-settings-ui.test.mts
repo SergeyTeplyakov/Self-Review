@@ -695,6 +695,53 @@ test("status shows the parallel limit separately from queued, running and applyi
     assert.doesNotMatch(status(), /Parallelism/);
     assert.match(status(), /Copilot busy<\/span>/);
 });
+
+test("the Parallelism badge opens the repository concurrency control and disappears after saving serial mode", async () => {
+    const calls: CapturedPost[] = [];
+    const app = await loadApp({ fetch: async (url, init) => {
+        calls.push([init?.method ?? "GET", url, requestBody(init)]);
+        return jsonResponse(settingsFixture({ commentConcurrency: 1 }));
+    } });
+    app.state.review = reviewFixture();
+    app.state.settings = settingsFixture({ commentConcurrency: 3 });
+    app.run("renderTop()");
+    const badge = required(app.node("#top").innerHTML.match(/<button\b[^>]*data-action="([^"]+)"[^>]*>Parallelism: 3<\/button>/));
+    const click = clicker(app);
+    await click(badge[1]);
+    assert.match(app.node("#dialog").innerHTML, /<option value="3" selected>3<\/option>/);
+    assert.equal(app.focused.at(-1), '#dialog select[name="commentConcurrency"]');
+    await click("dialog-cancel");
+    assert.equal(app.focused.at(-1), `[data-action="${badge[1]}"]`);
+    assert.deepEqual(calls, []);
+
+    await click(badge[1]);
+    await app.run("onChange")({ target: { name: "commentConcurrency", value: "1" } });
+    await click("dialog-save");
+    assert.deepEqual(calls, [["POST", "/api/settings", { autoSaveLearnedRules: false, delivery: "immediate", commentConcurrency: 1 }]]);
+    assert.doesNotMatch(app.node("#top").innerHTML, /Parallelism/);
+    assert.equal(app.focused.at(-1), '[data-action="configure"]');
+});
+
+test("saving parallelism with parallel mode enabled restores focus to the badge", async () => {
+    const calls: CapturedPost[] = [];
+    const app = await loadApp({ fetch: async (url, init) => {
+        calls.push([init?.method ?? "GET", url, requestBody(init)]);
+        return jsonResponse(settingsFixture({ commentConcurrency: 2 }));
+    } });
+    app.state.review = reviewFixture();
+    app.state.settings = settingsFixture({ commentConcurrency: 3 });
+    app.run("renderTop()");
+
+    const click = clicker(app);
+    await click("configure-parallelism");
+    await app.run("onChange")({ target: { name: "commentConcurrency", value: "2" } });
+    await click("dialog-save");
+
+    assert.deepEqual(calls, [["POST", "/api/settings", { autoSaveLearnedRules: false, delivery: "immediate", commentConcurrency: 2 }]]);
+    assert.match(app.node("#top").innerHTML, /Parallelism: 2/);
+    assert.equal(app.focused.at(-1), '[data-action="configure-parallelism"]');
+});
+
 const bundledCatalog = (selected = NAMES) => ({ bundled: true, selected, defaults: { selected, saved: selected !== NAMES }, skills: NAMES.map((name, i) => ({
     name, role: i === 2 ? "ponytail" : "review", title: name, summary: `Summary of ${name}`, modified: false, sha256: "0".repeat(64),
     upstream: { repository: i === 2 ? "https://github.com/DietrichGebert/ponytail" : "https://github.com/addyosmani/agent-skills", release: i === 2 ? "v5.3.3" : "0.6.15", releaseCommit: "1".repeat(40), path: `skills/${name}/SKILL.md`, fileCommit: "abcdef1234567890" },
@@ -736,7 +783,7 @@ test("Agent review settings has a heading, General and Review skills tabs, no Ru
 test("header rerenders preserve the open Settings menu and focused menu control", async () => {
     const app = await loadApp();
     app.state.review = reviewFixture();
-    app.state.settings = settingsFixture();
+    app.state.settings = settingsFixture({ commentConcurrency: 3 });
     app.state.agentReviewAvailable = true;
 
     const focusEvents: string[] = [];
@@ -745,10 +792,15 @@ test("header rerenders preserve the open Settings menu and focused menu control"
         dataset: { action: "configure" },
         focus: () => focusEvents.push("configure"),
     });
+    const badge = Object.assign(new MockElement("BUTTON"), {
+        dataset: { action: "configure-parallelism" },
+        focus: () => focusEvents.push("badge"),
+    });
     const menu = Object.assign(new MockElement("DETAILS"), { open: true });
     menu.contains = (node) => node === summary || node === configure;
     menu.querySelector = (selector) => selector === "summary" ? summary : selector === '[data-action="configure"]' ? configure : null;
-    app.node("#top").querySelector = (selector) => selector === ".review-settings-menu" ? menu : null;
+    app.node("#top").querySelector = (selector) => selector === ".review-settings-menu" ? menu
+        : selector === '[data-action="configure-parallelism"]' ? badge : null;
 
     app.document.activeElement = configure;
     app.run("renderTop()");
@@ -759,6 +811,10 @@ test("header rerenders preserve the open Settings menu and focused menu control"
     app.run("renderTop()");
     assert.equal(menu.open, true);
     assert.equal(focusEvents.at(-1), "summary", "focus on the Settings summary survives an update");
+
+    app.document.activeElement = badge;
+    app.run("renderTop()");
+    assert.equal(focusEvents.at(-1), "badge", "focus on the Parallelism badge survives an update");
 });
 
 test("bundled skill loading failures keep unsaved choices and can be retried", async () => {

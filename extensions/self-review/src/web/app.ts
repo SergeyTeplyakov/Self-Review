@@ -228,6 +228,7 @@ type Selection = { path: string; hunk: number; anchor: number; from: number; to:
 type RowPosition = { path: string; h: number; i: number; full: boolean };
 type ConfigureDialog = {
     type: "configure";
+    opener: "configure" | "configure-parallelism";
     autoSaveLearnedRules: boolean;
     delivery: DeliveryMode;
     commentConcurrency: number;
@@ -1566,6 +1567,7 @@ function renderTop() {
     const previousSettingsMenu = top.querySelector<HTMLDetailsElement>(".review-settings-menu");
     const active = document.activeElement;
     const activeInSettingsMenu = active instanceof HTMLElement && previousSettingsMenu?.contains(active);
+    const activeParallelismBadge = active instanceof HTMLElement && active.dataset.action === "configure-parallelism";
     const settingsMenuWasOpen = previousSettingsMenu?.open ?? false;
     const focusedSettingsSummary = activeInSettingsMenu && active === previousSettingsMenu?.querySelector("summary");
     const focusedSettingsAction = activeInSettingsMenu && active instanceof HTMLElement ? active.dataset.action : undefined;
@@ -1604,7 +1606,7 @@ function renderTop() {
         } else if (git.branch) parts.push(`<span class="pill warn">no upstream</span>`);
         if (git.uncommittedFiles) parts.push(`<span class="pill warn" title="Diff includes working-tree changes">${git.uncommittedFiles} uncommitted</span>`);
     }
-    if (limit > 1) parts.push(`<span class="pill" title="Maximum comments analyzed together in this repository">Parallelism: ${limit}</span>`);
+    if (limit > 1) parts.push(`<button type="button" class="pill" data-action="configure-parallelism" aria-haspopup="dialog" title="Change how many comments are analyzed together in this repository">Parallelism: ${limit}</button>`);
     if (state.connection === "lost") parts.push(`<span class="pill warn" title="If this persists, reopen the canvas">disconnected</span>`);
     else if (commentsActive) parts.push(`<span class="pill busy"><span class="dot"></span>Copilot working${counts}</span>`);
     else if (state.busy === true) parts.push(`<span class="pill busy" title="${queued ? "Copilot is finishing other work in this conversation. Queued comments start when it picks them up." : "Copilot is working in this conversation."}"><span class="dot"></span>Copilot busy${counts}</span>`);
@@ -1618,6 +1620,11 @@ function renderTop() {
     if (controls.length) parts.push(`<div class="review-controls">${controls.join("")}</div>`);
     top.innerHTML = parts.join("");
     const settingsMenu = top.querySelector<HTMLDetailsElement>(".review-settings-menu");
+    if (activeParallelismBadge) {
+        const badge = top.querySelector<HTMLButtonElement>('[data-action="configure-parallelism"]');
+        if (badge) badge.focus();
+        else settingsMenu?.querySelector<HTMLElement>("summary")?.focus();
+    }
     if (!settingsMenu) return;
     settingsMenu.open = settingsMenuWasOpen;
     if (activeInSettingsMenu) {
@@ -1724,26 +1731,27 @@ function renderDialog() {
     }
 }
 
-function openConfigure() {
+function openConfigure(opener: ConfigureDialog["opener"] = "configure") {
     if (!state.settings || state.dialog) return;
     const mappings = state.settings.instructionMappings.map((mapping) => ({ ...mapping }));
     state.dialog = {
-        type: "configure", autoSaveLearnedRules: autoSaveLearnedRules(), delivery: deliveryRepoMode(),
+        type: "configure", opener, autoSaveLearnedRules: autoSaveLearnedRules(), delivery: deliveryRepoMode(),
         commentConcurrency: state.settings.commentConcurrency ?? 1,
         originalInstructionMappings: mappings.map((mapping) => ({ ...mapping })),
         instructionMappings: mappings,
         saving: false, error: "",
     };
     renderDialog();
-    focusIn('#dialog input[name="autoSaveLearnedRules"]');
+    focusIn(opener === "configure-parallelism" ? '#dialog select[name="commentConcurrency"]' : '#dialog input[name="autoSaveLearnedRules"]');
 }
 
 function closeConfigure() {
     if (!state.dialog || state.dialog.saving) return;
-    const opener = state.dialog.type === "agent-review" ? state.dialog.opener ?? "agent-review" : "configure";
+    const opener = state.dialog.type === "agent-review" ? state.dialog.opener ?? "agent-review" : state.dialog.opener;
     state.dialog = null;
     renderDialog();
-    focusIn(`[data-action="${opener}"]`);
+    const returnTo = opener === "configure-parallelism" && (state.settings?.commentConcurrency ?? 1) <= 1 ? "configure" : opener;
+    focusIn(`[data-action="${returnTo}"]`);
 }
 
 function reviewSkillsSectionHtml(d: AgentReviewDialog): string {
@@ -2061,9 +2069,8 @@ async function saveConfigure(): Promise<void> {
                 expectedInstructionMappings: d.originalInstructionMappings,
             } : {}),
         });
-        state.dialog = null;
-        renderDialog();
-        focusIn('[data-action="configure"]');
+        d.saving = false;
+        closeConfigure();
         toast(`Saved. ${autoSaveLabel()} · Delivery: ${DELIVERY[deliveryRepoMode()].pill}`);
     } catch (err: unknown) {
         d.saving = false;
@@ -3453,7 +3460,8 @@ async function onClick(e: MouseEvent): Promise<void> {
                 }
                 break;
             case "configure":
-                openConfigure();
+            case "configure-parallelism":
+                openConfigure(action);
                 break;
             case "dialog-cancel":
                 closeConfigure();
