@@ -6,7 +6,13 @@ import path from "node:path";
 import { Delivery, ReviewService, SettingsService, Store, runGit } from "./modules.mjs";
 import type { SendOptions } from "../src/lib/delivery.mjs";
 
-async function fixture(t: TestContext, limit: number | null = 2) {
+function deferred() {
+    let resolve!: () => void;
+    const promise = new Promise<void>((done) => { resolve = done; });
+    return { promise, resolve };
+}
+
+async function fixture(t: TestContext, limit: number | null = 2, afterSend: (options: SendOptions) => Promise<void> = async () => {}) {
     const tmp = await realpath(await mkdtemp(path.join(os.tmpdir(), "sr-parallel-test-")));
     const root = path.join(tmp, "repo");
     t.after(() => rm(tmp, { recursive: true, force: true }));
@@ -29,6 +35,7 @@ async function fixture(t: TestContext, limit: number | null = 2) {
         autoSaveLearnedRules: async repoRoot => (await settings.get(repoRoot)).autoSaveLearnedRules,
         send: async options => {
             sent.push(options);
+            await afterSend(options);
             return `send-${sent.length}`;
         },
     });
@@ -110,6 +117,88 @@ test("immediate follow-ups stay queued behind a pending combined submission in t
 
     assert.equal(f.sent[1].mode, "enqueue");
     assert.doesNotMatch(f.sent[1].prompt, /^\[self-review parallel:/);
+});
+
+test("immediate follow-ups wait until a combined submission reaches the session queue", async t => {
+    const sendStarted = deferred();
+    const releaseBatch = deferred();
+    const followUpSent = deferred();
+    const completed: string[] = [];
+    const f = await fixture(t, 3, async options => {
+        if (options.prompt.includes("with 2 comments in 1 thread")) {
+            sendStarted.resolve();
+            await releaseBatch.promise;
+            completed.push("batch");
+        } else if (options.prompt.includes("Immediate follow-up")) {
+            followUpSent.resolve();
+            completed.push("follow-up");
+        }
+    });
+    await f.settings.update(f.root, { delivery: "batch" });
+    const first = await f.newThread("First batch comment", true);
+    await f.service.addMessage(f.reviewId, first.thread.threadId, { author: "user", body: "Second batch comment", hold: true });
+    const submission = f.delivery.submit(f.reviewId, "parallel-test");
+    await sendStarted.promise;
+
+    await f.settings.update(f.root, { delivery: "immediate" });
+    const followUp = await f.service.addMessage(f.reviewId, first.thread.threadId, { author: "user", body: "Immediate follow-up" });
+    const followUpDelivery = f.delivery.deliver(f.reviewId, first.thread.threadId, followUp.message.messageId, "parallel-test");
+    const sentBeforeRelease = await Promise.race([
+        followUpSent.promise.then(() => true),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 100)),
+    ]);
+
+    releaseBatch.resolve();
+    await Promise.all([submission, followUpDelivery]);
+    assert.equal(sentBeforeRelease, false);
+    assert.deepEqual(completed, ["batch", "follow-up"]);
+});
+
+test("parallel follow-ups wait for earlier claims to finish routing", async t => {
+    const firstSettingsRead = deferred();
+    const releaseFirstSettings = deferred();
+    const laterSend = deferred();
+    const f = await fixture(t, 3, async options => {
+        if (options.prompt.includes("Second comment")) laterSend.resolve();
+    });
+    const getSettings = f.settings.get.bind(f.settings);
+    let settingsReads = 0;
+    f.settings.get = async (...args) => {
+        const settings = await getSettings(...args);
+        if (++settingsReads === 1) {
+            firstSettingsRead.resolve();
+            await releaseFirstSettings.promise;
+        }
+        return settings;
+    };
+
+    const first = await f.newThread("First comment");
+    const firstDelivery = f.send(first);
+    await firstSettingsRead.promise;
+    const second = await f.newThread("Second comment");
+    const secondClaimed = deferred();
+    const onChanged = (event: { reviewId: string; reason: string }) => {
+        if (event.reviewId === f.reviewId && event.reason === "delivery") {
+            f.service.off("changed", onChanged);
+            secondClaimed.resolve();
+        }
+    };
+    f.service.on("changed", onChanged);
+    const secondDelivery = f.send(second);
+    await secondClaimed.promise;
+    const sentBeforeRelease = await Promise.race([
+        laterSend.promise.then(() => true),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 100)),
+    ]);
+
+    releaseFirstSettings.resolve();
+    await Promise.all([firstDelivery, secondDelivery]);
+    assert.equal(sentBeforeRelease, false);
+    assert.match(f.sent[0].prompt, /^\[self-review parallel:/);
+    assert.match(f.sent[1].prompt, /^\[self-review parallel:/);
+    const firstRun = /^\[self-review parallel:([^\]]+)\]/.exec(f.sent[0].prompt)?.[1];
+    const secondRun = /^\[self-review parallel:([^\]]+)\]/.exec(f.sent[1].prompt)?.[1];
+    assert.equal(secondRun, firstRun);
 });
 
 test("parallel processing starts newly eligible work while earlier workers are still running", async t => {
