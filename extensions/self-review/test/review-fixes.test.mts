@@ -397,12 +397,16 @@ test("file locations select existing files, fall back to the nearest folder, and
     await mkdir(path.join(repo, "docs"));
     await writeFile(path.join(outside, "secret.txt"), "external secret");
     await symlink(outside, path.join(repo, "escape"), process.platform === "win32" ? "junction" : "dir");
+    await symlink(path.join(root, "docs"), path.join(repo, "linked"), process.platform === "win32" ? "junction" : "dir");
     assert.deepEqual(await resolveRevealTarget(repo, "a.txt"), { path: path.join(root, "a.txt"), select: true });
     assert.deepEqual(await resolveRevealTarget(repo, "docs/deleted.md"), { path: path.join(root, "docs"), select: false });
     assert.deepEqual(await resolveRevealTarget(repo, "gone/deeper/deleted.md"), { path: root, select: false });
     // A path under a file must not fall back to opening that file in its default app.
     assert.deepEqual(await resolveRevealTarget(repo, "a.txt/child"), { path: root, select: false });
-    for (const bad of ["escape/secret.txt", "escape/missing.txt", "../outside/secret.txt"]) {
+    // A contained folder link is selected as the link, and a missing path under it opens the folder it points to.
+    assert.deepEqual(await resolveRevealTarget(repo, "linked"), { path: path.join(root, "linked"), select: true });
+    assert.deepEqual(await resolveRevealTarget(repo, "linked/deleted.md"), { path: path.join(root, "docs"), select: false });
+    for (const bad of ["escape/secret.txt", "escape/missing.txt", "escape/gone/missing.txt", "../outside/secret.txt"]) {
         await assert.rejects(resolveRevealTarget(repo, bad), /escapes repository/, bad);
     }
     for (const bad of ["", path.join(root, "a.txt"), "C:\\Windows\\notepad.exe"]) {

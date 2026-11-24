@@ -1,5 +1,5 @@
 import { execFile, spawn, type SpawnOptions } from "node:child_process";
-import { lstat, realpath } from "node:fs/promises";
+import { lstat, realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { safeJoin } from "./git.mjs";
 
@@ -15,8 +15,8 @@ function isMissing(error: unknown): boolean {
 }
 
 // Resolves a repository-relative path for the file manager. A path that no longer exists, such as a deleted
-// file, falls back to its nearest existing folder, which is opened rather than selected. The containing folder
-// is resolved through links, so a junction or directory symlink cannot reveal a location outside the repository.
+// file, falls back to its nearest existing folder, which is opened rather than selected. Links are resolved
+// before the containment check, so a junction or directory symlink cannot reveal a location outside the repository.
 export async function resolveRevealTarget(repoRoot: string, relPath: string): Promise<RevealTarget> {
     if (!relPath || path.isAbsolute(relPath) || path.win32.isAbsolute(relPath)) {
         throw new Error("Expected a repository-relative path.");
@@ -27,10 +27,16 @@ export async function resolveRevealTarget(repoRoot: string, relPath: string): Pr
     while (candidate !== root) {
         const parent = path.dirname(candidate);
         try {
-            const checked = safeJoin(root, path.relative(root, path.join(await realpath(parent), path.basename(candidate))));
-            const info = await lstat(checked);
+            if (select) {
+                // The item itself is selected, not followed, so an existing link is shown as the link.
+                const item = safeJoin(root, path.relative(root, path.join(await realpath(parent), path.basename(candidate))));
+                await lstat(item);
+                return { path: item, select };
+            }
+            // A fallback folder is opened, so follow a link to the folder it really is.
+            const folder = safeJoin(root, path.relative(root, await realpath(candidate)));
             // Only a folder may be opened directly; opening a file would launch it in its default app.
-            if (select || info.isDirectory()) return { path: checked, select };
+            if ((await stat(folder)).isDirectory()) return { path: folder, select };
         } catch (error) {
             if (!isMissing(error)) throw error;
         }
