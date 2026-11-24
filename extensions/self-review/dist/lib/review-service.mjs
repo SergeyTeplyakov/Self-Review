@@ -14,7 +14,7 @@ import { checkBatchImageBudget, commentImageIds } from "./comment-images.mjs";
 import { inferRuleDestination, previewRepositoryRuleDestination, saveRepositoryRule } from "./learned-rules.mjs";
 import { pathKey, selectInstructionMapping, validateMappingPrefixes } from "./settings.mjs";
 import { readGitBlob } from "./git-process.mjs";
-import { IMAGE_TYPES, imageType, MAX_IMAGE_BYTES } from "./image-format.mjs";
+import { DIFF_IMAGE_TYPES, diffImageType, MAX_IMAGE_BYTES } from "./image-format.mjs";
 export { ReviewError } from "../web/contracts.mjs";
 const errorMessage = (error) => String(error && typeof error === "object" && "message" in error ? error.message ?? error : error);
 export const THREAD_KINDS = ["overview", "file", "change", "line"];
@@ -743,10 +743,10 @@ export class ReviewService extends EventEmitter {
         // Git computes the worktree blob ID for diff without necessarily storing that blob.
         if (!bytes && side === "new")
             bytes = await this.git.readMatchingWorkingImage(repoRoot, file, oid);
-        const type = bytes && imageType(bytes);
+        const type = bytes && diffImageType(bytes);
         if (!bytes || !type)
             throw notFound("Image unavailable in this revision, unsupported, or over 2 MB.");
-        return { bytes, mimeType: IMAGE_TYPES[type] };
+        return { bytes, mimeType: DIFF_IMAGE_TYPES[type] };
     }
     // Validate gaps against the saved base as well as hunks so newer edits cannot leak into an older revision.
     async getFileContent(reviewId, revisionId, filePath) {

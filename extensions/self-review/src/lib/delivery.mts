@@ -245,7 +245,7 @@ export class Delivery extends EventEmitter {
             if (!thread || index <= 0) continue;
             for (const message of thread.messages.slice(0, index)) {
                 const delivery = message.delivery;
-                if (message.author !== "user" || submitted.has(message.messageId) || !delivery || delivery.parallel
+                if (message.author !== "user" || submitted.has(message.messageId) || !delivery?.attemptId || delivery.parallel
                     || !["saving", "queued", "processing"].includes(delivery.state)) continue;
                 predecessors.set(delivery.attemptId ?? message.messageId, { attemptId: delivery.attemptId, state: delivery.state });
             }

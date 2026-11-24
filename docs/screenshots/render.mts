@@ -1,6 +1,6 @@
 // Renders the README screenshots from a scripted demo review.
 //
-// Builds a throwaway git repo, seeds a review through the same ReviewService the canvas
+// Builds throwaway git repos, seeds reviews through the same ReviewService the canvas
 // uses, serves the real web UI, and captures it with Playwright in light and dark themes.
 //
 //   cd docs/screenshots
@@ -16,6 +16,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { crc32, deflateSync } from "node:zlib";
 import { chromium, type Browser, type Page } from "playwright-core";
 import assert from "node:assert/strict";
 import type { ReviewService as ReviewServiceContract } from "../../extensions/self-review/src/lib/review-service.mjs";
@@ -390,7 +391,7 @@ const git = (cwd: string, ...args: string[]) => runGit(cwd, [
     "-c", "user.name=Demo", "-c", "user.email=demo@example.com",
     "-c", "core.autocrlf=false", "-c", "commit.gpgsign=false", ...args]);
 
-async function writeFiles(repo: string, files: Record<string, string | null>) {
+async function writeFiles(repo: string, files: Record<string, string | Uint8Array | null>) {
     for (const [rel, text] of Object.entries(files)) {
         const full = path.join(repo, ...rel.split("/"));
         if (text === null) {
@@ -555,6 +556,82 @@ async function seed(tmp: string) {
     }
 
     return { reviewId, service, delivery, store, threads: { clamp: clamp.threadId, idempotent: idempotent.threadId } };
+}
+
+// ---------- Image diff review ----------
+
+type Rgba = readonly [number, number, number, number];
+
+// Encodes an 8-bit RGBA PNG, so the demo images need no binary fixtures in the repository.
+function png(width: number, height: number, pixel: (x: number, y: number) => Rgba): Buffer {
+    const stride = width * 4 + 1;
+    const raw = Buffer.alloc(stride * height);
+    for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) raw.set(pixel(x, y), y * stride + 1 + x * 4);
+    }
+    const chunk = (type: string, data: Buffer) => {
+        const body = Buffer.concat([Buffer.from(type, "latin1"), data]);
+        const framed = Buffer.alloc(body.length + 8);
+        framed.writeUInt32BE(data.length, 0);
+        body.copy(framed, 4);
+        framed.writeUInt32BE(crc32(body), body.length + 4);
+        return framed;
+    };
+    const header = Buffer.alloc(13);
+    header.writeUInt32BE(width, 0);
+    header.writeUInt32BE(height, 4);
+    header.set([8, 6, 0, 0, 0], 8); // 8-bit RGBA, not interlaced
+    const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    return Buffer.concat([signature, chunk("IHDR", header), chunk("IDAT", deflateSync(raw)), chunk("IEND", Buffer.alloc(0))]);
+}
+
+const CHART = { width: 640, height: 360, padding: 36 };
+const AXIS: Rgba = [101, 109, 118, 255];
+const TRANSPARENT: Rgba = [0, 0, 0, 0];
+
+// Bars on a transparent background, so the review's checkerboard shows around them.
+function barChart(bars: number[], color: Rgba): Buffer {
+    const { width, height, padding } = CHART;
+    const baseline = height - padding;
+    const slot = (width - 2 * padding) / bars.length;
+    return png(width, height, (x, y) => {
+        if (x >= padding && x < width - padding && y >= baseline && y < baseline + 3) return AXIS;
+        const index = Math.floor((x - padding) / slot);
+        const left = padding + index * slot;
+        const inBar = index >= 0 && index < bars.length && x >= left + slot * 0.2 && x < left + slot * 0.8
+            && y < baseline && y >= baseline - bars[index] * (baseline - padding);
+        return inBar ? color : TRANSPARENT;
+    });
+}
+
+const logo = (fill: string, mark: boolean) => file(`
+<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96">
+  <circle cx="48" cy="48" r="40" fill="${fill}"/>
+${mark ? '  <path d="M30 50 l12 12 l24 -26" fill="none" stroke="#fff" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>\n' : ""}</svg>
+`);
+
+async function seedImages(tmp: string, service: ReviewServiceContract) {
+    const repo = path.join(tmp, "dashboard");
+    const origin = path.join(tmp, "dashboard.git");
+    await runGit(tmp, ["init", "-q", "--bare", "-b", "main", origin]);
+    await runGit(tmp, ["init", "-q", "-b", "main", repo]);
+    await writeFiles(repo, {
+        "assets/usage-chart.png": barChart([0.42, 0.66, 0.5, 0.78], [9, 105, 218, 255]),
+        "assets/logo.svg": logo("#0969da", false),
+    });
+    await git(repo, "add", "-A");
+    await git(repo, "commit", "-q", "-m", "Add dashboard assets");
+    await git(repo, "remote", "add", "origin", origin);
+    await git(repo, "push", "-q", "-u", "origin", "main");
+    await git(repo, "checkout", "-q", "-b", "feature/weekly-usage");
+    await writeFiles(repo, {
+        "assets/usage-chart.png": barChart([0.48, 0.72, 0.58, 0.88, 0.64], [26, 127, 55, 255]),
+        "assets/logo.svg": logo("#1a7f37", true),
+    });
+    await git(repo, "add", "-A");
+    await git(repo, "commit", "-q", "-m", "Show weekly usage");
+    await git(repo, "push", "-q", "-u", "origin", "feature/weekly-usage");
+    return service.ensureReview({ repoPath: repo, base: "main", title: "Show weekly usage on the dashboard" });
 }
 
 // ---------- Capture ----------
@@ -825,6 +902,55 @@ async function capture(
     await context.close();
 }
 
+async function captureImages(browser: Browser, url: string, theme: "light" | "dark") {
+    const context = await browser.newContext({ viewport: { width: WIDTH, height: 900 }, deviceScaleFactor: 2, colorScheme: theme });
+    const page = await context.newPage();
+    await page.goto(url);
+    await page.locator("#side .nav-item").first().waitFor();
+    await page.locator("#banner:not([hidden])").waitFor();
+    await page.locator('#banner [data-action="learning-set"][data-enabled="false"]').click();
+    await page.locator("#banner").waitFor({ state: "hidden" });
+    await page.locator("#toast").waitFor({ state: "hidden" });
+    // Every visible preview must decode; a block that only rendered its fallback fails here.
+    const decoded = async (count: number) => {
+        const images = page.locator(".image-diff img[data-image-key]");
+        await page.waitForFunction((n) => {
+            const shown = [...document.querySelectorAll<HTMLImageElement>(".image-diff img[data-image-key]")];
+            return shown.length === n && shown.every((image) => image.complete && image.naturalWidth > 0);
+        }, count);
+        return images;
+    };
+    const selectMode = async (mode: string) => {
+        await page.locator(`.image-modes [data-action="image-mode"][data-mode="${mode}"]`).click();
+        await page.locator(`.image-modes [data-mode="${mode}"][aria-pressed="true"]`).waitFor();
+        await decoded(2);
+    };
+
+    // An SVG is rendered from a data: URL, never as live markup, and its text diff stays below the preview.
+    await nav(page, "file", "assets/logo.svg");
+    const logos = await decoded(2);
+    for (const src of await logos.evaluateAll((images: HTMLImageElement[]) => images.map((image) => image.src))) {
+        assert.match(src, /^data:image\/svg\+xml;base64,/);
+    }
+    assert.ok(await page.locator(".file-section .diff tr.row.add").count(), "the SVG keeps its text diff");
+
+    await nav(page, "file", "assets/usage-chart.png");
+    await decoded(2);
+    assert.equal(await page.locator(".image-diff .image-meta").count(), 2, "both sides show dimensions and size");
+    await selectMode("onion");
+    await page.locator('.image-diff input[data-image-control="opacity"]').waitFor();
+    await selectMode("swipe");
+    await page.locator('.image-diff input[data-image-control="split"]').waitFor();
+    await fitHeight(page, 1000);
+    if (!only || only.includes("image-diff")) {
+        const target = path.join(OUT, `image-diff-${theme}.png`);
+        await page.screenshot({ path: target });
+        console.log(`  ${path.relative(process.cwd(), target)}`);
+    }
+    await selectMode("2-up");
+    await context.close();
+}
+
 const tmp = await mkdtemp(path.join(os.tmpdir(), "mr-shots-"));
 let server: Awaited<ReturnType<typeof startReviewServer>> | undefined;
 let browser: Browser | undefined;
@@ -834,6 +960,7 @@ try {
         console.log("Screenshot fixture lessons saved.");
     } else {
         const { service, delivery } = seeded;
+        const imageReviewId = await seedImages(tmp, service);
         const extensionVersion = parseExtensionVersion(JSON.parse(await readFile(EXTENSION_VERSION_PATH, "utf8")) as unknown);
         let reviewId = seeded.reviewId;
         const settings = new SettingsService({ store: seeded.store });
@@ -867,6 +994,9 @@ try {
                 console.log(`${theme}:`);
                 await capture(browser, server.url, theme, resetLearning);
                 if ((await service.getReview(seeded.reviewId)).agentReviews?.length) throw new Error("Screenshots must not start reviews.");
+                reviewId = imageReviewId;
+                await captureImages(browser, server.url, theme);
+                reviewId = seeded.reviewId;
             }
         }
         if (KEEP) {

@@ -236,7 +236,14 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
                 if (url.searchParams.get("review") !== reviewId)
                     throw new HttpError(404, "not_found", "Not found.");
                 const { bytes, mimeType } = await service.getDiffImage(reviewId, parts[1], url.searchParams.get("path"), url.searchParams.get("side"));
-                return send(res, 200, bytes, mimeType);
+                res.writeHead(200, {
+                    "Content-Type": mimeType, "Content-Length": bytes.length, "Cache-Control": "no-store",
+                    "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer",
+                    // An SVG opened directly is a document; keep its scripts and external loads from running.
+                    "Content-Security-Policy": "default-src 'none'; img-src data:; style-src 'unsafe-inline'; sandbox",
+                });
+                res.end(bytes);
+                return;
             }
             if (parts[0] === "comment-images" && parts.length === 2) {
                 if (url.searchParams.get("review") !== reviewId)
