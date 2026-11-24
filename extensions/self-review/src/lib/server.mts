@@ -10,7 +10,7 @@ import type { FSWatcher } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { isRecord } from "../web/contracts.mjs";
-import { SCOPES, archivedThreadIds } from "./review-service.mjs";
+import { SCOPES } from "./review-service.mjs";
 import { SUGGESTED_REVIEWERS } from "./agent-review.mjs";
 import { resolveDelivery } from "./settings.mjs";
 import { findPullRequest as findBranchPullRequest } from "./pull-request.mjs";
@@ -270,21 +270,18 @@ export async function startReviewServer({
         return { pullRequest: entry.value, status: { checkedAt: entry.checkedAt, error: entry.error, commitsAfterHead } };
     }
 
-    // Counted once per pull request head and local HEAD; a failure only hides the count.
+    // Counted once per pull request head and local HEAD. An unavailable count is not kept, so a transient git failure only hides it until the next check.
     async function commitsAfterPullRequest(review: Review, headRefOid: string): Promise<number | null> {
         const key = `${review.repoRoot}\0${headRefOid}\0${review.git?.headCommit ?? ""}`;
-        if (!commitsAfterCache.has(key)) {
-            if (commitsAfterCache.size > 50) commitsAfterCache.clear();
-            commitsAfterCache.set(key, service.git.commitsAfter(review.repoRoot, headRefOid).catch(() => null));
-        }
-        return commitsAfterCache.get(key)!;
-    }
-
-    // History is read-only from the canvas; a page loaded before the merge must not write into an archived thread.
-    async function assertNotArchived(reviewId: string, threadId: string): Promise<void> {
-        if (archivedThreadIds(await service.getReview(reviewId)).has(threadId)) {
-            throw new HttpError(409, "conflict", "This thread moved to review history when its pull request merged. Use Start follow-up to continue it.");
-        }
+        const cached = commitsAfterCache.get(key);
+        if (cached) return cached;
+        if (commitsAfterCache.size > 50) commitsAfterCache.clear();
+        const counting = service.git.commitsAfter(review.repoRoot, headRefOid).catch(() => null);
+        commitsAfterCache.set(key, counting);
+        void counting.then((count) => {
+            if (count === null && commitsAfterCache.get(key) === counting) commitsAfterCache.delete(key);
+        });
+        return counting;
     }
 
     // An explicit draft flag wins; otherwise the repository's delivery mode decides, and an undecided ask-mode review holds.
@@ -442,7 +439,6 @@ export async function startReviewServer({
             if (revisionId !== undefined && typeof revisionId !== "string") {
                 throw new HttpError(400, "invalid_input", "revisionId must be a string.");
             }
-            await assertNotArchived(reviewId, parts[1]);
             const approved = await agentReview.approve(reviewId, parts[1], revisionId);
             const result = await delivery.deliver(reviewId, approved.threadId, approved.messageId, instanceId);
             return send(res, 200, { ...approved, ...result });
@@ -454,14 +450,12 @@ export async function startReviewServer({
             return send(res, 200, { threadId: thread.threadId, messageId: message.messageId, duplicate, draft: message.delivery?.state === "draft" });
         }
         if (parts[0] === "threads" && parts.length === 3 && parts[2] === "messages") {
-            await assertNotArchived(reviewId, parts[1]);
             const hold = await shouldHold(reviewId, body.draft);
             const { thread, message, duplicate } = await service.addMessage(reviewId, parts[1], { body: body.body, imageIds: body.imageIds, clientRequestId: body.clientRequestId, descriptionVersion: body.descriptionVersion, author: "user", hold });
             if (!duplicate && !hold) deliverAsync(reviewId, thread.threadId, message.messageId);
             return send(res, 200, { threadId: thread.threadId, messageId: message.messageId, duplicate, draft: message.delivery?.state === "draft" });
         }
         if (parts[0] === "threads" && parts.length === 3 && parts[2] === "status") {
-            await assertNotArchived(reviewId, parts[1]);
             const thread = await service.setThreadStatus(reviewId, parts[1], body.status);
             return send(res, 200, { threadId: thread.threadId, status: thread.status });
         }
@@ -473,7 +467,6 @@ export async function startReviewServer({
         if (parts[0] === "messages" && parts.length === 3 && parts[2] === "retry") {
             const { thread, message } = await service.findMessage(reviewId, parts[1]);
             if (message.author !== "user") throw new HttpError(400, "invalid_input", "Only user messages can be resent.");
-            await assertNotArchived(reviewId, thread.threadId);
             const result = await delivery.deliver(reviewId, thread.threadId, message.messageId, instanceId, { retry: true });
             return send(res, 200, result);
         }
@@ -482,7 +475,6 @@ export async function startReviewServer({
             if (message.author !== "user" || message.delivery?.state !== "draft") {
                 throw new HttpError(409, "conflict", "Only draft comments can be sent individually.");
             }
-            await assertNotArchived(reviewId, thread.threadId);
             return send(res, 200, await delivery.deliver(reviewId, thread.threadId, message.messageId, instanceId));
         }
         if (parts[0] === "messages" && parts.length === 3 && parts[2] === "discard") {

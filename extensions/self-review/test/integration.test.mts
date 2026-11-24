@@ -5,7 +5,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { Delivery, ReviewService, SettingsService, Store, runGit, startReviewServer } from "./modules.mjs";
+import { Delivery, ReviewService, SettingsService, Store, git as gitModule, runGit, startReviewServer } from "./modules.mjs";
 import type { FileContent, ReviewMessage, ReviewService as ReviewServiceType, ReviewThread } from "../src/lib/review-service.mjs";
 import type { SendOptions } from "../src/lib/delivery.mjs";
 import type { Store as StoreType } from "../src/lib/store.mjs";
@@ -976,7 +976,11 @@ test("a merged pull request completes the review: history keeps dispositions, la
     const squash = (await git(prRepo, "rev-parse", "HEAD")).stdout.trim();
     await git(prRepo, "checkout", "-q", "feature");
 
-    const prService = new ReviewService({ store: new Store(path.join(root, "data")) });
+    let gitBusy = false;
+    const prService = new ReviewService({ store: new Store(path.join(root, "data")), git: { ...gitModule, commitsAfter: async (repoRoot: string, oid: string) => {
+        if (gitBusy) throw new Error("git is busy");
+        return gitModule.commitsAfter(repoRoot, oid);
+    } } });
     const prompts: SendOptions[] = [];
     const prDelivery = new Delivery({ service: prService, send: async (options) => {
         prompts.push(options);
@@ -986,6 +990,10 @@ test("a merged pull request completes the review: history keeps dispositions, la
     const unresolved = (await prService.createThread(prReviewId, { kind: "line", path: "app.ts", side: "new", startLine: 3, endLine: 3, body: "Is line 3 right?", author: "user", hold: true })).thread;
     const resolved = (await prService.createThread(prReviewId, { kind: "overview", body: "Add a test", author: "user", hold: true })).thread;
     await prService.setThreadStatus(prReviewId, resolved.threadId, "resolved");
+    const inFlight = (await prService.createThread(prReviewId, { kind: "overview", body: "Rename the helper", author: "user", hold: true })).thread;
+    await prDelivery.deliver(prReviewId, inFlight.threadId, inFlight.messages[0].messageId, "merged-pr");
+    assert.equal(prompts.length, 1);
+    prompts.length = 0;
     const mergedAt = new Date().toISOString();
 
     const open: PullRequestInfo = { number: 5, url: "https://github.com/example/repo/pull/5", state: "open", baseRefName: "main", headRefOid: prHead, mergedAt: null, closedAt: null, mergeCommitOid: null };
@@ -1023,15 +1031,19 @@ test("a merged pull request completes the review: history keeps dispositions, la
     await git(prRepo, "commit", "-q", "-m", "later work");
     await writeFile(path.join(prRepo, "notes.md"), "uncommitted\n");
     lookup = async () => open;
+    gitBusy = true;
     state = await readState();
     assert.equal(state.pullRequest?.state, "open");
-    assert.deepEqual(state.pullRequestStatus && { error: state.pullRequestStatus.error, commitsAfterHead: state.pullRequestStatus.commitsAfterHead }, { error: null, commitsAfterHead: 1 });
+    assert.equal(state.pullRequestStatus?.commitsAfterHead, null, "a failed count only hides the pill");
+    gitBusy = false;
+    state = await readState();
+    assert.deepEqual(state.pullRequestStatus && { error: state.pullRequestStatus.error, commitsAfterHead: state.pullRequestStatus.commitsAfterHead }, { error: null, commitsAfterHead: 1 }, "a failed count is not cached");
     assert.equal(state.review.completions?.length ?? 0, 0);
 
     lookup = async () => ({ ...open, state: "merged", mergedAt, closedAt: mergedAt, mergeCommitOid: squash });
     state = await readState();
     const completion = required(state.review.completions?.[0]);
-    assert.deepEqual(completion.archivedThreadIds, [unresolved.threadId, resolved.threadId]);
+    assert.deepEqual(completion.archivedThreadIds, [unresolved.threadId, resolved.threadId, inFlight.threadId]);
     assert.equal(completion.deliveredRevisionId, "r1");
     assert.equal(thread(state, unresolved.threadId).status, "active", "archiving does not mark a finding fixed");
     assert.equal(thread(state, resolved.threadId).status, "resolved");
@@ -1048,6 +1060,16 @@ test("a merged pull request completes the review: history keeps dispositions, la
 
     assert.equal((await post(`threads/${unresolved.threadId}/messages`, { body: "Still wrong" })).status, 409);
     assert.equal((await post(`threads/${resolved.threadId}/status`, { status: "active" })).status, 409);
+    assert.equal((await post(`messages/${unresolved.messages[0].messageId}/send`, {})).status, 409);
+    // Canvas actions call the service directly, so history is enforced there too.
+    const archivedError = /moved to review history/;
+    await assert.rejects(prService.setThreadStatus(prReviewId, unresolved.threadId, "resolved"), archivedError);
+    await assert.rejects(prService.addMessage(prReviewId, resolved.threadId, { author: "agent", body: "Done", outcome: "answered" }), archivedError);
+    await assert.rejects(prService.claimDelivery(prReviewId, unresolved.threadId, unresolved.messages[0].messageId), archivedError);
+    const late = await prService.addMessage(prReviewId, inFlight.threadId, { author: "agent", body: "Renamed it", outcome: "answered" });
+    assert.equal(late.thread.messages[0].delivery?.state, "replied", "the agent can still answer a comment sent before the merge");
+    await assert.rejects(prService.addMessage(prReviewId, inFlight.threadId, { author: "agent", body: "One more thing", outcome: "answered" }), archivedError);
+    assert.equal(thread(await readState(), unresolved.threadId).status, "active");
     assert.equal((await post("submit", {})).status, 200);
     assert.equal(prompts.length, 0, "Submit review leaves archived drafts in history");
     assert.equal((await post("follow-up", { threadIds: ["missing"] })).status, 400);

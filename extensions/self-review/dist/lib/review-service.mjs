@@ -192,6 +192,12 @@ function findThread(review, threadId) {
 export function archivedThreadIds(review) {
     return new Set(review.completions?.flatMap((c) => c.archivedThreadIds) ?? []);
 }
+// Checked inside each mutation's store update, so neither a canvas action nor a merge recorded mid-request can change history.
+export function assertNotArchived(review, threadId) {
+    if (archivedThreadIds(review).has(threadId)) {
+        throw new ReviewError("conflict", "This thread moved to review history when its pull request merged. Use Start follow-up to continue it.");
+    }
+}
 const DISPOSITIONS = { active: "unresolved", resolved: "resolved", wontfix: "won't fix", closed: "closed" };
 function followUpBody(thread, pullRequest) {
     const first = thread.messages[0]?.body ?? "";
@@ -1005,6 +1011,8 @@ export class ReviewService extends EventEmitter {
             if (dup)
                 return { write: false, value: { thread: dup.thread, message: dup.message, duplicate: true } };
             const thread = findThread(review, threadId);
+            if (author === "user")
+                assertNotArchived(review, threadId);
             const message = {
                 messageId: `m-${randomUUID()}`,
                 author,
@@ -1031,6 +1039,9 @@ export class ReviewService extends EventEmitter {
                 if (target?.delivery?.state === "draft") {
                     throw new ReviewError("conflict", `Message ${input.inReplyTo} is a draft the reviewer has not sent yet; reply after it is delivered.`);
                 }
+                // The agent may still answer a comment sent before the merge; its work is not lost.
+                if (!target?.delivery || target.delivery.state === "replied")
+                    assertNotArchived(review, threadId);
                 if (input.parallelAttemptId && (target?.delivery?.attemptId !== input.parallelAttemptId
                     || !target.delivery.parallel || target.delivery.state !== "processing")) {
                     throw new ReviewError("conflict", "This parallel comment attempt is no longer processing.");
@@ -1202,6 +1213,7 @@ export class ReviewService extends EventEmitter {
             if (isRetiredCommitReview(review))
                 throw retiredCommitError(review);
             const t = findThread(review, threadId);
+            assertNotArchived(review, threadId);
             t.status = status;
             return { review, value: t };
         });
@@ -1218,6 +1230,7 @@ export class ReviewService extends EventEmitter {
             const message = findThread(review, threadId).messages.find((m) => m.messageId === messageId);
             if (!message || message.author !== "user")
                 throw invalid(`Message ${messageId} is not a user message in ${threadId}.`);
+            assertNotArchived(review, threadId);
             const current = message.delivery;
             const initial = current?.state === "draft" || (current?.state === "saving" && !current.attempts);
             if (!initial && !(retry && ["failed", "no-reply"].includes(current?.state ?? "")))
