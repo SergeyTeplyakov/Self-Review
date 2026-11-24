@@ -10,7 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import {
     Delivery, ReviewService, SettingsService, Store, captureSnapshot, hunkExcerpt, normalizeRemoteUrl,
-    parseUnifiedDiff, readWorkingFile, relocate, resolveRevealTarget, runGit, safeJoin,
+    parseUnifiedDiff, readWorkingFile, relocate, resolveRevealTarget, revealInFileManager, runGit, safeJoin,
 } from "./modules.mjs";
 import type { MessageDelivery, Review, ReviewMessage, ReviewService as ReviewServiceType, ThreadInput } from "../src/lib/review-service.mjs";
 import type { Store as StoreType } from "../src/lib/store.mjs";
@@ -408,6 +408,20 @@ test("file locations select existing files, fall back to the nearest folder, and
     for (const bad of ["", path.join(root, "a.txt"), "C:\\Windows\\notepad.exe"]) {
         await assert.rejects(resolveRevealTarget(repo, bad), /repository-relative/, bad);
     }
+});
+
+test("Linux file locations wait for xdg-open and report its failure", { skip: process.platform !== "linux" }, async (t) => {
+    const bin = await temporary(t);
+    const opened = path.join(bin, "opened");
+    await writeFile(path.join(bin, "xdg-open"), `#!/bin/sh\nprintf '%s' "$1" > '${opened}'\nexit "$XDG_OPEN_EXIT"\n`, { mode: 0o755 });
+    const saved = { PATH: process.env.PATH, XDG_OPEN_EXIT: process.env.XDG_OPEN_EXIT };
+    t.after(() => Object.assign(process.env, saved));
+    process.env.PATH = `${bin}${path.delimiter}${saved.PATH ?? ""}`;
+    process.env.XDG_OPEN_EXIT = "0";
+    await revealInFileManager({ path: path.join(bin, "docs", "a.txt"), select: true });
+    assert.equal(await readFile(opened, "utf8"), path.join(bin, "docs"), "a selected file opens its folder");
+    process.env.XDG_OPEN_EXIT = "3";
+    await assert.rejects(revealInFileManager({ path: bin, select: false }), "a failing file manager is reported");
 });
 
 test("safeJoin accepts names that start with two dots and rejects parent traversal", async (t) => {

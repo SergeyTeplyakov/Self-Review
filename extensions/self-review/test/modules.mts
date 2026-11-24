@@ -49,7 +49,7 @@ export const { createSettingsApi } = settingsApi;
 export const { REVIEW_COMMANDS, reviewCommandSuggestions, parseReviewCommand } = reviewCommands;
 export const { completionHooks, COMPLETION_REVIEW_GUIDANCE } = completionGuidance;
 export const { ReviewWatcher } = reviewWatcher;
-export const { resolveRevealTarget } = revealFileModule;
+export const { resolveRevealTarget, revealInFileManager } = revealFileModule;
 
 export async function loadExtension(): Promise<void> {
     const extensionUrl = new URL("../dist/extension.mjs", import.meta.url).href;

@@ -65,7 +65,8 @@ export function revealInFileManager({ path: target, select }) {
     }
     if (process.platform === "darwin")
         return run("/usr/bin/open", select ? ["-R", target] : [target]);
+    // xdg-open reports a missing or failing file manager only through its exit status.
     if (process.platform === "linux")
-        return launch("xdg-open", [select ? path.dirname(target) : target]);
+        return run("xdg-open", [select ? path.dirname(target) : target]);
     return Promise.reject(new Error("No file manager launcher is available on this platform."));
 }
