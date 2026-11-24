@@ -9,6 +9,7 @@ import { Delivery, ReviewService, SettingsService, Store, runGit, startReviewSer
 import type { FileContent, ReviewMessage, ReviewService as ReviewServiceType, ReviewThread } from "../src/lib/review-service.mjs";
 import type { SendOptions } from "../src/lib/delivery.mjs";
 import type { Store as StoreType } from "../src/lib/store.mjs";
+import type { PullRequestInfo } from "../types/contracts.js";
 
 const WEB_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "dist", "web");
 const lines = (n: number, f: (i: number) => string = (i) => `line ${i}`) => Array.from({ length: n }, (_, i) => f(i + 1)).join("\n") + "\n";
@@ -903,7 +904,10 @@ test("state returns the latest Overview after slow PR discovery and exposes capt
             assert.equal(branch, "feature");
             discoveryStarted();
             await discoveryGate;
-            return { number: 42, url: "https://github.com/example/repo/pull/42" };
+            return {
+                number: 42, url: "https://github.com/example/repo/pull/42", state: "open",
+                baseRefName: "main", headRefOid: null, mergedAt: null, closedAt: null, mergeCommitOid: null,
+            };
         },
     });
     t.after(() => server.close());
@@ -913,6 +917,7 @@ test("state returns the latest Overview after slow PR discovery and exposes capt
         review: { description: { body: string }; branch?: string | null };
         refresh: { status: string; error?: string };
         pullRequest: { number: number; url: string } | null;
+        pullRequestStatus: unknown;
     }> => {
         const response = await fetch(new URL(`/api/state${url.search}`, url));
         assert.equal(response.status, 200);
@@ -931,6 +936,7 @@ test("state returns the latest Overview after slow PR discovery and exposes capt
     assert.equal(latest.review.description.body, "Updated during discovery");
     assert.equal(latest.review.branch, "other-branch");
     assert.equal(latest.pullRequest, null, "PR metadata discovered for the old branch is not paired with the newer review");
+    assert.equal(latest.pullRequestStatus, null);
     assert.equal(latest.refresh.status, "idle");
 
     let releaseCapture = () => {};
@@ -949,4 +955,116 @@ test("state returns the latest Overview after slow PR discovery and exposes capt
     capture.mock.restore();
     await service.refresh(reviewId);
     assert.equal((await readState()).refresh.status, "idle");
+});
+
+test("a merged pull request completes the review: history keeps dispositions, later work stays active, follow-ups are held drafts", async (t) => {
+    const root = path.join(tmp, "merged-pr");
+    const prRepo = path.join(root, "repo");
+    await mkdir(root, { recursive: true });
+    await runGit(root, ["init", "-q", "-b", "main", prRepo]);
+    await writeFile(path.join(prRepo, "app.ts"), lines(10));
+    await git(prRepo, "add", ".");
+    await git(prRepo, "commit", "-q", "-m", "base");
+    await git(prRepo, "checkout", "-q", "-b", "feature");
+    await writeFile(path.join(prRepo, "app.ts"), lines(10, (i) => (i === 3 ? "line 3 PR" : `line ${i}`)));
+    await git(prRepo, "commit", "-q", "-am", "pull request work");
+    const prHead = (await git(prRepo, "rev-parse", "HEAD")).stdout.trim();
+    // GitHub squash-merges into main, so the branch commits never become ancestors of the base.
+    await git(prRepo, "checkout", "-q", "main");
+    await writeFile(path.join(prRepo, "app.ts"), lines(10, (i) => (i === 3 ? "line 3 PR" : `line ${i}`)));
+    await git(prRepo, "commit", "-q", "-am", "squashed pull request");
+    const squash = (await git(prRepo, "rev-parse", "HEAD")).stdout.trim();
+    await git(prRepo, "checkout", "-q", "feature");
+
+    const prService = new ReviewService({ store: new Store(path.join(root, "data")) });
+    const prompts: SendOptions[] = [];
+    const prDelivery = new Delivery({ service: prService, send: async (options) => {
+        prompts.push(options);
+        return `pr-message-${prompts.length}`;
+    } });
+    const prReviewId = await prService.ensureReview({ repoPath: prRepo, base: "main" });
+    const unresolved = (await prService.createThread(prReviewId, { kind: "line", path: "app.ts", side: "new", startLine: 3, endLine: 3, body: "Is line 3 right?", author: "user", hold: true })).thread;
+    const resolved = (await prService.createThread(prReviewId, { kind: "overview", body: "Add a test", author: "user", hold: true })).thread;
+    await prService.setThreadStatus(prReviewId, resolved.threadId, "resolved");
+    const mergedAt = new Date().toISOString();
+
+    const open: PullRequestInfo = { number: 5, url: "https://github.com/example/repo/pull/5", state: "open", baseRefName: "main", headRefOid: prHead, mergedAt: null, closedAt: null, mergeCommitOid: null };
+    let lookup = async (): Promise<PullRequestInfo | null> => { throw new Error("gh offline"); };
+    const server = await startReviewServer({
+        instanceId: "merged-pr", getReviewId: () => prReviewId, service: prService, delivery: prDelivery, webRoot: WEB_ROOT,
+        findPullRequest: async () => lookup(),
+    });
+    t.after(() => server.close());
+    const url = new URL(server.url);
+    const token = required(url.searchParams.get("t"));
+    const endpoint = (suffix: string) => new URL(`/api/${suffix}`, url);
+    type State = {
+        review: { threads: ReviewThread[]; completions?: Array<{ archivedThreadIds: string[]; deliveredRevisionId: string | null }>; currentRevisionId: string; git: { delivered?: { separation: string } } };
+        pullRequest: PullRequestInfo | null;
+        pullRequestStatus: { checkedAt: string | null; error: string | null; commitsAfterHead: number | null } | null;
+    };
+    const readState = async (): Promise<State> => {
+        const response = await fetch(endpoint(`state?pullRequest=refresh&t=${token}`));
+        assert.equal(response.status, 200);
+        return await response.json() as State;
+    };
+    const post = (suffix: string, value: unknown) => fetch(endpoint(suffix), {
+        method: "POST", headers: { "X-MR-Token": token, "X-MR-Review": prReviewId, "Content-Type": "application/json" }, body: JSON.stringify(value),
+    });
+    const thread = (state: State, threadId: string) => required(state.review.threads.find((x) => x.threadId === threadId));
+
+    let state = await readState();
+    assert.equal(state.pullRequestStatus?.error, "gh offline");
+    assert.equal(state.pullRequest, null);
+    assert.equal(state.review.completions?.length ?? 0, 0, "a failed lookup never completes the review");
+
+    await writeFile(path.join(prRepo, "later.ts"), "after the pull request\n");
+    await git(prRepo, "add", "later.ts");
+    await git(prRepo, "commit", "-q", "-m", "later work");
+    await writeFile(path.join(prRepo, "notes.md"), "uncommitted\n");
+    lookup = async () => open;
+    state = await readState();
+    assert.equal(state.pullRequest?.state, "open");
+    assert.deepEqual(state.pullRequestStatus && { error: state.pullRequestStatus.error, commitsAfterHead: state.pullRequestStatus.commitsAfterHead }, { error: null, commitsAfterHead: 1 });
+    assert.equal(state.review.completions?.length ?? 0, 0);
+
+    lookup = async () => ({ ...open, state: "merged", mergedAt, closedAt: mergedAt, mergeCommitOid: squash });
+    state = await readState();
+    const completion = required(state.review.completions?.[0]);
+    assert.deepEqual(completion.archivedThreadIds, [unresolved.threadId, resolved.threadId]);
+    assert.equal(completion.deliveredRevisionId, "r1");
+    assert.equal(thread(state, unresolved.threadId).status, "active", "archiving does not mark a finding fixed");
+    assert.equal(thread(state, resolved.threadId).status, "resolved");
+    assert.equal(state.review.git.delivered?.separation, "separated");
+    const active = await prService.getSnapshot(prReviewId, state.review.currentRevisionId);
+    assert.deepEqual(active.files.map((f) => f.path), ["later.ts", "notes.md"], "only work after the PR head stays active");
+    assert.equal((await readState()).review.completions?.length, 1, "a merge is recorded once");
+
+    lookup = async () => { throw new Error("rate limited"); };
+    state = await readState();
+    assert.equal(state.pullRequestStatus?.error, "rate limited");
+    assert.equal(state.pullRequest?.state, "merged", "the last known result is kept, marked stale");
+    assert.equal(state.review.completions?.length, 1);
+
+    assert.equal((await post(`threads/${unresolved.threadId}/messages`, { body: "Still wrong" })).status, 409);
+    assert.equal((await post(`threads/${resolved.threadId}/status`, { status: "active" })).status, 409);
+    assert.equal((await post("submit", {})).status, 200);
+    assert.equal(prompts.length, 0, "Submit review leaves archived drafts in history");
+    assert.equal((await post("follow-up", { threadIds: ["missing"] })).status, 400);
+
+    const followUp = await post("follow-up", { threadIds: [unresolved.threadId] });
+    assert.equal(followUp.status, 200);
+    const [followUpId] = (await followUp.json() as { threadIds: string[] }).threadIds;
+    const later = await post("threads", { kind: "overview", body: "New work", draft: true });
+    const laterId = (await later.json() as { threadId: string }).threadId;
+    state = await readState();
+    const created = thread(state, followUpId);
+    assert.equal(created.followUpOf, unresolved.threadId);
+    assert.equal(created.kind, "overview", "the original line is no longer in the active diff");
+    assert.equal(created.messages[0].delivery?.state, "draft");
+    assert.match(created.messages[0].body, /Is line 3 right\?/);
+    assert.equal(thread(state, unresolved.threadId).messages.length, 1, "the original thread is not modified");
+    assert.ok(![followUpId, laterId].some((id) => completion.archivedThreadIds.includes(id)));
+    assert.deepEqual(required(state.review.completions?.[0]).archivedThreadIds, completion.archivedThreadIds);
+    assert.equal(prompts.length, 0, "starting a follow-up sends nothing");
 });

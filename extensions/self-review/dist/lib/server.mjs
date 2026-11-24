@@ -8,10 +8,10 @@ import { watch } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import { isRecord } from "../web/contracts.mjs";
-import { SCOPES } from "./review-service.mjs";
+import { SCOPES, archivedThreadIds } from "./review-service.mjs";
 import { SUGGESTED_REVIEWERS } from "./agent-review.mjs";
 import { resolveDelivery } from "./settings.mjs";
-import { findOpenPullRequest } from "./pull-request.mjs";
+import { findPullRequest as findBranchPullRequest } from "./pull-request.mjs";
 import { SettingsHttp, HttpError } from "./settings-http.mjs";
 import { ReviewWatcher } from "./review-watcher.mjs";
 import { MAX_IMAGE_BYTES, readCommentImage, saveCommentImage } from "./comment-images.mjs";
@@ -129,12 +129,13 @@ function openInDefaultBrowser(url) {
         });
     });
 }
-export async function startReviewServer({ instanceId, getReviewId, service, delivery, webRoot, extensionVersion, log = () => { }, settings, onReviewChange, agentReview, reviewSkills, findPullRequest = findOpenPullRequest, openCommentLink = openInDefaultBrowser, }) {
+export async function startReviewServer({ instanceId, getReviewId, service, delivery, webRoot, extensionVersion, log = () => { }, settings, onReviewChange, agentReview, reviewSkills, findPullRequest = findBranchPullRequest, openCommentLink = openInDefaultBrowser, }) {
     const settingsHttp = new SettingsHttp(settings, log);
     const reviewWatcher = new ReviewWatcher(service, log);
     const token = randomBytes(24).toString("base64url");
     const clients = new Set();
     const pullRequestCache = new Map();
+    const commitsAfterCache = new Map();
     let port = 0;
     const broadcast = (event, data) => {
         const frame = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
@@ -188,26 +189,50 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
             service.setDelivery(reviewId, messageId, { state: "failed", error: errorMessage(err) }).catch(() => { });
         });
     };
-    async function readPullRequest(review) {
+    async function readPullRequest(review, force) {
         const branch = review.branch;
         if (!branch)
             return null;
         const key = `${review.repoRoot}\0${branch}`;
-        const cached = pullRequestCache.get(key);
-        if (cached && cached.expiresAt > Date.now())
-            return "promise" in cached ? cached.promise : cached.value;
-        const promise = Promise.resolve()
-            .then(() => findPullRequest(review.repoRoot, branch))
-            .catch((error) => {
-            log(`self-review: could not discover an open pull request: ${errorMessage(error)}`, "warning");
-            return null;
-        })
-            .then((value) => {
-            pullRequestCache.set(key, { value, expiresAt: Date.now() + PULL_REQUEST_CACHE_MS });
-            return value;
-        });
-        pullRequestCache.set(key, { promise, expiresAt: Infinity });
-        return promise;
+        let entry = pullRequestCache.get(key);
+        if (!entry)
+            pullRequestCache.set(key, entry = { value: null, checkedAt: null, error: null, expiresAt: 0 });
+        if (!entry.promise && (force || entry.expiresAt <= Date.now())) {
+            const next = entry;
+            next.promise = Promise.resolve()
+                .then(() => findPullRequest(review.repoRoot, branch))
+                .then((value) => {
+                Object.assign(next, { value, checkedAt: new Date().toISOString(), error: null });
+            }, (error) => {
+                log(`self-review: could not check the pull request: ${errorMessage(error)}`, "warning");
+                next.error = errorMessage(error);
+            })
+                .finally(() => {
+                next.expiresAt = Date.now() + PULL_REQUEST_CACHE_MS;
+                delete next.promise;
+            });
+        }
+        await entry.promise;
+        const commitsAfterHead = entry.value?.headRefOid && entry.value.state !== "closed"
+            ? await commitsAfterPullRequest(review, entry.value.headRefOid)
+            : null;
+        return { pullRequest: entry.value, status: { checkedAt: entry.checkedAt, error: entry.error, commitsAfterHead } };
+    }
+    // Counted once per pull request head and local HEAD; a failure only hides the count.
+    async function commitsAfterPullRequest(review, headRefOid) {
+        const key = `${review.repoRoot}\0${headRefOid}\0${review.git?.headCommit ?? ""}`;
+        if (!commitsAfterCache.has(key)) {
+            if (commitsAfterCache.size > 50)
+                commitsAfterCache.clear();
+            commitsAfterCache.set(key, service.git.commitsAfter(review.repoRoot, headRefOid).catch(() => null));
+        }
+        return commitsAfterCache.get(key);
+    }
+    // History is read-only from the canvas; a page loaded before the merge must not write into an archived thread.
+    async function assertNotArchived(reviewId, threadId) {
+        if (archivedThreadIds(await service.getReview(reviewId)).has(threadId)) {
+            throw new HttpError(409, "conflict", "This thread moved to review history when its pull request merged. Use Start follow-up to continue it.");
+        }
     }
     // An explicit draft flag wins; otherwise the repository's delivery mode decides, and an undecided ask-mode review holds.
     async function shouldHold(reviewId, draft) {
@@ -258,16 +283,25 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
             }
             if (parts[0] === "state" && parts.length === 1) {
                 const initial = await service.getReview(reviewId);
-                const [pullRequest, settingsState] = await Promise.all([readPullRequest(initial), settingsHttp.read(initial.repoRoot)]);
+                const [lookup, settingsState] = await Promise.all([
+                    readPullRequest(initial, url.searchParams.get("pullRequest") === "refresh"),
+                    settingsHttp.read(initial.repoRoot),
+                ]);
                 // PR discovery can outlive a scope/branch change; pair it only with the review it describes.
-                const review = await service.getReview(reviewId);
-                const currentPullRequest = initial.repoRoot === review.repoRoot && initial.branch === review.branch ? pullRequest : null;
+                let review = await service.getReview(reviewId);
+                const current = lookup && initial.repoRoot === review.repoRoot && initial.branch === review.branch ? lookup : null;
+                // Only a successful lookup may complete a review; a failed one leaves the last known state marked stale.
+                if (current?.pullRequest?.state === "merged" && !current.status.error
+                    && await service.recordCompletion(reviewId, current.pullRequest, initial.branch)) {
+                    review = await service.getReview(reviewId);
+                }
                 return send(res, 200, {
                     instanceId,
                     review,
                     refresh: service.refreshState(reviewId),
                     session: { busy: delivery.busy },
-                    pullRequest: currentPullRequest,
+                    pullRequest: current?.pullRequest ?? null,
+                    pullRequestStatus: current?.status ?? null,
                     agentReviewAvailable: Boolean(agentReview),
                     reviewSkillsAvailable: Boolean(reviewSkills),
                     agentReviewSuggestedModels: SUGGESTED_REVIEWERS,
@@ -366,6 +400,7 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
             if (revisionId !== undefined && typeof revisionId !== "string") {
                 throw new HttpError(400, "invalid_input", "revisionId must be a string.");
             }
+            await assertNotArchived(reviewId, parts[1]);
             const approved = await agentReview.approve(reviewId, parts[1], revisionId);
             const result = await delivery.deliver(reviewId, approved.threadId, approved.messageId, instanceId);
             return send(res, 200, { ...approved, ...result });
@@ -378,6 +413,7 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
             return send(res, 200, { threadId: thread.threadId, messageId: message.messageId, duplicate, draft: message.delivery?.state === "draft" });
         }
         if (parts[0] === "threads" && parts.length === 3 && parts[2] === "messages") {
+            await assertNotArchived(reviewId, parts[1]);
             const hold = await shouldHold(reviewId, body.draft);
             const { thread, message, duplicate } = await service.addMessage(reviewId, parts[1], { body: body.body, imageIds: body.imageIds, clientRequestId: body.clientRequestId, descriptionVersion: body.descriptionVersion, author: "user", hold });
             if (!duplicate && !hold)
@@ -385,13 +421,21 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
             return send(res, 200, { threadId: thread.threadId, messageId: message.messageId, duplicate, draft: message.delivery?.state === "draft" });
         }
         if (parts[0] === "threads" && parts.length === 3 && parts[2] === "status") {
+            await assertNotArchived(reviewId, parts[1]);
             const thread = await service.setThreadStatus(reviewId, parts[1], body.status);
             return send(res, 200, { threadId: thread.threadId, status: thread.status });
+        }
+        if (parts[0] === "follow-up" && parts.length === 1) {
+            if (pageReview !== reviewId)
+                throw new HttpError(409, "conflict", "Refresh the canvas before starting a follow-up.");
+            const threads = await service.startFollowUp(reviewId, body.threadIds);
+            return send(res, 200, { threadIds: threads.map((t) => t.threadId) });
         }
         if (parts[0] === "messages" && parts.length === 3 && parts[2] === "retry") {
             const { thread, message } = await service.findMessage(reviewId, parts[1]);
             if (message.author !== "user")
                 throw new HttpError(400, "invalid_input", "Only user messages can be resent.");
+            await assertNotArchived(reviewId, thread.threadId);
             const result = await delivery.deliver(reviewId, thread.threadId, message.messageId, instanceId, { retry: true });
             return send(res, 200, result);
         }
@@ -400,6 +444,7 @@ export async function startReviewServer({ instanceId, getReviewId, service, deli
             if (message.author !== "user" || message.delivery?.state !== "draft") {
                 throw new HttpError(409, "conflict", "Only draft comments can be sent individually.");
             }
+            await assertNotArchived(reviewId, thread.threadId);
             return send(res, 200, await delivery.deliver(reviewId, thread.threadId, message.messageId, instanceId));
         }
         if (parts[0] === "messages" && parts.length === 3 && parts[2] === "discard") {

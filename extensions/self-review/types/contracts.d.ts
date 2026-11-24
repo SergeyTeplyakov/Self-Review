@@ -98,3 +98,38 @@ export type SettingsTransport = <K extends keyof SettingsRequests>(
 ) => Promise<unknown>;
 
 export type Log = (message: string, level?: "info" | "warning" | "error") => void;
+
+export type PullRequestState = "open" | "merged" | "closed";
+
+// The branch's pull request as reported by GitHub CLI; validated before it is stored or shown.
+export interface PullRequestInfo {
+    number: number;
+    url: string;
+    state: PullRequestState;
+    baseRefName: string | null;
+    headRefOid: string | null;
+    mergedAt: string | null;
+    closedAt: string | null;
+    mergeCommitOid: string | null;
+}
+
+// error is set when the latest lookup failed; pullRequest is then the last known result, possibly stale.
+export interface PullRequestStatus {
+    checkedAt: string | null;
+    error: string | null;
+    commitsAfterHead: number | null;
+}
+
+// How an "all changes" diff left out work a merged pull request delivered:
+// separated: the diff starts at the PR head; in-base: the base already contains it;
+// unavailable: the PR head commit is not in the local repository; not-in-branch: HEAD does not contain the PR head.
+export type DeliveredSeparation = "separated" | "in-base" | "unavailable" | "not-in-branch";
+
+export interface ReviewCompletion {
+    pullRequest: PullRequestInfo;
+    completedAt: string;
+    // Threads moved to history by this completion; their status is left as it was.
+    archivedThreadIds: string[];
+    // The last revision captured before the merge, shown read-only as the delivered diff.
+    deliveredRevisionId: string | null;
+}

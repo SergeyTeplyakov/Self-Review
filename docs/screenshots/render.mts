@@ -983,6 +983,8 @@ try {
             agentReview,
             reviewSkills,
             webRoot: WEB_ROOT,
+            // The demo repository has no GitHub remote; without this the header would depend on the local gh setup.
+            findPullRequest: async () => null,
         });
         await mkdir(OUT, { recursive: true });
         browser = await launchBrowser();

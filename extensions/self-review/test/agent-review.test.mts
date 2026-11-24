@@ -979,7 +979,10 @@ test("review context exposes the baseline and caller guard; known outcomes persi
 test("HTTP settings persist user-wide defaults, expose read failures, and separate save from run", async (t) => {
     const f = await fixture(t);
     const logs: string[] = [];
-    const pullRequest = { number: 7, url: "https://github.com/SergeyTeplyakov/Self-Review/pull/7" };
+    const pullRequest = {
+        number: 7, url: "https://github.com/SergeyTeplyakov/Self-Review/pull/7", state: "open" as const,
+        baseRefName: "main", headRefOid: null, mergedAt: null, closedAt: null, mergeCommitOid: null,
+    };
     const lookups: Array<{ repoRoot: string; branch: string }> = [];
     const settings = new SettingsService({ store: f.store });
     const delivery = new Delivery({ service: f.service, sessionId: () => "session-a", send: async () => "unused" });
@@ -998,7 +1001,7 @@ test("HTTP settings persist user-wide defaults, expose read failures, and separa
         agentReviewSettingsAvailable: boolean;
         agentReviewSettingsError: string | null;
         agentReviewSuggestedModels: string[];
-        pullRequest: { number: number; url: string } | null;
+        pullRequest: { number: number; url: string; state: string } | null;
     }
     const state = async (): Promise<AgentReviewHttpState> =>
         await (await fetch(new URL("api/state", url), { headers })).json() as AgentReviewHttpState;

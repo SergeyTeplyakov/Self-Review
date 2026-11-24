@@ -1725,11 +1725,41 @@ test("the sidebar shows review scope near the file tree, and learning controls o
     assert.match(html, />3 uncommitted</);
     assert.doesNotMatch(toggle(side()), /disabled/);
 
-    app.state.pullRequest = { number: 7, url: "https://github.com/SergeyTeplyakov/Self-Review/pull/7" };
+    const pr = (overrides: Record<string, unknown> = {}) => ({
+        number: 7, url: "https://github.com/SergeyTeplyakov/Self-Review/pull/7", state: "open",
+        baseRefName: "main", headRefOid: "c0ffee", mergedAt: null, closedAt: null, mergeCommitOid: null, ...overrides,
+    });
+    app.state.pullRequest = pr();
+    app.state.pullRequestStatus = { checkedAt: "2026-01-02T00:00:00Z", error: null, commitsAfterHead: 2 };
     html = top();
-    assert.match(html, /<a class="pill pr-link" href="https:\/\/github\.com\/SergeyTeplyakov\/Self-Review\/pull\/7" target="_blank" rel="noopener noreferrer" title="Open pull request #7 in browser">Open PR #7<\/a>/);
+    assert.match(html, /<a class="pill pr-link pr-open" href="https:\/\/github\.com\/SergeyTeplyakov\/Self-Review\/pull\/7" target="_blank" rel="noopener noreferrer" title="[^"]*">PR #7 · Awaiting merge<\/a>/);
+    assert.match(html, /<span class="pill warn local-work"[^>]*>Not in PR #7: 2 commits · 3 uncommitted<\/span>/, "local work outside the open PR is called out separately");
+    assert.doesNotMatch(html, />3 uncommitted</);
+    assert.doesNotMatch(html, /Completed/);
+
+    app.state.pullRequestStatus = { checkedAt: "2026-01-02T00:00:00Z", error: "gh: network unreachable", commitsAfterHead: null };
+    html = top();
+    assert.match(html, /class="pill pr-link pr-stale warn"[^>]*title="Last known state: open\. Could not check[^"]*gh: network unreachable[^"]*">PR #7 · status may be stale<\/a>/);
+    app.state.pullRequest = pr({ state: "merged", mergedAt: "2026-01-02T00:00:00Z" });
+    assert.doesNotMatch(top(), /Completed/, "a failed lookup never reports a completion it did not observe");
     app.state.pullRequest = null;
-    assert.doesNotMatch(top(), /Open PR #7/);
+    assert.match(top(), /<span class="pill muted pr-stale"[^>]*>PR status unknown<\/span>/);
+
+    app.state.pullRequestStatus = { checkedAt: "2026-01-02T00:00:00Z", error: null, commitsAfterHead: 1 };
+    app.state.pullRequest = pr({ state: "merged", mergedAt: "2026-01-02T00:00:00Z" });
+    html = top();
+    assert.match(html, /class="pill pr-link pr-completed"[^>]*>Completed · PR #7 merged into main · [^<]+<\/a>/);
+    assert.match(html, />After PR #7: 1 commit · 3 uncommitted</, "work after the merged PR stays visible");
+
+    app.state.pullRequest = pr({ state: "closed", closedAt: "2026-01-02T00:00:00Z" });
+    html = top();
+    assert.match(html, />PR #7 closed without merging<\/a>/);
+    assert.match(html, />3 uncommitted</);
+    assert.doesNotMatch(html, /local-work|Completed/);
+
+    app.state.pullRequest = null;
+    app.state.pullRequestStatus = null;
+    assert.doesNotMatch(top(), /PR #7/);
 
     app.state.review = reviewFixture({ git: { branch: "feature", uncommittedFiles: 0 } });
     html = top();
@@ -1760,6 +1790,72 @@ test("the sidebar shows review scope near the file tree, and learning controls o
     assert.doesNotMatch(html, /review-settings-menu/);
     assert.match(html, /data-action="refresh"/);
     assert.equal(footer(), "");
+});
+
+test("a merged PR moves its comments to review history with their disposition, and Start follow-up posts only the selection", async () => {
+    const merged = {
+        number: 7, url: "https://github.com/SergeyTeplyakov/Self-Review/pull/7", state: "merged",
+        baseRefName: "main", headRefOid: "c0ffee", mergedAt: "2026-01-02T00:00:00Z", closedAt: "2026-01-02T00:00:00Z", mergeCommitOid: "beef",
+    };
+    const thread = (threadId: string, status: string, body: string, kind = "overview") =>
+        ({ threadId, kind, status, messages: [{ messageId: `${threadId}-m`, author: "user", body, createdAt: "2026-01-01" }] });
+    const review = reviewFixture({
+        currentRevisionId: "r2",
+        revisions: [
+            { revisionId: "r1", files: 1, additions: 1, deletions: 0, createdAt: "2026-01-01T00:00:00Z" },
+            { revisionId: "r2", files: 0, additions: 0, deletions: 0, createdAt: "2026-01-03T00:00:00Z" },
+        ],
+        git: { branch: "feature", headCommit: "abc", baseCommit: "c0ffee", upstream: null, uncommittedFiles: 0, delivered: { pullRequestNumber: 7, separation: "separated" } },
+        threads: [thread("old-open", "active", "Unfixed finding"), thread("old-done", "resolved", "Fixed finding"), thread("new", "active", "Later work")],
+        completions: [{ pullRequest: merged, completedAt: "2026-01-02T01:00:00Z", archivedThreadIds: ["old-open", "old-done"], deliveredRevisionId: "r1" }],
+    });
+    const posts: Array<[string, Record<string, unknown>]> = [];
+    const app = await loadApp({
+        fetch: async (url: string, options?: { method?: string; body?: string }) => {
+            if (options?.method === "POST") {
+                posts.push([url, requestBody(options)]);
+                return jsonResponse({ threadIds: ["follow"] });
+            }
+            if (url === "/api/state") {
+                return jsonResponse({ review, settings: settingsFixture(), pullRequest: merged, pullRequestStatus: { checkedAt: "2026-01-03T00:00:00Z", error: null, commitsAfterHead: 0 } });
+            }
+            if (url === "/api/snapshot/r1" || url === "/api/snapshot/r2") return jsonResponse({ revisionId: url.slice(-2), files: [] });
+            throw new Error(`unexpected request ${url}`);
+        },
+    });
+    app.run("render = () => {}");
+    await app.run("loadState()");
+    assert.deepEqual(app.read("state.review.threads.map((t) => t.threadId)"), ["new"], "archived threads leave the active review");
+    assert.deepEqual(app.read("state.archived.map((t) => [t.threadId, t.status])"), [["old-open", "active"], ["old-done", "resolved"]]);
+
+    app.run("renderSide()");
+    const side = app.node("#side").innerHTML;
+    assert.match(side, /data-view="overview"><span class="name">Overview<\/span><span class="count">1<\/span>/, "an archived unresolved comment is not counted as active work");
+    assert.match(side, /data-view="history"[^>]*><span class="name">Delivered in PR #7<\/span><span class="muted"[^>]*>2<\/span>/);
+    app.run("renderTop()");
+    assert.match(app.node("#top").innerHTML, /PR #7 head<\/span>/);
+
+    let html = app.run("historyView()");
+    assert.match(html, /Completed · <a href="https:\/\/github\.com\/SergeyTeplyakov\/Self-Review\/pull\/7"[^>]*>PR #7<\/a> merged into main/);
+    assert.match(html, /data-thread-id="old-open".*class="badge st-active"[^>]*>Unresolved<\/span>/s);
+    assert.match(html, /data-thread-id="old-done".*class="badge st-resolved"[^>]*>Resolved<\/span>/s);
+    assert.match(html, /1 was still unresolved/);
+    assert.match(html, /data-action="start-follow-up"[^>]* disabled>Start follow-up<\/button>/);
+    assert.doesNotMatch(html, /data-thread-id="new"/);
+    await settle();
+    assert.match(app.run("historyView()"), /The last revision before the merge had no changes/, "the delivered diff loads from the pre-merge revision");
+
+    const checkbox = Object.assign(new MockElement("INPUT"), { dataset: { action: "history-select", thread: "old-open" }, checked: true });
+    checkbox.closest = () => checkbox;
+    await app.run("onClick")({ target: checkbox });
+    html = app.run("historyView()");
+    assert.match(html, /data-thread="old-open"[^>]* checked>/);
+    assert.match(html, /data-action="start-follow-up"[^>]*>Start follow-up \(1\)<\/button>/);
+    assert.doesNotMatch(html, /Start follow-up \(1\)<\/button>.*disabled/s);
+
+    await clicker(app)("start-follow-up");
+    assert.deepEqual(posts, [["/api/follow-up", { threadIds: ["old-open"] }]]);
+    assert.equal(app.read("state.historySelection.size"), 0);
 });
 
 test("the first-use banner offers manual saving or auto-save, with the old dismissal still supported", async () => {

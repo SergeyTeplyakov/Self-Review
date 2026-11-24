@@ -35,7 +35,7 @@ export const { inferRuleDestination, previewRepositoryRuleDestination, saveRepos
 export const { readGitBlobPrefixes } = gitProcess;
 export const { diffImageType, isSvg, SVG_PROLOG_BYTES } = imageFormat;
 export const { buildCommentPrompt, buildBatchPrompt, marker } = prompt;
-export const { findOpenPullRequest } = pullRequest;
+export const { findPullRequest } = pullRequest;
 export const { ReviewService, computeReviewId, scopeOf } = reviewService;
 export const { ReviewSkills } = reviewSkillsModule;
 export const { startReviewServer } = server;

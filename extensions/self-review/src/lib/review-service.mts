@@ -16,7 +16,7 @@ import { pathKey, selectInstructionMapping, validateMappingPrefixes, type Settin
 import { readGitBlob } from "./git-process.mjs";
 import { DIFF_IMAGE_TYPES, diffImageType, MAX_IMAGE_BYTES } from "./image-format.mjs";
 export { ReviewError } from "../web/contracts.mjs";
-import type { InstructionMapping, Log, ReviewScope, DeliveryChoice } from "../../types/contracts.js";
+import type { DeliveredSeparation, InstructionMapping, Log, PullRequestInfo, ReviewCompletion, ReviewScope, DeliveryChoice } from "../../types/contracts.js";
 import type { Store } from "./store.mjs";
 import type { DiffFile, DiffSide } from "./diff.mjs";
 import type { Snapshot } from "./git.mjs";
@@ -91,6 +91,8 @@ export interface ReviewThread {
     messages: ReviewMessage[];
     agentReview?: FindingMetadata;
     ponytailReport?: { runId: string; revisionId: string };
+    // The archived thread this follow-up was started from.
+    followUpOf?: string;
 }
 
 export interface Lesson {
@@ -145,11 +147,14 @@ export interface Review {
         upstream: Snapshot["upstream"];
         uncommittedFiles: number;
         capturedAt: string;
+        delivered?: { pullRequestNumber: number; separation: DeliveredSeparation };
     } | null;
     deliveryMode?: DeliveryChoice;
     agentReviews?: AgentReviewRun[];
     description?: ReviewDescription;
     siblingReviewId?: string;
+    // Merged pull requests observed for this review, oldest first.
+    completions?: ReviewCompletion[];
     createdAt: string;
     updatedAt?: string;
     headCommit?: string;
@@ -397,6 +402,21 @@ function findThread(review: Review, threadId: string) {
     const thread = review.threads.find((t) => t.threadId === threadId);
     if (!thread) throw notFound(`Thread ${threadId} not found in review ${review.reviewId}.`);
     return thread;
+}
+
+// Threads a merged pull request moved to history. They keep their status but no longer count as active work.
+export function archivedThreadIds(review: Pick<Review, "completions">): Set<string> {
+    return new Set(review.completions?.flatMap((c) => c.archivedThreadIds) ?? []);
+}
+
+const DISPOSITIONS: Record<string, string> = { active: "unresolved", resolved: "resolved", wontfix: "won't fix", closed: "closed" };
+
+function followUpBody(thread: ReviewThread, pullRequest: PullRequestInfo | undefined) {
+    const first = thread.messages[0]?.body ?? "";
+    const quoted = (first.length > 2000 ? `${first.slice(0, 2000)}...` : first).split("\n").map((line) => `> ${line}`).join("\n");
+    const where = thread.kind === "overview" ? "overall comment" : `comment on ${thread.location?.path ?? thread.anchor?.path ?? "a file"}`;
+    const source = pullRequest ? `[PR #${pullRequest.number}](${pullRequest.url})` : "an earlier pull request";
+    return `Follow-up on a ${where} delivered in ${source}, left ${DISPOSITIONS[thread.status] ?? thread.status} (thread ${thread.threadId}):\n\n${quoted}`;
 }
 
 const normalizeRule = (rule: string) => rule.toLowerCase().replace(/\s+/g, " ").replace(/[\s.;:!,]+$/, "").trim();
@@ -839,6 +859,7 @@ export class ReviewService extends EventEmitter {
         const before = await this.getReview(reviewId);
         if (isRetiredCommitReview(before)) throw retiredCommitError(before);
         let snapshot;
+        const completion = before.completions?.at(-1);
         try {
             snapshot = await this.git.captureSnapshot({
                 repoRoot: before.repoRoot,
@@ -848,6 +869,7 @@ export class ReviewService extends EventEmitter {
                 includeUntracked: before.includeUntracked,
                 contextLines: before.contextLines,
                 scope: scopeOf(before),
+                delivered: completion?.pullRequest,
             });
         } catch (err) {
             if (isCurrent && !isCurrent()) return null;
@@ -865,6 +887,9 @@ export class ReviewService extends EventEmitter {
                 upstream: snapshot.upstream,
                 uncommittedFiles: snapshot.uncommittedFiles.length,
                 capturedAt: nowIso(),
+                ...(completion && snapshot.delivered
+                    ? { delivered: { pullRequestNumber: completion.pullRequest.number, separation: snapshot.delivered } }
+                    : {}),
             };
             const latest = review.revisions[review.revisions.length - 1];
             let created = false;
@@ -1078,6 +1103,79 @@ export class ReviewService extends EventEmitter {
         });
         this.changed(reviewId, "thread");
         return result;
+    }
+
+    // Records a merged pull request once and moves the threads that existed when it merged into history, keeping
+    // their status. The refresh that follows leaves the delivered commits out of the active diff where it can.
+    async recordCompletion(reviewId: string, pullRequest: PullRequestInfo, branch: string): Promise<boolean> {
+        if (pullRequest.state !== "merged") return false;
+        const recorded = await this.store.updateReview(reviewId, (review) => {
+            if (!review) throw notFound(`Review ${reviewId} not found.`);
+            if (isRetiredCommitReview(review) || scopeOf(review) !== "all") return { write: false, value: false };
+            // The lookup used the live branch; a review opened for another branch must not adopt its pull request.
+            if (review.branch !== branch || (review.originBranch ?? branch) !== branch) return { write: false, value: false };
+            if (review.completions?.some((c) => c.pullRequest.number === pullRequest.number)) return { write: false, value: false };
+            const mergedAt = pullRequest.mergedAt;
+            const beforeMerge = (at: string) => !mergedAt || at <= mergedAt;
+            const archived = archivedThreadIds(review);
+            const delivered = [...review.revisions].reverse().find((r) => beforeMerge(r.createdAt));
+            (review.completions ??= []).push({
+                pullRequest,
+                completedAt: nowIso(),
+                archivedThreadIds: review.threads.filter((t) => !archived.has(t.threadId) && beforeMerge(t.createdAt)).map((t) => t.threadId),
+                deliveredRevisionId: delivered?.revisionId ?? review.currentRevisionId,
+            });
+            return { review, value: true };
+        });
+        if (!recorded) return false;
+        this.changed(reviewId, "completion");
+        // A failed capture is reported through refreshState; the completion itself is already saved.
+        await this.refresh(reviewId).catch(() => null);
+        return true;
+    }
+
+    // Carries archived threads into new held drafts. The originals are left untouched and nothing is sent.
+    async startFollowUp(reviewId: string, threadIds: unknown): Promise<ReviewThread[]> {
+        if (!Array.isArray(threadIds) || !threadIds.length || !threadIds.every((id): id is string => typeof id === "string")) {
+            throw invalid("threadIds must be a non-empty list of thread IDs.");
+        }
+        const created = await this.store.updateReview(reviewId, async (review) => {
+            if (!review) throw notFound(`Review ${reviewId} not found.`);
+            if (isRetiredCommitReview(review)) throw retiredCommitError(review);
+            const snapshot = review.currentRevisionId ? await this.store.readSnapshot(reviewId, review.currentRevisionId) : null;
+            const inDiff = (filePath: string | undefined) => Boolean(filePath && snapshot?.files.some((f) => f.path === filePath));
+            const threads: ReviewThread[] = [];
+            for (const id of new Set(threadIds)) {
+                const completion = review.completions?.find((c) => c.archivedThreadIds.includes(id));
+                if (!completion) throw invalid(`Thread ${id} is not in review history.`);
+                const original = findThread(review, id);
+                const base = { body: followUpBody(original, completion.pullRequest), author: "user", hold: true };
+                const loc = original.location;
+                const candidates: ThreadInput[] = [];
+                if (loc && original.kind !== "overview" && inDiff(loc.path)) {
+                    if (loc.state === "current" && loc.revisionId === review.currentRevisionId && original.kind !== "file") {
+                        candidates.push({ ...base, kind: original.kind, path: loc.path, side: loc.side, startLine: loc.startLine, endLine: loc.endLine });
+                    }
+                    candidates.push({ ...base, kind: "file", path: loc.path });
+                }
+                candidates.push({ ...base, kind: "overview" });
+                let built: ThreadResult | undefined;
+                for (const input of candidates) {
+                    try {
+                        built = await this.buildThread(review, input);
+                        break;
+                    } catch (error) {
+                        if (!(error instanceof ReviewError) || input.kind === "overview") throw error;
+                    }
+                }
+                const thread = { ...built!.thread, followUpOf: id };
+                review.threads.push(thread);
+                threads.push(thread);
+            }
+            return { review, value: threads };
+        });
+        this.changed(reviewId, "thread");
+        return created;
     }
 
     async addMessage(reviewId: string, threadId: string, input: MessageInput): Promise<ThreadResult> {
@@ -1311,7 +1409,8 @@ export class ReviewService extends EventEmitter {
         const claims = await this.store.updateReview(reviewId, async (review) => {
             if (!review) throw notFound(`Review ${reviewId} not found.`);
             if (isRetiredCommitReview(review)) throw retiredCommitError(review);
-            const drafts = allMessages(review).filter((e) => e.message.author === "user" && e.message.delivery?.state === "draft");
+            const archived = archivedThreadIds(review);
+            const drafts = allMessages(review).filter((e) => e.message.author === "user" && e.message.delivery?.state === "draft" && !archived.has(e.thread.threadId));
             if (!drafts.length) return { write: false, value: [] };
             await checkBatchImageBudget(this.store, reviewId, drafts.flatMap(({ message }) => message.imageIds ?? []));
             const batchId = randomUUID();
@@ -1515,8 +1614,9 @@ export class ReviewService extends EventEmitter {
     summarize(review: Review, { threadId, includeResolved = false, maxBody = 2000 }: { threadId?: string; includeResolved?: boolean; maxBody?: number } = {}) {
         if (isRetiredCommitReview(review)) throw retiredCommitError(review);
         const isDraft = (m: ReviewMessage) => m.author === "user" && m.delivery?.state === "draft";
+        const archived = archivedThreadIds(review);
         const visible = review.threads.filter((t) => t.messages.some((m) => !isDraft(m)));
-        const threads = visible.filter((t) => (threadId ? t.threadId === threadId : includeResolved || t.status === "active"));
+        const threads = visible.filter((t) => (threadId ? t.threadId === threadId : includeResolved || (t.status === "active" && !archived.has(t.threadId))));
         return {
             reviewId: review.reviewId,
             title: review.title,
@@ -1527,17 +1627,21 @@ export class ReviewService extends EventEmitter {
             scope: scopeOf(review),
             currentRevisionId: review.currentRevisionId,
             git: review.git,
+            completions: review.completions ?? [],
             counts: {
                 total: visible.length,
-                active: visible.filter((t) => t.status === "active").length,
+                active: visible.filter((t) => t.status === "active" && !archived.has(t.threadId)).length,
+                archived: visible.filter((t) => archived.has(t.threadId)).length,
                 awaitingAgent: allMessages(review).filter((e) => ["queued", "processing", "failed", "no-reply"].includes(e.message.delivery?.state ?? "")).length,
-                drafts: allMessages(review).filter((e) => isDraft(e.message)).length,
+                drafts: allMessages(review).filter((e) => isDraft(e.message) && !archived.has(e.thread.threadId)).length,
             },
             threads: threads.map((t) => ({
                 threadId: t.threadId,
                 kind: t.kind,
                 agentReview: t.agentReview,
                 status: t.status,
+                ...(archived.has(t.threadId) ? { archived: true } : {}),
+                ...(t.followUpOf ? { followUpOf: t.followUpOf } : {}),
                 location: t.location,
                 originalLocation: t.anchor ? { revisionId: t.anchor.revisionId, path: t.anchor.path, side: t.anchor.side, startLine: t.anchor.startLine, endLine: t.anchor.endLine } : null,
                 messages: t.messages.filter((m) => !isDraft(m)).map((m) => ({
