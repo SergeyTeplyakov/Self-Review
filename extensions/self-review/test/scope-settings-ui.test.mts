@@ -1516,6 +1516,86 @@ test("Discuss only opens a composer; Approve explicitly sends the finding and re
     assert.equal(app.state.approving.size, 0);
 });
 
+test("Resolve and Reactivate change thread status in one click, show progress, and keep the status when saving fails", async () => {
+    const posts: CapturedPost[] = [];
+    let fail = false;
+    let release = () => {};
+    const app = await loadApp({
+        CSS: { escape: (value: string) => value },
+        fetch: async (url: string, opts?: { method?: string; body?: string }) => {
+            posts.push([url, requestBody(opts)]);
+            await new Promise<void>((resolve) => { release = resolve; });
+            return fail ? jsonResponse({ error: { message: "disk full" } }, 500) : jsonResponse({ ok: true });
+        },
+    });
+    app.run("render = () => {}; loadState = async () => {}");
+    const thread = { threadId: "t1", kind: "overview", status: "active", messages: [{ messageId: "m", author: "user", body: "Fix it", createdAt: "2026-01-01T00:00:00Z" }] };
+    const html = () => app.run(`threadHtml(${JSON.stringify(thread)})`);
+    assert.match(html(), /<button type="button" data-action="thread-status" data-thread="t1" data-status="resolved"[^>]*>Resolve<\/button>/);
+    assert.doesNotMatch(html(), /Reactivate/);
+    for (const status of ["resolved", "wontfix", "closed"]) {
+        thread.status = status;
+        assert.match(html(), /data-action="thread-status" data-thread="t1" data-status="active"[^>]*>Reactivate<\/button>/, `${status} threads can be reactivated`);
+    }
+
+    const click = clicker(app);
+    thread.status = "active";
+    app.state.review = reviewFixture({ threads: [thread] });
+    app.state.expanded.add("t1");
+    const resolving = click("thread-status", { thread: "t1", status: "resolved" });
+    assert.match(html(), /disabled aria-busy="true">Resolving…<\/button>/);
+    assert.match(html(), /data-action="status"[^>]*disabled/, "the header dropdown waits for the pending update");
+    await click("thread-status", { thread: "t1", status: "resolved" });
+    release();
+    await resolving;
+    assert.deepEqual(posts, [["/api/threads/t1/status", { status: "resolved" }]], "a second click while pending sends nothing");
+    assert.equal(app.state.expanded.has("t1"), false, "a resolved thread collapses like one resolved from the dropdown");
+    assert.match(html(), />Resolve<\/button>/);
+
+    fail = true;
+    thread.status = "resolved";
+    const reactivating = click("thread-status", { thread: "t1", status: "active" });
+    assert.match(html(), /disabled aria-busy="true">Reactivating…<\/button>/);
+    release();
+    await reactivating;
+    assert.match(app.node("#toast").textContent, /disk full/);
+    assert.equal(app.node("#toast").className, "error");
+    assert.match(html(), /data-status="active" title="[^"]*">Reactivate<\/button>/, "the failed update leaves the button ready to retry");
+    assert.equal(app.run("state.statusUpdates.size"), 0);
+});
+
+test("thread status buttons stay disabled through the reload and restore focus only when the user left it", async () => {
+    let release = () => {};
+    const app = await loadApp({
+        CSS: { escape: (value: string) => value },
+        fetch: async () => {
+            await new Promise<void>((resolve) => { release = resolve; });
+            return jsonResponse({ ok: true });
+        },
+    });
+    app.run("var pendingDuringReload; render = () => {}; loadState = async () => { pendingDuringReload = state.statusUpdates.has('t1'); }");
+    const thread = { threadId: "t1", kind: "line", status: "active", messages: [{ messageId: "m", author: "user", body: "Fix it", createdAt: "2026-01-01T00:00:00Z" }] };
+    app.state.review = reviewFixture({ threads: [thread] });
+    const click = clicker(app);
+
+    let saving = click("thread-status", { thread: "t1", status: "resolved" });
+    app.document.activeElement = { tagName: "TEXTAREA", dataset: { composer: "reply:t2" } };
+    release();
+    await saving;
+    assert.equal(app.run("pendingDuringReload"), true, "the reload still sees the save in progress");
+    assert.equal(app.run("state.statusUpdates.size"), 0);
+    assert.deepEqual(app.focused, [], "focus stays in the composer the user moved to");
+
+    // Reactivating a placed thread from Closed threads leaves only its Active threads row.
+    app.document.activeElement = null;
+    const findNode = app.document.querySelector;
+    app.document.querySelector = (selector: string) => selector.startsWith("[data-thread-id") ? null as unknown as MockNode : findNode(selector);
+    saving = click("thread-status", { thread: "t1", status: "active" });
+    release();
+    await saving;
+    assert.deepEqual(app.focused, ['.list-row [data-action="jump"][data-thread="t1"]']);
+});
+
 test("file views show mode changes and side-specific EOF notes without selectable phantom lines", async () => {
     const app = await loadApp();
     app.state.review = reviewFixture();
