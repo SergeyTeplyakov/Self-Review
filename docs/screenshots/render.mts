@@ -765,6 +765,7 @@ async function capture(
     url: string,
     theme: "light" | "dark",
     resetLearning: () => Promise<void>,
+    notifyReviewChanged: () => void,
 ) {
     await resetLearning();
     const context = await browser.newContext({ viewport: { width: WIDTH, height: 900 }, deviceScaleFactor: 2, colorScheme: theme });
@@ -879,10 +880,14 @@ async function capture(
     // A separate page injects a scripted agentic review into the state it loads, so later shots keep the real review.
     if (!only || only.includes("agent-activity")) {
         const activity = await context.newPage();
+        let extraRuns = 0;
         await activity.route("**/api/state", async (route) => {
             const response = await route.fetch();
             const json = await response.json() as { review: Parameters<typeof demoAgentRuns>[0] & { agentReviews?: unknown[] } };
-            json.review.agentReviews = demoAgentRuns(json.review);
+            const runs = demoAgentRuns(json.review);
+            json.review.agentReviews = [...runs, ...Array.from({ length: extraRuns }, (_, i) => ({
+                ...runs[1], runId: `demo-extra-${i}`,
+            }))];
             await route.fulfill({ response, json });
         });
         await activity.setViewportSize({ width: WIDTH, height: 760 });
@@ -908,6 +913,22 @@ async function capture(
         await activity.keyboard.press("Escape");
         assert.equal(await pageToggle.evaluate((element) => element === document.activeElement), true);
         for (const trigger of [toggle, pageToggle]) assert.equal(await trigger.getAttribute("aria-expanded"), "false");
+        await activity.setViewportSize({ width: WIDTH, height: 280 });
+        extraRuns = 6;
+        notifyReviewChanged();
+        await activity.locator('#agent-activity-layer [data-run="demo-extra-5"]').first().waitFor({ state: "attached" });
+        await activity.addStyleTag({ content: '#main .agent-review-launch { position: fixed; top: 195px; right: 8px }' });
+        await pageToggle.click();
+        const footer = await panel.locator(".agent-activity-footer").boundingBox();
+        assert.ok(footer && footer.y >= 0 && footer.y + footer.height <= 280, "the footer fits inside a short viewport");
+        const body = panel.locator(".agent-activity-body");
+        const offset = await body.evaluate((el) => { el.scrollTop = 72; return el.scrollTop; });
+        assert.ok(offset > 0);
+        extraRuns++;
+        notifyReviewChanged();
+        await panel.locator('[data-run="demo-extra-6"]').first().waitFor({ state: "attached" });
+        assert.equal(await body.evaluate((el) => el.scrollTop), offset, "new activity rows preserve the scrolled list");
+        await activity.unrouteAll({ behavior: "wait" });
         await activity.close();
     }
 
@@ -1053,7 +1074,7 @@ try {
         } else {
             for (const theme of THEMES) {
                 console.log(`${theme}:`);
-                await capture(browser, server.url, theme, resetLearning);
+                await capture(browser, server.url, theme, resetLearning, () => service.changed(seeded.reviewId, "agent-review"));
                 if ((await service.getReview(seeded.reviewId)).agentReviews?.length) throw new Error("Screenshots must not start reviews.");
                 reviewId = imageReviewId;
                 await captureImages(browser, server.url, theme);

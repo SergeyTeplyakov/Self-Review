@@ -2054,27 +2054,14 @@ function renderAgentActivity() {
     if (!runs.length)
         state.agentActivityOpen = false;
     const markup = runs.length ? agentActivityPanelHtml(runs) : "";
+    let action = null;
+    let scroll = 0;
     if (markup !== agentActivityMarkup) {
         const focused = document.activeElement;
-        const action = focused instanceof HTMLElement && layer.contains(focused) ? focused.dataset.action ?? "" : null;
-        const scroll = $("#agent-activity-panel .agent-activity-body")?.scrollTop ?? 0;
+        action = focused instanceof HTMLElement && layer.contains(focused) ? focused.dataset.action ?? "" : null;
+        scroll = $("#agent-activity-panel .agent-activity-body")?.scrollTop ?? 0;
         layer.innerHTML = markup;
         agentActivityMarkup = markup;
-        const body = $("#agent-activity-panel .agent-activity-body");
-        if (body)
-            body.scrollTop = scroll;
-        if (action !== null) {
-            if (state.agentActivityOpen) {
-                const panel = $("#agent-activity-panel");
-                if (panel)
-                    panel.hidden = false;
-                const control = /^[\w-]+$/.test(action) ? $(`#agent-activity-panel [data-action="${action}"]`) : null;
-                (control ?? panel)?.focus();
-            }
-            else if (!runs.length) {
-                activityLauncher()?.focus();
-            }
-        }
     }
     const panel = $("#agent-activity-panel");
     if (panel)
@@ -2082,6 +2069,16 @@ function renderAgentActivity() {
     if (state.agentActivityOpen) {
         updateElapsedLabels();
         positionAgentActivity();
+        if (action !== null) {
+            const control = /^[\w-]+$/.test(action) ? $(`#agent-activity-panel [data-action="${action}"]`) : null;
+            (control ?? panel)?.focus({ preventScroll: true });
+        }
+        const body = scroll ? $("#agent-activity-panel .agent-activity-body") : null;
+        if (body)
+            body.scrollTop = scroll;
+    }
+    else if (action !== null && !runs.length) {
+        activityLauncher()?.focus();
     }
     syncAgentActivityTimer();
 }
@@ -2094,10 +2091,13 @@ function positionAgentActivity() {
     const anchor = toggle.getBoundingClientRect();
     const margin = 8;
     const width = Math.min(440, window.innerWidth - margin * 2);
-    panel.style.top = `${Math.round(anchor.bottom + 4)}px`;
+    const bottom = window.innerHeight - margin;
+    const minHeight = Math.min(160, Math.max(0, bottom - margin));
+    const top = Math.max(margin, Math.min(Math.round(anchor.bottom + 4), bottom - minHeight));
+    panel.style.top = `${top}px`;
     panel.style.left = `${Math.round(Math.max(margin, Math.min(anchor.left, window.innerWidth - width - margin)))}px`;
     panel.style.width = `${width}px`;
-    panel.style.maxHeight = `${Math.max(160, Math.round(window.innerHeight - anchor.bottom - 16))}px`;
+    panel.style.maxHeight = `${Math.max(0, bottom - top)}px`;
 }
 let agentActivityTimer;
 // Ticks the run age in place once a second while the panel shows an active run.
