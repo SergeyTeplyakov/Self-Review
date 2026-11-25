@@ -282,7 +282,9 @@ test("Markdown links in replies and verification prevent canvas navigation and l
     target.closest = (selector) => selector === "a[data-markdown-link][href]" ? link : null;
     let prevented = 0;
     const preventDefault = () => { prevented++; };
+    app.state.agentActivityOpen = true;
     await app.run("onClick")({ target, preventDefault });
+    assert.equal(app.state.agentActivityOpen, false, "opening an outside link dismisses the activity panel");
     const openPR = new MockElement("A");
     openPR.closest = () => null;
     await app.run("onClick")({ target: openPR, preventDefault });
@@ -954,7 +956,7 @@ test("Run review sends this review's skill opt-outs without saving skill default
 
 test("the page provides every container the scope and learning controls render into", async () => {
     const html = await readFile(new URL("../dist/web/index.html", import.meta.url), "utf8");
-    for (const id of ["top", "banner", "layout", "side", "main", "ruler", "review-status-controls", "dialog", "toast"]) assert.match(html, new RegExp(`id="${id}"`), id);
+    for (const id of ["top", "banner", "layout", "side", "main", "ruler", "review-status-controls", "agent-activity-layer", "dialog", "toast"]) assert.match(html, new RegExp(`id="${id}"`), id);
     assert.ok(html.indexOf('id="review-status-controls"') < html.indexOf('id="review-status"'), "left footer controls must precede right-aligned refresh status");
 });
 
@@ -1028,8 +1030,8 @@ test("built-in reviewer suggestions prefill only without saved or previous choic
     await click("dialog-cancel");
     app.state.review = reviewFixture({ agentReviews: [{ runId: "ar-fusion", state: "running", focus: "both", revisionId: "r1", models: ["model-a", "copilot-fusion"], results: [] }] });
     const html = app.run("agentReviewsHtml()");
-    assert.match(html, /copilot-fusion<\/span>: Awaiting result from the Copilot Fusion child session/);
-    assert.match(html, /model-a<\/span>: Awaiting result</);
+    assert.match(activityRow(html, "ar-fusion", "copilot-fusion")[1] ?? "", /^Awaiting result from the Copilot Fusion child session\./);
+    assert.equal(activityRow(html, "ar-fusion", "model-a")[2], "Reviewing");
     assert.equal(posts.length, 0);
 });
 
@@ -1072,8 +1074,9 @@ test("the prominent review action and agent-comment counts include findings, not
     assert.match(app.node("#main").innerHTML, /<h2>Agent reviews<\/h2>.*Agent comments \(<span aria-live="polite">2<\/span>\)/);
     app.state.review = reviewFixture({ agentReviews: [{ runId: "ar-running", state: "running", focus: "review", revisionId: "r1", models: ["model-a"], results: [] }] });
     app.run("renderTop()");
-    assert.match(app.node("#top").innerHTML, /data-action="agent-review"[^>]*disabled>Agentic review running/);
-    assert.match(app.run("agentCommentsView()"), /data-action="agent-review"[^>]*disabled>Agentic review running/);
+    assert.match(app.node("#top").innerHTML, /data-action="agent-activity-toggle"[^>]*>Agentic review running/);
+    assert.doesNotMatch(app.node("#top").innerHTML, /data-action="agent-review"/, "a new review cannot start while one is active");
+    assert.match(app.run("agentCommentsView()"), /data-action="agent-activity-toggle"[^>]*>Agentic review running/);
     assert.equal(app.run("agentComments().length"), 0, "scope switches never carry another scope's counts");
 });
 
@@ -1358,16 +1361,218 @@ test("agent review results distinguish findings, assessments, limits, and missin
         ],
     });
     const html = app.run("agentReviewsHtml()");
-    assert.match(html, /model-a<\/span>: No findings reported/);
-    assert.match(html, /&lt;bad-model&gt;<\/span>: Failed: &lt;failed&gt;/);
-    assert.match(html, /model-c<\/span>: Awaiting result/);
-    assert.match(html, /model-d<\/span>: 1 confirmed, 1 pre-existing, 1 rejected, 1 unverified/);
+    assert.equal(activityRow(html, "ar-one", "model-a")[2], "Completed · 0 published");
+    assert.equal(activityRow(html, "ar-one", "&lt;bad-model&gt;")[2], "Failed (&lt;failed&gt;)");
+    assert.equal(activityRow(html, "ar-one", "model-c")[2], "Reviewing");
+    assert.equal(activityRow(html, "ar-one", "model-d")[2], "Completed · 4 published");
+    assert.match(html, /1 confirmed, 1 pre-existing, 1 rejected, 1 unverified/);
     assert.match(html, /&lt;coverage&gt;: spec unavailable; tests not run/);
     assert.match(html, /Goal \/ spec \/ guidance: &lt;goal&gt;/);
     assert.match(html, /No coverage or verification summary recorded/);
     assert.match(html, /older diff/);
     assert.match(html, /does not stop agents already running/);
     assert.doesNotMatch(html, /<bad-model>|<failed>|<coverage>|<goal>/);
+});
+
+const activityRow = (html: string, runId: string, model: string) => html.match(new RegExp(`<li class="agent-activity-row" data-phase="(\\w+)" data-run="${runId}" data-model="${model}">`
+    + `.*?<span class="agent-activity-status" title="([^"]*)">([^<]*)</span>`))?.slice(1) ?? [];
+
+test("the running button opens a panel listing each active run's models with their phase, without per-model elapsed time", async () => {
+    const app = await loadApp();
+    const createdAt = new Date(Date.now() - 72_000).toISOString();
+    const reportedAt = new Date(Date.parse(createdAt) + 30_000).toISOString();
+    const error = `<boom> ${"x".repeat(120)}`;
+    app.state.busy = false;
+    app.state.agentReviewAvailable = true;
+    app.state.settings = settingsFixture();
+    app.state.review = reviewFixture({ agentReviews: [
+        { runId: "ar-old", state: "completed", focus: "simplify", revisionId: "r0", createdAt: "2026-01-01T00:00:00Z", models: ["model-old"],
+            results: [{ model: "model-old", state: "completed", threadIds: ["t1", "t2"], finishedAt: "2026-01-01T00:01:12Z" }] },
+        { runId: "ar-live", state: "running", protocol: "consensus-v1", focus: "correctness", revisionId: "r1", createdAt, models: ["model-a", "model-b", "<bad>", "copilot-fusion"],
+            results: [
+                { model: "model-a", state: "completed", threadIds: [], candidates: [{}, {}], finishedAt: reportedAt },
+                { model: "<bad>", state: "failed", error, threadIds: [], finishedAt: reportedAt },
+            ] },
+    ] });
+    app.run("renderTop()");
+    const top = app.node("#top").innerHTML;
+    const panel = app.node("#agent-activity-layer").innerHTML;
+    assert.match(top, /<button class="primary agent-review-launch" data-action="agent-activity-toggle" aria-expanded="false" aria-controls="agent-activity-panel"[^>]*>Agentic review running<\/button>/);
+    assert.doesNotMatch(top, /agent-activity-toggle busy|class="agent-activity"|Agentic review ·/, "there is no separate header pill");
+    assert.doesNotMatch(top, /data-action="agent-review"/);
+    assert.match(panel, /^<div id="agent-activity-panel" class="agent-activity-panel" role="dialog" aria-labelledby="agent-activity-title" tabindex="-1" hidden><div class="agent-activity-header"><h2 id="agent-activity-title">Agentic review activity<\/h2><button[^>]*data-action="agent-activity-close" aria-label="Close agentic review activity"/);
+    assert.equal(app.node("#agent-activity-panel").hidden, true);
+    assert.equal(panel.match(/class="agent-activity-section"/g)?.length, 1, "only the active run is listed");
+    assert.doesNotMatch(panel, /ar-old|model-old|Finished|Clear/);
+    assert.match(panel, new RegExp(`<h3 id="agent-activity-run-0">correctness · r1</h3><span class="muted">Active · 2 of 4 reported · <span data-elapsed-since="${createdAt}"`));
+    const [reportedPhase, reportedTitle, reported] = activityRow(panel, "ar-live", "model-a");
+    assert.equal(reportedPhase, "reported");
+    assert.equal(reported, "Reported · 2 findings · awaiting consensus");
+    assert.match(reportedTitle ?? "", /^Reported 2 candidate findings at .+\. Findings are published only after every model reports/);
+    const [reviewingPhase, reviewingTitle, reviewing] = activityRow(panel, "ar-live", "model-b");
+    assert.equal(reviewingPhase, "reviewing");
+    assert.equal(reviewing, "Reviewing");
+    assert.match(reviewingTitle ?? "", /Start times are recorded per run, not per model/);
+    const [failedPhase, failedTitle, failed] = activityRow(panel, "ar-live", "&lt;bad&gt;");
+    assert.equal(failedPhase, "failed");
+    assert.match(failed, /^Failed \(&lt;boom&gt; x+…\)$/);
+    assert.match(failedTitle ?? "", new RegExp(`^Failed at .+: &lt;boom&gt; ${"x".repeat(120)}$`), "the row keeps the full error in its title");
+    assert.equal(activityRow(panel, "ar-live", "copilot-fusion")[0], "reviewing");
+    assert.match(panel, /data-model="copilot-fusion">.*?<span class="mono">copilot-fusion<\/span><span class="muted"> \(child session\)<\/span>/);
+    assert.equal(panel.match(/data-elapsed-since/g)?.length, 1, "only the run header shows a live age");
+
+    app.state.review = reviewFixture({ agentReviews: [{ runId: "ar-q", state: "sending", focus: "both", revisionId: "r1", createdAt, models: ["model-a"], results: [] }] });
+    app.run("renderTop()");
+    assert.match(app.node("#agent-activity-layer").innerHTML, /<span class="muted">Active · queued · <span data-elapsed-since/);
+    assert.equal(activityRow(app.node("#agent-activity-layer").innerHTML, "ar-q", "model-a")[2], "Queued");
+
+    app.state.review = reviewFixture({ agentReviews: [{ runId: "ar-d", state: "running", protocol: "consensus-v1", focus: "both", revisionId: "r1", createdAt, models: ["model-a", "model-b"],
+        results: ["model-a", "model-b"].map((model) => ({ model, state: "completed", threadIds: [], candidates: [{}], finishedAt: reportedAt })) }] });
+    app.run("renderTop()");
+    const discussing = app.node("#agent-activity-layer").innerHTML;
+    assert.match(discussing, /Active · all 2 reported · discussing and voting · <span data-elapsed-since/);
+    assert.equal(activityRow(discussing, "ar-d", "model-a")[2], "Reported · 1 finding · awaiting consensus");
+    assert.doesNotMatch(discussing, /data-phase="discussing"|Discussion and voting/, "no separate discussion row");
+
+    const votes = ["model-a", "model-b"].map((model) => ({ model, decision: "agree" }));
+    app.state.review = reviewFixture({ agentReviews: [{ runId: "ar-done", state: "completed", protocol: "consensus-v1", focus: "both", revisionId: "r1", createdAt, models: ["model-a", "model-b"],
+        consensus: [{ kind: "finding", votes }, { kind: "ponytail", votes }, { kind: "finding", votes: [votes[0], { model: "model-b", decision: "disagree" }] }],
+        results: [{ model: "model-a", state: "completed", threadIds: ["t1"] }, { model: "model-b", state: "completed", threadIds: [] }] }] });
+    app.run("renderTop()");
+    assert.equal(app.node("#agent-activity-layer").innerHTML, "", "a finished run is only on the Agent reviews page");
+    assert.equal(activityRow(app.run("agentReviewsHtml()"), "ar-done", "model-b")[2], "Completed · 1 supported", "an agreeing voter need not be a source");
+});
+
+test("the activity panel takes focus, closes on Escape, its close button or an outside click, and ticks the run age in place", async () => {
+    const timers: Array<() => void> = [];
+    const cleared: number[] = [];
+    const app = await loadApp({ window: { setTimeout: (callback: () => void) => timers.push(callback) }, clearTimeout: (id: number) => cleared.push(id) });
+    const createdAt = new Date(Date.now() - 65_000).toISOString();
+    app.state.busy = false;
+    app.state.agentReviewAvailable = true;
+    app.state.settings = settingsFixture();
+    app.state.review = reviewFixture({ agentReviews: [{ runId: "ar-1", state: "running", focus: "both", revisionId: "r1", createdAt, models: ["model-a"], results: [] }] });
+    const baseline = timers.length;
+    app.run("renderTop()");
+    assert.equal(timers.length, baseline, "no ticker while the panel is closed");
+    const click = clicker(app);
+    const toggle = '[data-action="agent-activity-toggle"]';
+    const triggers = [app.node("#top .agent-review-launch"), app.node("#main .agent-review-launch")];
+    const queryToggles = (selector: string) => selector === toggle ? triggers : [];
+    app.document.querySelectorAll = queryToggles;
+    app.node("#main").contains = () => true;
+    await click("agent-activity-toggle");
+    assert.equal(app.state.agentActivityOpen, true);
+    assert.equal(app.focused.at(-1), "#agent-activity-panel");
+    assert.ok(triggers.every((node) => Reflect.get(node, "ariaExpanded") === "true"));
+    assert.equal(app.node("#agent-activity-panel").hidden, false);
+    assert.equal(timers.length, baseline + 1);
+    const label = { dataset: { elapsedSince: createdAt }, textContent: "" };
+    app.document.querySelectorAll = () => [label];
+    const header = app.node("#top").innerHTML;
+    const layer = app.node("#agent-activity-layer");
+    const panel = layer.innerHTML;
+    required(timers[baseline])();
+    assert.match(label.textContent, /^1m \d+s$/);
+    assert.equal(app.node("#top").innerHTML, header, "ticking updates labels in place without re-rendering");
+    assert.equal(layer.innerHTML, panel, "ticking leaves the panel markup alone");
+    assert.equal(timers.length, baseline + 2, "the ticker keeps running while the panel is open");
+    app.document.querySelectorAll = queryToggles;
+
+    layer.innerHTML = "kept";
+    app.run("renderTop()");
+    assert.equal(layer.innerHTML, "kept", "a header re-render keeps the open panel while its rows are unchanged");
+    assert.equal(app.node("#agent-activity-panel").hidden, false);
+    app.state.review = reviewFixture({ agentReviews: [{ runId: "ar-1", state: "running", focus: "both", revisionId: "r1", createdAt, models: ["model-a"],
+        results: [{ model: "model-a", state: "completed", threadIds: ["t1"], finishedAt: createdAt }] }] });
+    app.run("renderTop()");
+    assert.match(layer.innerHTML, /data-phase="completed" data-run="ar-1" data-model="model-a"/, "a reported model rebuilds the rows");
+    app.state.review = reviewFixture({ agentReviews: [{ runId: "ar-1", state: "running", focus: "both", revisionId: "r1", createdAt, models: ["model-a"], results: [] }] });
+    app.run("renderTop()");
+
+    const clearedBefore = cleared.length;
+    app.run("onKeyDown")({ key: "Escape", target: new MockElement("BUTTON"), preventDefault() {} });
+    assert.equal(app.state.agentActivityOpen, false);
+    assert.equal(app.node("#agent-activity-panel").hidden, true);
+    assert.ok(triggers.every((node) => Reflect.get(node, "ariaExpanded") === "false"));
+    assert.equal(app.focused.at(-1), "#main .agent-review-launch");
+    assert.deepEqual(cleared.slice(clearedBefore), [baseline + 2], "closing stops the ticker");
+
+    await click("agent-activity-toggle");
+    assert.equal(app.focused.at(-1), "#agent-activity-panel");
+    await click("agent-activity-close");
+    assert.equal(app.state.agentActivityOpen, false);
+    assert.equal(app.focused.at(-1), "#main .agent-review-launch");
+
+    await click("agent-activity-toggle");
+    const focusCount = app.focused.length;
+    const outside = new MockElement("DIV");
+    outside.closest = () => null;
+    await app.run("onClick")({ target: outside });
+    assert.equal(app.state.agentActivityOpen, false);
+    assert.equal(app.focused.length, focusCount, "an outside click leaves focus where the user clicked");
+});
+
+test("the panel closes when the last active run finishes, and the Agent reviews page keeps every run", async () => {
+    const app = await loadApp();
+    app.state.busy = false;
+    app.state.agentReviewAvailable = true;
+    app.state.settings = settingsFixture();
+    const failed = { runId: "ar-0", state: "failed", focus: "both", revisionId: "r1", models: ["model-b"], results: [{ model: "model-b", state: "failed", error: "boom", threadIds: [] }] };
+    const live = { runId: "ar-1", state: "running", protocol: "consensus-v1", focus: "both", revisionId: "r1", models: ["model-a"], results: [] as unknown[] };
+    app.state.review = reviewFixture({ agentReviews: [failed, live] });
+    app.run("renderTop()");
+    assert.doesNotMatch(app.node("#agent-activity-layer").innerHTML, /ar-0/, "finished runs are not in the panel");
+    const click = clicker(app);
+    await click("agent-activity-toggle");
+    assert.equal(app.state.agentActivityOpen, true);
+
+    const panel = app.node("#agent-activity-panel");
+    app.document.activeElement = panel;
+    app.node("#agent-activity-layer").contains = (node) => node === panel;
+    app.state.review = reviewFixture({ agentReviews: [failed, { ...live, state: "completed", results: [{ model: "model-a", state: "completed", threadIds: ["t1"] }] }] });
+    app.run("renderTop()");
+    assert.equal(app.state.agentActivityOpen, false);
+    assert.equal(app.node("#agent-activity-layer").innerHTML, "");
+    assert.match(app.node("#top").innerHTML, /data-action="agent-review"[^>]*>Run agentic review/);
+    assert.equal(app.focused.at(-1), "#top .agent-review-launch", "focus moves to the Run button the running button became");
+    const page = app.run("agentReviewsHtml()");
+    assert.equal(activityRow(page, "ar-1", "model-a")[2], "Completed · 1 published", "without vote records, show the known published count");
+    assert.equal(activityRow(page, "ar-0", "model-b")[2], "Failed (boom)");
+});
+
+test("the Agent reviews page shows the same per-model status as the activity panel", async () => {
+    const app = await loadApp();
+    const createdAt = new Date(Date.now() - 90_000).toISOString();
+    const reportedAt = new Date(Date.parse(createdAt) + 45_000).toISOString();
+    app.state.busy = false;
+    app.state.agentReviewAvailable = true;
+    app.state.settings = settingsFixture();
+    app.state.review = reviewFixture({ agentReviews: [
+        { runId: "ar-e", state: "partial", focus: "both", revisionId: "r1", createdAt, models: ["model-a", "model-d"], error: "Timed out.",
+            results: [{ model: "model-a", state: "completed", threadIds: ["t1"], finishedAt: reportedAt }] },
+        { runId: "ar-p", state: "running", protocol: "consensus-v1", focus: "both", revisionId: "r1", createdAt, models: ["model-a", "model-b", "model-c"],
+            results: [
+                { model: "model-a", state: "completed", threadIds: [], candidates: [{}], finishedAt: reportedAt, summary: "Covered." },
+                { model: "model-b", state: "failed", error: "quota", threadIds: [], finishedAt: reportedAt },
+            ] },
+    ] });
+    app.run("renderTop()");
+    const top = app.node("#agent-activity-layer").innerHTML;
+    const [running, ended] = app.run("agentReviewsHtml()").split('<div class="card agent-review-run">').slice(1);
+    for (const model of ["model-a", "model-b", "model-c"]) {
+        const panel = activityRow(top, "ar-p", model);
+        assert.equal(panel.length, 3, `${model} is in the panel`);
+        assert.deepEqual(activityRow(required(running), "ar-p", model), panel, `${model} matches`);
+    }
+    assert.equal(activityRow(top, "ar-p", "model-a")[2], "Reported · 1 finding · awaiting consensus");
+    assert.equal(activityRow(top, "ar-p", "model-b")[2], "Failed (quota)");
+    assert.equal(activityRow(top, "ar-p", "model-c")[2], "Reviewing");
+    assert.equal(activityRow(top, "ar-e", "model-a").length, 0, "a partial run is not active, so only the page lists it");
+    assert.equal(activityRow(required(ended), "ar-e", "model-a")[2], "Completed · 1 published");
+    assert.equal(activityRow(required(ended), "ar-e", "model-d")[2], "Not completed");
+    assert.match(running ?? "", /Coverage and verification.*data-action="agent-review-close"/s, "coverage details and Close review remain");
+    assert.match(ended ?? "", /<p class="err">Timed out\.<\/p>/);
 });
 
 test("Ponytail run details retain each contributing model's wording and evidence", async () => {

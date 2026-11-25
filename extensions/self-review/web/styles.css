@@ -195,6 +195,32 @@ button.agent-review-launch { padding: 7px 14px; font-weight: 600; }
 .review-settings-options button { width: 100%; text-align: left; white-space: nowrap; }
 .agent-reviews-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .agent-reviews-heading h2 { margin: 0; }
+.agent-activity-panel { position: fixed; z-index: 20; top: 48px; left: 8px; width: min(440px, calc(100vw - 16px)); max-height: 70vh; display: flex; flex-direction: column; border: 1px solid var(--mr-border); border-radius: 10px; background: var(--mr-bg); color: var(--mr-fg); box-shadow: 0 8px 24px rgb(0 0 0 / 24%); }
+.agent-activity-panel[hidden] { display: none; }
+.agent-activity-panel:focus { outline: none; }
+.agent-activity-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 10px 4px 14px; }
+.agent-activity-header h2 { margin: 0; font-size: 1em; font-weight: 600; }
+button.agent-activity-close { display: inline-flex; padding: 4px; border: 0; background: none; color: var(--mr-muted); }
+button.agent-activity-close:hover { background: var(--mr-subtle); color: var(--mr-fg); }
+.agent-activity-close svg, .agent-activity-icon svg { width: 14px; height: 14px; }
+.agent-activity-body { min-height: 0; overflow-y: auto; padding: 0 6px 6px; }
+.agent-activity-section + .agent-activity-section { margin-top: 4px; }
+.agent-activity-section-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 8px 2px; }
+.agent-activity-section-header h3 { min-width: 0; margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--mr-muted); font-size: 0.85em; font-weight: 600; }
+.agent-activity-section-header .muted { flex: none; font-size: 0.85em; font-variant-numeric: tabular-nums; }
+.agent-activity-list { margin: 0; padding: 0; list-style: none; }
+.agent-activity-row { display: flex; align-items: center; gap: 8px; min-height: 26px; padding: 3px 8px; border-radius: var(--mr-radius); }
+.agent-activity-row:hover { background: var(--mr-subtle); }
+.agent-activity-icon { display: inline-flex; flex: none; color: var(--mr-muted); }
+.agent-activity-row[data-phase="reviewing"] .agent-activity-icon { color: var(--mr-accent); }
+.agent-activity-row[data-phase="completed"] .agent-activity-icon, .agent-activity-row[data-phase="reported"] .agent-activity-icon { color: var(--mr-green); }
+.agent-activity-row[data-phase="failed"] .agent-activity-icon { color: var(--mr-red); }
+.agent-activity-label, .agent-activity-status { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent-activity-label { flex: 1; min-width: 0; }
+.agent-activity-status { max-width: 65%; white-space: normal; overflow-wrap: anywhere; color: var(--mr-muted); font-size: 0.9em; font-variant-numeric: tabular-nums; }
+.agent-activity-footer { padding: 6px 14px 10px; border-top: 1px solid var(--mr-border); }
+.agent-review-run .agent-activity-row { flex-wrap: wrap; }
+.agent-activity-result { width: 100%; padding-inline-start: 22px; }
 .skill-group { display: flex; flex-direction: column; gap: 6px; }
 .review-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--mr-border); margin: 4px 0 12px; }
 .review-tab { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none; padding: 6px 10px; color: var(--mr-muted); }
