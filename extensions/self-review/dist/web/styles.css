@@ -174,7 +174,7 @@ select {
 .review-field { display: flex; flex-direction: column; gap: 6px; margin: 12px 0; }
 .review-field input, .review-field textarea { background: var(--mr-bg); border: 1px solid var(--mr-border); border-radius: var(--mr-radius); padding: 6px; }
 .review-field textarea { resize: vertical; }
-.finding-actions { display: flex; gap: 8px; padding: 8px 12px; }
+.finding-actions { display: flex; flex-wrap: wrap; gap: 8px; padding: 8px 12px; }
 .finding-evidence { padding: 8px 12px; border-top: 1px solid var(--mr-border); }
 .finding-evidence dt { margin-top: 8px; font-weight: 600; }
 .finding-evidence dd { margin: 4px 0; overflow-wrap: anywhere; }
@@ -508,7 +508,9 @@ tr.inline > td { padding: 6px 10px 8px 90px; background: var(--mr-bg); border-to
     border-bottom: 1px solid var(--mr-border);
     background: var(--mr-subtle);
 }
-.thread-head .loc { flex: 1; min-width: 0; font-family: var(--mr-mono); font-size: 0.9em; overflow-wrap: anywhere; }
+/* A basis wide enough for a short path makes a long one wrap onto its own row instead of a one-character column. */
+.thread-head .loc { flex: 1 1 24ch; min-width: 0; font-family: var(--mr-mono); font-size: 0.9em; overflow-wrap: anywhere; }
+.thread-head .badge { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
 .thread.collapsed .thread-head { border-bottom: none; }
 .thread.collapsed .thread-body { display: none; }
 .badge {

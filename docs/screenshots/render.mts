@@ -1031,6 +1031,62 @@ async function captureImages(browser: Browser, url: string, theme: "light" | "da
     await context.close();
 }
 
+// Add the finding after capturing the other views so it doesn't change their screenshots.
+async function checkFindingLayout(browser: Browser, url: string, service: ReviewServiceContract, reviewId: string) {
+    const { repoRoot } = await service.getReview(reviewId);
+    const filePath = "src/orders/integrations/http/retry/policies/transient-failure-backoff-policy.ts";
+    await writeFiles(repoRoot, { [filePath]: "export const maxAttempts = 4;\n" });
+    await service.refresh(reviewId);
+    const { threadId } = await service.store.updateReview(reviewId, async (review) => {
+        assert.ok(review?.currentRevisionId);
+        const body = "Clamp the delay to the configured maximum.";
+        const { thread } = await service.buildThread(review, { kind: "file", path: filePath, body, author: "agent" });
+        const evidence = { source: filePath, baseline: "Missing clamp", validation: "Regression test" };
+        thread.status = "resolved";
+        thread.agentReview = {
+            runId: "demo-layout", revisionId: review.currentRevisionId, model: "gpt-6.2-sol",
+            category: "issue", assessment: "confirmed", severity: "required", evidence,
+            contributions: ["gpt-6.2-sol", "gpt-6.2-astra"].map((model) => ({ model, body, evidence })),
+        };
+        review.threads.push(thread);
+        return { review, value: thread };
+    });
+
+    for (const theme of THEMES) {
+        const page = await browser.newPage({ colorScheme: theme });
+        try {
+            for (const width of [420, WIDTH]) {
+                await page.setViewportSize({ width, height: 900 });
+                await page.goto(url);
+                await nav(page, "agent-comments");
+                const card = page.locator(`#main .thread[data-thread-id="${threadId}"]`);
+                await card.locator('[data-action="toggle"][aria-expanded="false"]').click();
+                const header = card.locator(".thread-head");
+                const link = header.getByRole("button", { name: filePath, exact: true });
+                const [loc, head] = await Promise.all([link.boundingBox(), header.boundingBox()]);
+                assert.ok(loc && head && loc.width >= Math.min(head.width - 24, 180), `width ${width}: keep the path readable`);
+                assert.ok(await header.evaluate(el => el.scrollWidth <= el.clientWidth), `width ${width}: no horizontal overflow`);
+                const buttons = card.locator(".finding-actions button");
+                assert.deepEqual(await buttons.allTextContents(), ["Approve", "Discuss", "Reactivate"]);
+                if (width === WIDTH) {
+                    const tops = await buttons.evaluateAll(els => els.map(el => el.getBoundingClientRect().top));
+                    assert.ok(tops.every(top => top === tops[0]), "keep actions on one row when space permits");
+                }
+                assert.ok(await buttons.nth(0).isDisabled());
+                await card.locator(".finding-evidence summary").focus();
+                for (const next of [buttons.nth(1), buttons.nth(2), card.getByPlaceholder("Reply…")]) {
+                    await page.keyboard.press("Tab");
+                    assert.ok(await next.evaluate(el => el === document.activeElement), "Tab skips Approve and reaches Reply after Reactivate");
+                }
+                await link.click();
+                await page.locator(`.file-section[data-file="${filePath}"] [data-thread-id="${threadId}"]`).waitFor();
+            }
+        } finally {
+            await page.close();
+        }
+    }
+}
+
 const tmp = await mkdtemp(path.join(os.tmpdir(), "mr-shots-"));
 let server: Awaited<ReturnType<typeof startReviewServer>> | undefined;
 let browser: Browser | undefined;
@@ -1080,6 +1136,7 @@ try {
                 await captureImages(browser, server.url, theme);
                 reviewId = seeded.reviewId;
             }
+            if (!only || only.includes("agent-comment-layout")) await checkFindingLayout(browser, server.url, service, reviewId);
         }
         if (KEEP) {
             console.log(`\nDemo review: ${server.url}\nRepo: ${path.join(tmp, "orders-api")}\nPress Ctrl+C to stop.`);
