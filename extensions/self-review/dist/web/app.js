@@ -139,7 +139,8 @@ function isAgentReviewRun(value) {
     if (!isRecord(value) || typeof value.runId !== "string" || typeof value.state !== "string"
         || typeof value.focus !== "string" || typeof value.revisionId !== "string"
         || !Array.isArray(value.models) || !value.models.every((model) => typeof model === "string")
-        || !Array.isArray(value.results) || !isOptionalString(value.intent) || !isOptionalString(value.error))
+        || !Array.isArray(value.results) || !isOptionalString(value.intent) || !isOptionalString(value.error)
+        || !isOptionalString(value.createdAt) || !isOptionalString(value.finishedAt))
         return false;
     if (value.skills !== undefined && (!Array.isArray(value.skills) || !value.skills.every((skill) => isRecord(skill) && typeof skill.name === "string" && isOptionalString(skill.release))))
         return false;
@@ -156,7 +157,8 @@ function isAgentReviewRun(value) {
         if (!isRecord(result) || typeof result.model !== "string" || !Array.isArray(result.threadIds)
             || !result.threadIds.every((id) => typeof id === "string")
             || (result.candidates !== undefined && !Array.isArray(result.candidates))
-            || !isOptionalString(result.error) || !isOptionalString(result.summary))
+            || !isOptionalString(result.error) || !isOptionalString(result.summary)
+            || !isOptionalString(result.state) || !isOptionalString(result.finishedAt))
             return false;
         if (result.ponytail === undefined || result.ponytail === null)
             return true;
@@ -369,6 +371,7 @@ const state = {
     skillOverrides: new Map(),
     approving: new Set(),
     statusUpdates: new Map(),
+    agentActivityOpen: false,
 };
 const FOLDER_VIEW_ROW_BUDGET = 3000;
 const settingsApi = createSettingsApi((method, path, body) => api(method, path, body));
@@ -888,6 +891,7 @@ function resetForReview() {
     state.archived = [];
     state.historyDiffs.clear();
     state.historySelection.clear();
+    closeAgentActivity(false);
     viewRestored = false;
 }
 let loading = null;
@@ -1357,12 +1361,18 @@ function render() {
     const main = $("#main");
     if (!main)
         return;
+    const restorePageLauncher = active instanceof HTMLElement && ((main.contains(active) && active.dataset.action === "agent-activity-toggle")
+        || (agentActivityOpener === "#main" && state.agentActivityOpen && !agentActivityRuns().length && $("#agent-activity-layer")?.contains(active)));
     const scroll = main.scrollTop;
     renderTop();
     renderLoadStatus();
     renderBanner();
     renderSide();
     renderMain();
+    if (restorePageLauncher)
+        $('#main .agent-review-launch')?.focus();
+    if (state.agentActivityOpen && agentActivityOpener === "#main")
+        positionAgentActivity();
     refreshDestinationPreviews();
     const outsideReplies = outsideDraftRepliesHtml();
     if (pinnedComposers.size || outsideReplies) {
@@ -1371,6 +1381,7 @@ function render() {
     paintImageDiffs();
     main.scrollTop = scroll;
     renderRuler();
+    syncAgentActivityTimer();
     if (imageControl)
         document.querySelector(imageControl)?.focus();
     if (focusKey) {
@@ -1463,6 +1474,7 @@ function renderTop() {
     const settingsMenuWasOpen = previousSettingsMenu?.open ?? false;
     const focusedSettingsSummary = activeInSettingsMenu && active === previousSettingsMenu?.querySelector("summary");
     const focusedSettingsAction = activeInSettingsMenu && active instanceof HTMLElement ? active.dataset.action : undefined;
+    const toggleFocused = active instanceof HTMLElement && top.contains(active) && active.dataset.action === "agent-activity-toggle";
     const rev = r.revisions.find((x) => x.revisionId === r.currentRevisionId);
     const git = r.git ?? {};
     const scope = scopeOf(r);
@@ -1529,6 +1541,9 @@ function renderTop() {
     if (controls.length)
         parts.push(`<div class="review-controls">${controls.join("")}</div>`);
     top.innerHTML = parts.join("");
+    renderAgentActivity();
+    if (toggleFocused)
+        $('#top .agent-review-launch')?.focus();
     const settingsMenu = top.querySelector(".review-settings-menu");
     if (activeParallelismBadge) {
         const badge = top.querySelector('[data-action="configure-parallelism"]');
@@ -1624,6 +1639,8 @@ function renderDialog() {
     const dialog = $("#dialog");
     if (!dialog)
         return;
+    if (state.dialog)
+        closeAgentActivity(false);
     dialog.innerHTML = dialogHtml();
     for (const id of ["#top", "#banner", "#layout", "#review-status-slot"]) {
         const el = $(id);
@@ -1828,7 +1845,7 @@ function applyReviewSkills() {
 }
 async function runAgentReview() {
     if (!state.agentReviewAvailable || !state.review || state.dialog || state.startingReview
-        || state.review.agentReviews?.some((run) => ["sending", "queued", "running"].includes(run.state)))
+        || state.review.agentReviews?.some(isActiveAgentRun))
         return;
     if (!state.agentReviewSettings?.skipDialog || state.agentReviewSettings.models.length < 2 || state.agentReviewSettingsError) {
         openAgentReview();
@@ -1879,19 +1896,253 @@ function agentReviewButtonHtml() {
     const review = state.review;
     if (!review || !state.agentReviewAvailable)
         return "";
-    const running = review.agentReviews?.some((run) => ["sending", "queued", "running"].includes(run.state));
+    const running = review.agentReviews?.some(isActiveAgentRun);
     const defaults = state.agentReviewSettings;
     const hint = defaults?.skipDialog
         ? `Run with saved defaults: ${defaults.models.join(", ")} (${defaults.focus}). Review, discussion and voting calls may consume credits.`
         : "Configure and run a read-only review, discussion and vote. These calls may consume credits.";
-    return `<button class="primary agent-review-launch" data-action="agent-review" title="${esc(hint)}"${running || state.startingReview ? " disabled" : ""}>${running ? "Agentic review running" : state.startingReview ? "Queuing review..." : "Run agentic review"}</button>`;
+    if (running) {
+        return `<button class="primary agent-review-launch" data-action="agent-activity-toggle" aria-expanded="${state.agentActivityOpen}" aria-controls="agent-activity-panel" aria-haspopup="dialog" title="Show what each model is doing. A new review can start when this one finishes.">Agentic review running</button>`;
+    }
+    return `<button class="primary agent-review-launch" data-action="agent-review" title="${esc(hint)}"${state.startingReview ? " disabled" : ""}>${state.startingReview ? "Queuing review..." : "Run agentic review"}</button>`;
+}
+// ---------- Agentic review activity ----------
+const ACTIVE_AGENT_RUN_STATES = new Set(["sending", "queued", "running"]);
+const isActiveAgentRun = (run) => ACTIVE_AGENT_RUN_STATES.has(run.state);
+const FUSION_MODEL = "copilot-fusion";
+const MODEL_ICON = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.75 9.4 6.6l4.85 1.4L9.4 9.4 8 14.25 6.6 9.4 1.75 8 6.6 6.6Z" fill="currentColor"/></svg>`;
+const CHILD_SESSION_ICON = `<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.75" y="5.25" width="9" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M5.25 3.25v-.5c0-.55.45-1 1-1h7c.55 0 1 .45 1 1v7c0 .55-.45 1-1 1h-.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>`;
+const CLOSE_ICON = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8m0-8-8 8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>`;
+const countOf = (count, noun) => `${count} ${noun}${count === 1 ? "" : "s"}`;
+function formatDuration(ms) {
+    const seconds = Math.max(0, Math.floor(ms / 1000));
+    const hours = Math.floor(seconds / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    return hours ? `${hours}h ${minutes}m` : minutes ? `${minutes}m ${seconds % 60}s` : `${seconds}s`;
+}
+function timeOf(iso) {
+    const time = iso ? Date.parse(iso) : NaN;
+    return Number.isFinite(time) ? time : null;
+}
+function reportedAt(result) {
+    const time = timeOf(result.finishedAt);
+    return time === null ? "" : ` at ${new Date(time).toLocaleTimeString()}`;
+}
+function shortError(error) {
+    const line = error.trim().split(/\r?\n/, 1)[0] ?? "";
+    return line.length > 80 ? `${line.slice(0, 79)}…` : line;
+}
+function isFailedResult(result) {
+    return result.state === "failed" || Boolean(result.error);
+}
+// A consensus run stays active after every model reports while the models discuss and vote on the candidates.
+function isAgentRunDiscussing(run) {
+    return run.protocol === "consensus-v1" && isActiveAgentRun(run) && run.models.length > 0
+        && run.models.every((model) => run.results.some((result) => result.model === model));
+}
+function modelActivity(run, model) {
+    const result = run.results.find((x) => x.model === model);
+    const fusion = model === FUSION_MODEL ? " Copilot Fusion runs in a coordinated child session." : "";
+    if (!result) {
+        if (run.state === "sending" || run.state === "queued") {
+            return { phase: "queued", status: "Queued", detail: `Queued. The review was requested and no reviewer has opened the diff yet.${fusion}` };
+        }
+        if (isActiveAgentRun(run)) {
+            return {
+                phase: "reviewing", status: "Reviewing",
+                detail: `Awaiting result${model === FUSION_MODEL ? " from the Copilot Fusion child session" : ""}. Start times are recorded per run, not per model.`,
+            };
+        }
+        return {
+            phase: "incomplete", status: "Not completed",
+            detail: `No result was reported before the run ${run.state === "closed" ? "was closed" : "ended"}.${run.error ? ` ${run.error}` : ""}`,
+        };
+    }
+    const at = reportedAt(result);
+    if (isFailedResult(result)) {
+        const error = result.error?.trim() || "No error details were reported.";
+        return { phase: "failed", status: `Failed (${shortError(error)})`, detail: `Failed${at}: ${error}` };
+    }
+    const consensus = run.protocol === "consensus-v1";
+    if (consensus && run.state !== "completed") {
+        const reported = result.candidates?.length ?? result.threadIds.length;
+        if (isActiveAgentRun(run)) {
+            return {
+                phase: "reported", status: `Reported · ${countOf(reported, "finding")} · awaiting consensus`,
+                detail: `Reported ${countOf(reported, "candidate finding")}${at}. Findings are published only after every model reports and the discussion and vote finish.`,
+            };
+        }
+        return {
+            phase: "incomplete", status: `Not published · ${countOf(reported, "finding")}`,
+            detail: `Reported ${countOf(reported, "candidate finding")}${at}. They were not published because the run ended before discussion and voting finished.`,
+        };
+    }
+    if (consensus && run.consensus) {
+        const supported = run.consensus.filter((group) => group.kind === "finding"
+            && group.votes.some((vote) => vote.model === model)
+            && group.votes.length === run.models.length && group.votes.every((vote) => vote.decision === "agree")).length;
+        return { phase: "completed", status: `Completed · ${supported} supported`,
+            detail: `Voted to publish ${countOf(supported, "finding")} that reached unanimous agreement.${at ? ` Reported${at}.` : ""}` };
+    }
+    const published = result.threadIds.length;
+    return {
+        phase: "completed", status: `Completed · ${published} published`,
+        detail: consensus
+            ? `Contributed to ${countOf(published, "published finding")}. No vote record is available.${at ? ` Reported${at}.` : ""}`
+            : `Published ${countOf(published, "finding")}${at}.`,
+    };
+}
+function updateElapsedLabels() {
+    const now = Date.now();
+    document.querySelectorAll("[data-elapsed-since]").forEach((label) => {
+        const start = timeOf(label.dataset.elapsedSince);
+        const text = start === null ? "" : formatDuration(now - start);
+        if (text && label.textContent !== text)
+            label.textContent = text;
+    });
+}
+// The panel opens from the running button, so it only has something to show while a run is active.
+function agentActivityRuns(review = state.review) {
+    return (review?.agentReviews ?? []).filter(isActiveAgentRun);
+}
+function agentRunSummary(run) {
+    if (run.state === "sending" || run.state === "queued")
+        return "Active · queued";
+    if (isAgentRunDiscussing(run))
+        return `Active · all ${run.models.length} reported · discussing and voting`;
+    const reported = run.models.filter((model) => run.results.some((result) => result.model === model)).length;
+    return `Active · ${reported} of ${run.models.length} reported`;
+}
+function agentActivityRowHtml(run, model, details = "") {
+    const activity = modelActivity(run, model);
+    const child = model === FUSION_MODEL;
+    return `<li class="agent-activity-row" data-phase="${activity.phase}" data-run="${esc(run.runId)}" data-model="${esc(model)}">`
+        + `<span class="agent-activity-icon">${child ? CHILD_SESSION_ICON : MODEL_ICON}</span>`
+        + `<span class="agent-activity-label" title="${esc(`${model}${child ? " (child session)" : ""}`)}">`
+        + `<span class="mono">${esc(model)}</span>${child ? `<span class="muted"> (child session)</span>` : ""}</span>`
+        + `<span class="agent-activity-status" title="${esc(activity.detail)}">${esc(activity.status)}</span>`
+        + (details ? `<div class="agent-activity-result">${details}</div>` : "") + `</li>`;
+}
+function agentActivityPanelHtml(runs) {
+    const section = (run, index) => {
+        const context = [run.focus, run.revisionId].filter(Boolean).join(" · ");
+        const start = timeOf(run.createdAt);
+        const age = start === null ? ""
+            : ` · <span data-elapsed-since="${esc(run.createdAt)}" title="Time since the run started"></span>`;
+        return `<section class="agent-activity-section" aria-labelledby="agent-activity-run-${index}"><div class="agent-activity-section-header">`
+            + `<h3 id="agent-activity-run-${index}">${esc(context || "Agentic review")}</h3><span class="muted">${esc(agentRunSummary(run))}${age}</span></div>`
+            + `<ul class="agent-activity-list">${run.models.map((model) => agentActivityRowHtml(run, model)).join("")}</ul></section>`;
+    };
+    return `<div id="agent-activity-panel" class="agent-activity-panel" role="dialog" aria-labelledby="agent-activity-title" tabindex="-1" hidden>`
+        + `<div class="agent-activity-header"><h2 id="agent-activity-title">Agentic review activity</h2>`
+        + `<button type="button" class="agent-activity-close" data-action="agent-activity-close" aria-label="Close agentic review activity" title="Close">${CLOSE_ICON}</button></div>`
+        + `<div class="agent-activity-body">${[...runs].reverse().map(section).join("")}</div>`
+        + `<div class="agent-activity-footer"><button type="button" class="link" data-action="agent-activity-details">Open Agent reviews</button></div></div>`;
+}
+let agentActivityMarkup = "";
+let agentActivityOpener = "#top";
+function activityLauncher() {
+    return $(`${agentActivityOpener} .agent-review-launch`) ?? $("#top .agent-review-launch");
+}
+// The panel lives in its own layer outside the header, so header re-renders leave its focus, scroll, and pointer alone.
+// It is rebuilt only when its rows change; elapsed times tick in place.
+function renderAgentActivity() {
+    const layer = $("#agent-activity-layer");
+    if (!layer)
+        return;
+    const runs = agentActivityRuns();
+    if (!runs.length)
+        state.agentActivityOpen = false;
+    const markup = runs.length ? agentActivityPanelHtml(runs) : "";
+    if (markup !== agentActivityMarkup) {
+        const focused = document.activeElement;
+        const action = focused instanceof HTMLElement && layer.contains(focused) ? focused.dataset.action ?? "" : null;
+        const scroll = $("#agent-activity-panel .agent-activity-body")?.scrollTop ?? 0;
+        layer.innerHTML = markup;
+        agentActivityMarkup = markup;
+        const body = $("#agent-activity-panel .agent-activity-body");
+        if (body)
+            body.scrollTop = scroll;
+        if (action !== null) {
+            if (state.agentActivityOpen) {
+                const panel = $("#agent-activity-panel");
+                if (panel)
+                    panel.hidden = false;
+                const control = /^[\w-]+$/.test(action) ? $(`#agent-activity-panel [data-action="${action}"]`) : null;
+                (control ?? panel)?.focus();
+            }
+            else if (!runs.length) {
+                activityLauncher()?.focus();
+            }
+        }
+    }
+    const panel = $("#agent-activity-panel");
+    if (panel)
+        panel.hidden = !state.agentActivityOpen;
+    if (state.agentActivityOpen) {
+        updateElapsedLabels();
+        positionAgentActivity();
+    }
+    syncAgentActivityTimer();
+}
+// Keeps the panel inside the viewport under its toggle, whichever end of the header row the toggle wraps to.
+function positionAgentActivity() {
+    const panel = $("#agent-activity-panel");
+    const toggle = activityLauncher();
+    if (!state.agentActivityOpen || !panel || !toggle || typeof toggle.getBoundingClientRect !== "function" || !window.innerWidth)
+        return;
+    const anchor = toggle.getBoundingClientRect();
+    const margin = 8;
+    const width = Math.min(440, window.innerWidth - margin * 2);
+    panel.style.top = `${Math.round(anchor.bottom + 4)}px`;
+    panel.style.left = `${Math.round(Math.max(margin, Math.min(anchor.left, window.innerWidth - width - margin)))}px`;
+    panel.style.width = `${width}px`;
+    panel.style.maxHeight = `${Math.max(160, Math.round(window.innerHeight - anchor.bottom - 16))}px`;
+}
+let agentActivityTimer;
+// Ticks the run age in place once a second while the panel shows an active run.
+function syncAgentActivityTimer() {
+    const live = state.agentActivityOpen && agentActivityRuns().length > 0;
+    if (live && agentActivityTimer === undefined) {
+        agentActivityTimer = window.setTimeout(() => {
+            agentActivityTimer = undefined;
+            updateElapsedLabels();
+            syncAgentActivityTimer();
+        }, 1000);
+    }
+    else if (!live && agentActivityTimer !== undefined) {
+        clearTimeout(agentActivityTimer);
+        agentActivityTimer = undefined;
+    }
+}
+function openAgentActivity(opener) {
+    if (state.dialog || !agentActivityRuns().length)
+        return;
+    agentActivityOpener = $("#main")?.contains(opener) ? "#main" : "#top";
+    state.agentActivityOpen = true;
+    document.querySelectorAll('[data-action="agent-activity-toggle"]').forEach((toggle) => { toggle.ariaExpanded = "true"; });
+    renderAgentActivity();
+    $("#agent-activity-panel")?.focus();
+}
+// Closing updates the existing elements instead of rebuilding the header, so the click that closed it still reaches its target.
+function closeAgentActivity(returnFocus) {
+    if (!state.agentActivityOpen)
+        return;
+    state.agentActivityOpen = false;
+    const panel = $("#agent-activity-panel");
+    if (panel)
+        panel.hidden = true;
+    document.querySelectorAll('[data-action="agent-activity-toggle"]').forEach((toggle) => { toggle.ariaExpanded = "false"; });
+    syncAgentActivityTimer();
+    if (returnFocus)
+        activityLauncher()?.focus();
 }
 function agentReviewsHtml() {
     const review = state.review;
     const runs = review?.agentReviews ?? [];
     if (!runs.length)
         return "";
-    const active = (r) => ["sending", "queued", "running"].includes(r.state);
+    const active = isActiveAgentRun;
     return `<h3>Review runs</h3><p class="muted">Assessments and verification are reported by the coordinating agent, not independently attested by the canvas.</p>${[...runs].reverse().map((r) => `<div class="card agent-review-run">`
         + `<strong>${esc(r.focus)}: ${esc(r.state)}</strong> <span class="pill">${agentComments().filter((thread) => thread.agentReview.runId === r.runId).length} agent comments</span> <span class="muted">${esc(r.revisionId)}${r.revisionId !== review?.currentRevisionId ? " (older diff)" : ""}</span>`
         + (r.consensus?.some((group) => group.votes.some((vote) => vote.decision !== "agree"))
@@ -1899,12 +2150,14 @@ function agentReviewsHtml() {
         + (r.intent ? `<p class="review-summary">Goal / spec / guidance: ${esc(r.intent)}</p>` : "")
         + (r.skills?.length ? `<p class="review-summary">Bundled skills supplied: ${esc(r.skills.map((skill) => skill.release ? `${skill.name} (${skill.release})` : skill.name).join(", "))}. See actual use and limits in each result.</p>` : "")
         + (r.error ? `<p class="err">${esc(r.error)}</p>` : "")
-        + `<ul>${r.models.map((model) => {
+        + `<ul class="agent-activity-list">${r.models.map((model) => {
             const result = r.results.find((x) => x.model === model);
-            let outcome = active(r) ? (model === "copilot-fusion" ? "Awaiting result from the Copilot Fusion child session" : "Awaiting result") : "Not completed";
+            let outcome = "";
             if (result) {
-                if (result.error) {
-                    outcome = `Failed: ${esc(result.error)}`;
+                const error = result.error?.trim();
+                if (isFailedResult(result)) {
+                    if (error && shortError(error) !== error)
+                        outcome += `<details><summary>Error details</summary><p class="review-summary">${esc(error)}</p></details>`;
                 }
                 else {
                     const counts = {};
@@ -1913,9 +2166,8 @@ function agentReviewsHtml() {
                         const key = typeof assessment === "string" && Object.hasOwn(FINDING_ASSESSMENTS, assessment) ? assessment : "unverified";
                         counts[key] = (counts[key] ?? 0) + 1;
                     }
-                    outcome = result.threadIds.length ? Object.keys(FINDING_ASSESSMENTS).filter((key) => counts[key]).map((key) => `${counts[key]} ${key}`).join(", ")
-                        : r.protocol === "consensus-v1" && active(r) ? "Awaiting discussion and consensus"
-                            : r.protocol === "consensus-v1" ? "No agreed findings published" : "No findings reported";
+                    if (result.threadIds.length)
+                        outcome += Object.keys(FINDING_ASSESSMENTS).filter((key) => counts[key]).map((key) => `${counts[key]} ${key}`).join(", ");
                     outcome += `<details><summary>Coverage and verification</summary><p class="review-summary">${esc(result.summary ?? "No coverage or verification summary recorded.")}</p></details>`;
                     if (result.ponytail) {
                         const report = result.ponytail;
@@ -1947,7 +2199,7 @@ function agentReviewsHtml() {
                     }
                 }
             }
-            return `<li><span class="mono">${esc(model)}</span>: ${outcome}</li>`;
+            return agentActivityRowHtml(r, model, outcome);
         }).join("")}</ul>`
         + (active(r) ? `<button data-action="agent-review-close" data-run="${esc(r.runId)}" title="Stop accepting results for this review. This does not stop agents already running.">Close review</button>` : "")
         + `</div>`).join("")}`;
@@ -3341,6 +3593,8 @@ function dataValue(element, name) {
 async function onClick(e) {
     if (!(e.target instanceof Element))
         return;
+    if (e.type !== "auxclick" && state.agentActivityOpen && !e.target.closest('[data-action="agent-activity-toggle"], #agent-activity-layer'))
+        closeAgentActivity(false);
     const commentLink = e.target.closest("a[data-markdown-link][href]");
     if (commentLink?.tagName === "A") {
         e.preventDefault();
@@ -3396,6 +3650,19 @@ async function onClick(e) {
             case "agent-review-close":
                 await api("POST", `agent-reviews/${encodeURIComponent(value("run"))}/close`, {});
                 await loadState();
+                break;
+            case "agent-activity-toggle":
+                if (state.agentActivityOpen)
+                    closeAgentActivity(true);
+                else
+                    openAgentActivity(target);
+                break;
+            case "agent-activity-close":
+                closeAgentActivity(true);
+                break;
+            case "agent-activity-details":
+                closeAgentActivity(true);
+                navigate({ type: "agent-comments" });
                 break;
             case "discuss-finding":
                 state.collapsedThreads.delete(value("thread"));
@@ -3906,6 +4173,11 @@ function onKeyDown(e) {
         return;
     }
     const el = e.target;
+    if (e.key === "Escape" && state.agentActivityOpen && !(el instanceof HTMLTextAreaElement)) {
+        e.preventDefault();
+        closeAgentActivity(true);
+        return;
+    }
     if (!(el instanceof HTMLTextAreaElement))
         return;
     const key = el.dataset.composer;
@@ -4124,7 +4396,10 @@ document.addEventListener("click", (e) => {
 });
 document.addEventListener("scroll", (e) => { if (e.target instanceof HTMLElement && e.target.id === "main")
     paintRulerViewport(); }, true);
-globalThis.addEventListener?.("resize", () => requestAnimationFrame(renderRuler));
+globalThis.addEventListener?.("resize", () => {
+    positionAgentActivity();
+    requestAnimationFrame(renderRuler);
+});
 setInterval(() => {
     if (!state.review || state.dragging)
         return;
