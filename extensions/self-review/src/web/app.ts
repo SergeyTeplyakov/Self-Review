@@ -3161,20 +3161,22 @@ function threadHtml(t: ReviewThread, { showLocation = false }: { showLocation?: 
     const approvalIssue = t.agentReview ? findingApprovalIssue(t.agentReview) : "";
     const actions = t.agentReview
         ? `<div class="finding-actions"><button class="primary" data-action="approve-finding" data-thread="${esc(t.threadId)}" title="${esc(staleFinding ? "Review changed; rerun before approving" : approvalIssue || "Send this suggestion to the coding agent for implementation")}"${t.agentReview.approvalMessageId || staleFinding || approvalIssue || t.status !== "active" || state.approving.has(t.threadId) ? " disabled" : ""}>${t.agentReview.approvalMessageId ? "Approved" : "Approve"}</button>`
-            + `<button data-action="discuss-finding" data-thread="${esc(t.threadId)}">Discuss</button></div>`
+            + `<button data-action="discuss-finding" data-thread="${esc(t.threadId)}">Discuss</button>${threadStatusButtonHtml(t)}</div>`
         : "";
-    return `<div class="thread${collapsed ? " collapsed" : ""}" data-thread-id="${esc(t.threadId)}">${head}<div class="thread-body">${original}${t.messages.map((m, i) => messageHtml(m) + (i === 0 ? findingEvidenceHtml(t.agentReview) : "")).join("")}${actions}${reply}${threadStatusActionHtml(t)}</div></div>`;
+    const statusActions = t.agentReview ? "" : `<div class="thread-status-actions">${threadStatusButtonHtml(t)}</div>`;
+    return `<div class="thread${collapsed ? " collapsed" : ""}" data-thread-id="${esc(t.threadId)}">${head}<div class="thread-body">${original}${t.messages.map((m, i) => messageHtml(m) + (i === 0 ? findingEvidenceHtml(t.agentReview) : "")).join("")}${actions}${reply}${statusActions}</div></div>`;
 }
 
 // One-click Resolve for an active thread or Reactivate for any other status; the header dropdown keeps the rest.
-function threadStatusActionHtml(t: ReviewThread): string {
+// An agent finding shows it beside Approve and Discuss; other threads show it below the reply composer.
+function threadStatusButtonHtml(t: ReviewThread): string {
     const pending = state.statusUpdates.get(t.threadId);
     const resolve = t.status === "active";
     const target: ThreadStatus = resolve ? "resolved" : "active";
     const label = pending ? (pending === "active" ? "Reactivating…" : "Resolving…") : resolve ? "Resolve" : "Reactivate";
     const title = resolve ? "Mark this thread resolved" : "Reopen this thread as active";
-    return `<div class="thread-status-actions"><button type="button" data-action="thread-status" data-thread="${esc(t.threadId)}" data-status="${target}" title="${title}"`
-        + `${pending ? ` disabled aria-busy="true"` : ""}>${label}</button></div>`;
+    return `<button type="button" data-action="thread-status" data-thread="${esc(t.threadId)}" data-status="${target}" title="${title}"`
+        + `${pending ? ` disabled aria-busy="true"` : ""}>${label}</button>`;
 }
 
 // Saves a thread status through the same endpoint as the header dropdown. A failure is reported and the
